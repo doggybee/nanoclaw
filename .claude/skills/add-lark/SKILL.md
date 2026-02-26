@@ -1,6 +1,6 @@
 ---
 name: add-lark
-description: Add Lark (Larksuite) as a channel. Can replace WhatsApp entirely or run alongside it. Uses WebSocket long connection (no public URL needed).
+description: Add Lark (Larksuite) as a channel. Uses Webhook mode (requires a public URL for event callbacks).
 ---
 
 # Add Lark Channel
@@ -15,11 +15,12 @@ Read `.nanoclaw/state.yaml`. If `lark` is in `applied_skills`, skip to Phase 3 (
 
 ### Ask the user
 
-1. **Mode**: Replace WhatsApp or add alongside it?
-   - Replace → will set `LARK_ONLY=true`
-   - Alongside → both channels active (default)
+1. **Do they already have a Lark app configured?** If yes, collect the App ID and App Secret now. If no, we'll create one in Phase 3.
 
-2. **Do they already have a Lark app configured?** If yes, collect the App ID and App Secret now. If no, we'll create one in Phase 3.
+2. **Do they have a public URL for webhook callbacks?** The Lark Webhook mode requires Lark to send HTTP POST requests to your server. Options:
+   - A server with a public IP
+   - A reverse proxy (nginx, Caddy)
+   - A tunnel service (Cloudflare Tunnel, ngrok)
 
 ## Phase 2: Apply Code Changes
 
@@ -44,11 +45,11 @@ npx tsx scripts/apply-skill.ts .claude/skills/add-lark
 This deterministically:
 - Adds `src/channels/lark.ts` (LarkChannel class implementing Channel interface)
 - Adds `src/channels/lark.test.ts` (unit tests)
-- Three-way merges Lark support into `src/index.ts` (multi-channel support, conditional channel creation)
-- Three-way merges Lark config into `src/config.ts` (LARK_ONLY export)
+- Three-way merges Lark support into `src/index.ts` (channel creation)
+- Three-way merges Lark config into `src/config.ts`
 - Three-way merges updated routing tests into `src/routing.test.ts`
 - Installs the `@larksuiteoapi/node-sdk` npm dependency
-- Updates `.env.example` with `LARK_APP_ID`, `LARK_APP_SECRET`, and `LARK_ONLY`
+- Updates `.env.example` with `LARK_APP_ID`, `LARK_APP_SECRET`, `LARK_WEBHOOK_PORT`, `LARK_WEBHOOK_PATH`
 - Records the application in `.nanoclaw/state.yaml`
 
 If the apply reports merge conflicts, read the intent files:
@@ -76,8 +77,9 @@ Quick summary of what's needed:
 2. Enable Bot capability
 3. Add permissions: `im:message`, `im:message:send_as_bot`, `im:chat:readonly`, `contact:user.base:readonly`
 4. Subscribe to event: `im.message.receive_v1`
-5. Copy App ID (`cli_...`) and App Secret
-6. Publish app version and get admin approval
+5. Set up **Webhook** event subscription with your public callback URL
+6. Copy App ID (`cli_...`) and App Secret
+7. Publish app version and get admin approval
 
 Wait for the user to provide both credentials.
 
@@ -88,12 +90,8 @@ Add to `.env`:
 ```bash
 LARK_APP_ID=cli_your_app_id
 LARK_APP_SECRET=your_app_secret
-```
-
-If they chose to replace WhatsApp:
-
-```bash
-LARK_ONLY=true
+LARK_WEBHOOK_PORT=3000
+LARK_WEBHOOK_PATH=/lark/events
 ```
 
 Sync to container environment:
@@ -104,10 +102,33 @@ mkdir -p data/env && cp .env data/env/env
 
 The container reads environment from `data/env/env`, not `.env` directly.
 
+### Set up public URL for webhook
+
+Lark sends event callbacks via HTTP POST. You need a publicly reachable URL pointing to `http://localhost:<LARK_WEBHOOK_PORT><LARK_WEBHOOK_PATH>`.
+
+Options:
+- **Cloudflare Tunnel**: `cloudflared tunnel --url http://localhost:3000`
+- **ngrok**: `ngrok http 3000`
+- **Reverse proxy**: Configure nginx/Caddy to forward to localhost:3000
+
+Then set the webhook callback URL in the Lark developer console:
+1. Go to **Event Subscriptions**
+2. Set the **Request URL** to `https://your-public-url/lark/events`
+3. Lark will send a verification challenge — the bot handles this automatically with `autoChallenge: true`
+
 ### Build and restart
 
 ```bash
 npm run build
+./container/build.sh  # rebuild container image
+```
+
+Then restart the service:
+```bash
+# Linux (systemd)
+systemctl --user restart nanoclaw
+
+# macOS (launchd)
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw
 ```
 
@@ -117,7 +138,7 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw
 
 Tell the user:
 
-> 1. Add the bot to a Lark group (open group settings → **Bots** → **Add Bot**)
+> 1. Add the bot to a Lark group (open group settings > **Bots** > **Add Bot**)
 > 2. Send a test message in the group — the bot will log the chat_id
 > 3. Check the database for discovered chats:
 >    ```bash
@@ -181,7 +202,7 @@ tail -f logs/nanoclaw.log
 1. Check `LARK_APP_ID` and `LARK_APP_SECRET` are set in `.env` AND synced to `data/env/env`
 2. Check group is registered: `sqlite3 store/messages.db "SELECT * FROM registered_groups WHERE jid LIKE 'lark:%'"`
 3. For non-main groups: message must include trigger pattern
-4. Service is running: `launchctl list | grep nanoclaw` (macOS) or `systemctl --user status nanoclaw` (Linux)
+4. Service is running: `systemctl --user status nanoclaw` (Linux) or `launchctl list | grep nanoclaw` (macOS)
 
 ### Bot connected but not receiving messages
 
@@ -190,17 +211,19 @@ tail -f logs/nanoclaw.log
 3. Verify the bot has been added to the group
 4. Verify the app version has been published and approved
 5. Verify the required permissions are granted
+6. Verify the webhook callback URL is reachable from the internet
+7. Check that your public URL (tunnel/proxy) is running
 
-### WebSocket connection failing
+### Webhook not receiving events
 
-1. Check network connectivity to open.larksuite.com
-2. Verify App ID starts with `cli_`
-3. Verify App Secret is correct (regenerate if needed)
-4. Check logs: `tail -f logs/nanoclaw.log | grep -i lark`
+1. Verify the **Request URL** is correctly set in the Lark developer console
+2. Test the URL is reachable: `curl -X POST https://your-url/lark/events`
+3. Check that `LARK_WEBHOOK_PORT` and `LARK_WEBHOOK_PATH` match your setup
+4. If using Cloudflare Tunnel or ngrok, ensure the tunnel process is running
 
 ### Using wrong console
 
-If you're in China or using Feishu (飞书), you need the Feishu console at open.feishu.cn, not open.larksuite.com. This skill is configured for Lark international (`Domain.Lark`). To use Feishu instead, change `Lark.Domain.Lark` to `Lark.Domain.Feishu` in `src/channels/lark.ts`.
+If you're in China or using Feishu, you need the Feishu console at open.feishu.cn, not open.larksuite.com. This skill is configured for Lark international (`Domain.Lark`). To use Feishu instead, change `Lark.Domain.Lark` to `Lark.Domain.Feishu` in `src/channels/lark.ts`.
 
 ### Getting chat ID
 
@@ -214,7 +237,6 @@ If the chat ID is hard to find:
 The Lark channel supports:
 - **Group chats** — Bot must be added to the group
 - **Direct messages** — Users can DM the bot directly
-- **Multi-channel** — Can run alongside WhatsApp (default) or replace it (`LARK_ONLY=true`)
 
 ## Known Limitations
 
@@ -222,4 +244,4 @@ The Lark channel supports:
 - **No typing indicator** — Lark Bot API does not expose a typing indicator endpoint. The `setTyping()` method is a no-op.
 - **Message splitting is naive** — Long messages are split at a fixed 4000-character boundary, which may break mid-word or mid-sentence.
 - **@mention format** — Lark uses `@_user_N` placeholders in message text. The bot translates bot mentions to trigger format, but other user mentions remain as placeholders.
-- **WebSocket reconnection** — The Lark SDK handles WebSocket reconnection internally. If the connection drops, messages received during the outage will be queued and sent when reconnected.
+- **Requires public URL** — Unlike WebSocket mode, Webhook mode requires your server to be reachable from the internet for Lark to deliver events.

@@ -6,6 +6,7 @@ Step-by-step guide to creating and configuring a Lark (Larksuite) custom app for
 
 - A Lark (Larksuite) workspace where you have admin permissions
 - Your NanoClaw instance with the `/add-lark` skill applied
+- A public URL for webhook callbacks (tunnel, reverse proxy, or public server)
 
 ## Step 1: Create the Lark App
 
@@ -46,7 +47,11 @@ This tells Lark which events to forward to your bot.
 |-------|-------------|
 | `im.message.receive_v1` | Receive messages sent to the bot or in groups the bot is in |
 
-3. For the subscription method, the bot uses **WebSocket mode** (long connection), so no callback URL is needed
+3. For the subscription method, select **Webhook** mode
+4. Set the **Request URL** to your public callback URL, e.g.:
+   - `https://your-domain.com/lark/events`
+   - `https://your-tunnel-url.trycloudflare.com/lark/events`
+5. Lark will send a verification challenge — NanoClaw handles this automatically with `autoChallenge: true`
 
 ## Step 5: Get App Credentials
 
@@ -72,12 +77,8 @@ Add the credentials to your `.env` file:
 ```
 LARK_APP_ID=cli_your_app_id_here
 LARK_APP_SECRET=your_app_secret_here
-```
-
-If you want Lark to replace WhatsApp entirely (no WhatsApp channel), also add:
-
-```
-LARK_ONLY=true
+LARK_WEBHOOK_PORT=3000
+LARK_WEBHOOK_PATH=/lark/events
 ```
 
 Then sync the environment to the container:
@@ -86,7 +87,26 @@ Then sync the environment to the container:
 mkdir -p data/env && cp .env data/env/env
 ```
 
-## Step 8: Add the Bot to Groups
+## Step 8: Set Up Public URL
+
+Lark delivers events via HTTP POST to your webhook URL. Your server must be reachable from the internet.
+
+**Option A — Cloudflare Tunnel (recommended for testing):**
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+**Option B — ngrok:**
+```bash
+ngrok http 3000
+```
+
+**Option C — Reverse proxy (production):**
+Configure nginx or Caddy to forward `/lark/events` to `localhost:3000`.
+
+After getting your public URL, update the **Request URL** in the Lark developer console (Step 4).
+
+## Step 9: Add the Bot to Groups
 
 The bot only receives messages from groups it has been added to.
 
@@ -97,14 +117,14 @@ The bot only receives messages from groups it has been added to.
 
 Repeat for each group you want the bot in.
 
-## Step 9: Get Chat IDs for Registration
+## Step 10: Get Chat IDs for Registration
 
 You need the Lark chat ID to register it with NanoClaw.
 
 **Option A — From bot logs:**
 When the bot receives a message, it logs the chat_id. Check `logs/nanoclaw.log` for entries containing `lark:oc_`.
 
-**Option B — From the API:**
+**Option B — From the database:**
 The bot syncs chat metadata on startup. Check the database:
 ```bash
 sqlite3 store/messages.db "SELECT jid, name FROM chats WHERE jid LIKE 'lark:%'"
@@ -124,8 +144,14 @@ The NanoClaw JID format is `lark:` followed by the chat ID, e.g., `lark:oc_abc12
 **Bot not receiving messages:**
 - Verify Bot capability is enabled (Step 2)
 - Verify the `im.message.receive_v1` event is subscribed (Step 4)
-- Verify the bot has been added to the group (Step 8)
+- Verify the webhook Request URL is correct and reachable
+- Verify the bot has been added to the group (Step 9)
 - Verify the app version has been published and approved (Step 6)
+
+**Webhook verification failing:**
+- Make sure NanoClaw is running before setting the Request URL
+- Check that your public URL correctly forwards to `localhost:<LARK_WEBHOOK_PORT>`
+- NanoClaw handles the challenge automatically — no manual configuration needed
 
 **"permission denied" errors:**
 - Go back to **Permissions & Scopes** and add the missing scope
@@ -139,8 +165,3 @@ The NanoClaw JID format is `lark:` followed by the chat ID, e.g., `lark:oc_abc12
 - App ID starts with `cli_` — if yours doesn't, you may have copied the wrong value
 - Make sure you're using the international Lark console (open.larksuite.com), not the Feishu console (open.feishu.cn)
 - If you regenerated a secret, update `.env` and re-sync: `cp .env data/env/env`
-
-**WebSocket connection failing:**
-- Check your network can reach Lark's servers (open.larksuite.com)
-- Verify App ID and App Secret are correct
-- Check logs for specific error messages: `tail -f logs/nanoclaw.log`
