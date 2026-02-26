@@ -51,6 +51,10 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
+// Per-group reply target: shared between processGroupMessages callback and
+// startMessageLoop piping path so piped messages also get reply-to.
+let pendingReplyTo: Record<string, { messageId: string; senderId: string; senderName: string } | undefined> = {};
+
 let lark: LarkChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -127,6 +131,31 @@ export function _setRegisteredGroups(
 }
 
 /**
+ * Find the message to reply to (quote-reply + @mention target).
+ * For trigger-required groups: the last message matching the trigger.
+ * For always-on groups: the last non-bot message.
+ */
+function findReplyTarget(
+  messages: NewMessage[],
+  requiresTrigger: boolean,
+): { messageId: string; senderId: string; senderName: string } | undefined {
+  if (requiresTrigger) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (TRIGGER_PATTERN.test(messages[i].content.trim())) {
+        return { messageId: messages[i].id, senderId: messages[i].sender, senderName: messages[i].sender_name };
+      }
+    }
+  } else {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (!messages[i].is_bot_message) {
+        return { messageId: messages[i].id, senderId: messages[i].sender, senderName: messages[i].sender_name };
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
@@ -187,6 +216,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
+  // Set reply target in shared state so both initial and piped outputs use it
+  pendingReplyTo[chatJid] = findReplyTarget(missedMessages, group.requiresTrigger !== false);
+
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -202,7 +234,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
+        // Read and consume reply target from shared state
+        const target = pendingReplyTo[chatJid];
+        pendingReplyTo[chatJid] = undefined;
+        const opts = target
+          ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
+          : undefined;
+        await channel.sendMessage(chatJid, text, opts);
         outputSentToUser = true;
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -402,6 +440,8 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
+            // Update reply target so the callback picks up the new trigger message
+            pendingReplyTo[chatJid] = findReplyTarget(groupMessages, needsTrigger);
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)

@@ -65,6 +65,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
         v1: {
           message: {
             create: vi.fn().mockResolvedValue(undefined),
+            reply: vi.fn().mockResolvedValue(undefined),
           },
           chat: {
             list: vi.fn().mockResolvedValue({ data: { items: [] } }),
@@ -110,7 +111,7 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { LarkChannel, LarkChannelOpts } from './lark.js';
+import { LarkChannel, LarkChannelOpts, toLarkMarkdown, splitMarkdown, buildCardContent } from './lark.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import * as LarkSdk from '@larksuiteoapi/node-sdk';
@@ -497,7 +498,7 @@ describe('LarkChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends message via Lark client', async () => {
+    it('sends message as plain text', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -527,6 +528,7 @@ describe('LarkChannel', () => {
         expect.objectContaining({
           data: expect.objectContaining({
             receive_id: 'oc_other456',
+            msg_type: 'text',
           }),
         }),
       );
@@ -543,15 +545,16 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
     });
 
-    it('queues message on send failure', async () => {
+    it('queues message when both send attempts fail', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
 
       const mockClient = currentClient();
-      mockClient.im.v1.message.create.mockRejectedValueOnce(
-        new Error('Network error'),
-      );
+      // First call fails, fallback retry also fails
+      mockClient.im.v1.message.create
+        .mockRejectedValueOnce(new Error('Send error'))
+        .mockRejectedValueOnce(new Error('Retry error'));
 
       // Should not throw
       await expect(
@@ -559,17 +562,42 @@ describe('LarkChannel', () => {
       ).resolves.toBeUndefined();
     });
 
-    it('splits long messages at 4000 character boundary', async () => {
+    it('retries as single unsplit message on send failure', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
 
       const mockClient = currentClient();
-      // Create a message longer than 4000 chars
+      // First call fails, fallback retry succeeds
+      mockClient.im.v1.message.create
+        .mockRejectedValueOnce(new Error('Send error'))
+        .mockResolvedValueOnce(undefined);
+
+      await channel.sendMessage('lark:oc_test123', 'Retry message');
+
+      // Second call is the fallback retry
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(2);
+      expect(mockClient.im.v1.message.create).toHaveBeenNthCalledWith(2, {
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: 'oc_test123',
+          content: JSON.stringify({ text: 'Retry message' }),
+          msg_type: 'text',
+        },
+      });
+    });
+
+    it('splits long messages into multiple text messages', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      // Create a message longer than 4000 chars (no newlines → hard cut)
       const longText = 'A'.repeat(4500);
       await channel.sendMessage('lark:oc_test123', longText);
 
-      // Should be split into 2 messages: 4000 + 500
+      // Should be split into 2 text messages: 4000 + 500
       expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(2);
       expect(mockClient.im.v1.message.create).toHaveBeenNthCalledWith(1, {
         params: { receive_id_type: 'chat_id' },
@@ -589,7 +617,7 @@ describe('LarkChannel', () => {
       });
     });
 
-    it('sends exactly-4000-char messages as a single message', async () => {
+    it('sends exactly-4000-char messages as a single text message', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -599,9 +627,14 @@ describe('LarkChannel', () => {
       await channel.sendMessage('lark:oc_test123', text);
 
       expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(1);
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ msg_type: 'text' }),
+        }),
+      );
     });
 
-    it('splits messages into 3 parts when over 8000 chars', async () => {
+    it('splits messages into 3 when over 8000 chars', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -612,6 +645,149 @@ describe('LarkChannel', () => {
 
       // 4000 + 4000 + 500 = 3 messages
       expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(3);
+    });
+
+    it('replies to message when replyToMessageId is provided', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      await channel.sendMessage('lark:oc_test123', 'Reply text', {
+        replyToMessageId: 'om_trigger_msg_001',
+      });
+
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
+        path: { message_id: 'om_trigger_msg_001' },
+        data: {
+          content: JSON.stringify({ text: 'Reply text' }),
+          msg_type: 'text',
+        },
+      });
+      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
+    });
+
+    it('replies first chunk and creates subsequent chunks for long messages', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      const longText = 'A'.repeat(4500);
+      await channel.sendMessage('lark:oc_test123', longText, {
+        replyToMessageId: 'om_trigger_msg_002',
+      });
+
+      // First chunk: reply
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledTimes(1);
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
+        path: { message_id: 'om_trigger_msg_002' },
+        data: {
+          content: JSON.stringify({ text: 'A'.repeat(4000) }),
+          msg_type: 'text',
+        },
+      });
+
+      // Second chunk: create
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(1);
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: 'oc_test123',
+          content: JSON.stringify({ text: 'A'.repeat(500) }),
+          msg_type: 'text',
+        },
+      });
+    });
+
+    it('prepends @mention to first chunk when mentionUser is provided', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      await channel.sendMessage('lark:oc_test123', 'Hello there', {
+        replyToMessageId: 'om_trigger_msg_010',
+        mentionUser: { id: 'ou_USER_456', name: 'Alice' },
+      });
+
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
+        path: { message_id: 'om_trigger_msg_010' },
+        data: {
+          content: JSON.stringify({ text: '<at user_id="ou_USER_456">Alice</at> Hello there' }),
+          msg_type: 'text',
+        },
+      });
+    });
+
+    it('only prepends @mention to first chunk of split messages', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      const longText = 'A'.repeat(4500);
+      await channel.sendMessage('lark:oc_test123', longText, {
+        replyToMessageId: 'om_trigger_msg_011',
+        mentionUser: { id: 'ou_USER_456', name: 'Alice' },
+      });
+
+      // First chunk: reply with @mention
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
+        path: { message_id: 'om_trigger_msg_011' },
+        data: {
+          content: JSON.stringify({ text: '<at user_id="ou_USER_456">Alice</at> ' + 'A'.repeat(4000) }),
+          msg_type: 'text',
+        },
+      });
+
+      // Second chunk: create without @mention
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: 'oc_test123',
+          content: JSON.stringify({ text: 'A'.repeat(500) }),
+          msg_type: 'text',
+        },
+      });
+    });
+
+    it('does not use reply when replyToMessageId is not provided', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      await channel.sendMessage('lark:oc_test123', 'Normal message');
+
+      expect(mockClient.im.v1.message.reply).not.toHaveBeenCalled();
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries reply on send failure', async () => {
+      const opts = createTestOpts();
+      const channel = new LarkChannel(opts);
+      await channel.connect();
+
+      const mockClient = currentClient();
+      // First reply fails, fallback reply succeeds
+      mockClient.im.v1.message.reply
+        .mockRejectedValueOnce(new Error('Send error'))
+        .mockResolvedValueOnce(undefined);
+
+      await channel.sendMessage('lark:oc_test123', 'Fallback reply', {
+        replyToMessageId: 'om_trigger_msg_003',
+      });
+
+      // Second call to reply is the fallback retry
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledTimes(2);
+      expect(mockClient.im.v1.message.reply).toHaveBeenNthCalledWith(2, {
+        path: { message_id: 'om_trigger_msg_003' },
+        data: {
+          content: JSON.stringify({ text: 'Fallback reply' }),
+          msg_type: 'text',
+        },
+      });
     });
 
     it('flushes queued messages on connect', async () => {
@@ -633,6 +809,7 @@ describe('LarkChannel', () => {
         expect.objectContaining({
           data: expect.objectContaining({
             content: JSON.stringify({ text: 'First queued' }),
+            msg_type: 'text',
           }),
         }),
       );
@@ -640,6 +817,7 @@ describe('LarkChannel', () => {
         expect.objectContaining({
           data: expect.objectContaining({
             content: JSON.stringify({ text: 'Second queued' }),
+            msg_type: 'text',
           }),
         }),
       );
@@ -825,5 +1003,112 @@ describe('LarkChannel', () => {
       const channel = new LarkChannel(createTestOpts());
       expect(channel.name).toBe('lark');
     });
+  });
+});
+
+// --- Standalone helper function tests ---
+
+describe('toLarkMarkdown', () => {
+  it('passes through standard markdown unchanged', () => {
+    const input = '**bold** and *italic* and `code`';
+    expect(toLarkMarkdown(input)).toBe(input);
+  });
+
+  it('preserves all heading levels (H1–H6) for JSON 2.0', () => {
+    expect(toLarkMarkdown('# Title')).toBe('# Title');
+    expect(toLarkMarkdown('## Subtitle')).toBe('## Subtitle');
+    expect(toLarkMarkdown('### Section')).toBe('### Section');
+    expect(toLarkMarkdown('#### Deep')).toBe('#### Deep');
+    expect(toLarkMarkdown('##### Deeper')).toBe('##### Deeper');
+    expect(toLarkMarkdown('###### Deepest')).toBe('###### Deepest');
+  });
+
+  it('preserves nested lists for JSON 2.0', () => {
+    const input = '- top\n    - nested\n        - deep';
+    expect(toLarkMarkdown(input)).toBe(input);
+  });
+
+  it('collapses blank lines between unordered list items', () => {
+    const input = '- item 1\n\n- item 2\n\n- item 3';
+    expect(toLarkMarkdown(input)).toBe('- item 1\n- item 2\n- item 3');
+  });
+
+  it('collapses blank lines between ordered list items', () => {
+    const input = '1. first\n\n2. second\n\n3. third';
+    expect(toLarkMarkdown(input)).toBe('1. first\n2. second\n3. third');
+  });
+
+  it('collapses multiple blank lines between list items', () => {
+    const input = '- a\n\n\n\n- b';
+    expect(toLarkMarkdown(input)).toBe('- a\n- b');
+  });
+
+  it('preserves blank lines between non-list paragraphs', () => {
+    const input = 'paragraph 1\n\nparagraph 2';
+    expect(toLarkMarkdown(input)).toBe(input);
+  });
+
+  it('preserves code blocks', () => {
+    const input = '```js\nconst x = 1;\n```';
+    expect(toLarkMarkdown(input)).toBe(input);
+  });
+
+  it('preserves links', () => {
+    const input = '[click](https://example.com)';
+    expect(toLarkMarkdown(input)).toBe(input);
+  });
+});
+
+describe('splitMarkdown', () => {
+  it('returns single chunk when text fits', () => {
+    const text = 'short text';
+    expect(splitMarkdown(text, 100)).toEqual(['short text']);
+  });
+
+  it('splits at paragraph boundary (double newline)', () => {
+    const text = 'para1\n\npara2\n\npara3';
+    // maxLen=12: "para1\n\npara2" is 12 chars, fits
+    const chunks = splitMarkdown(text, 12);
+    expect(chunks).toEqual(['para1\n\npara2', 'para3']);
+  });
+
+  it('splits at single newline when no paragraph boundary', () => {
+    const text = 'line1\nline2\nline3';
+    // maxLen=11: "line1\nline2" is 11 chars, fits
+    const chunks = splitMarkdown(text, 11);
+    expect(chunks).toEqual(['line1\nline2', 'line3']);
+  });
+
+  it('hard-cuts when no newline within limit', () => {
+    const text = 'A'.repeat(20);
+    const chunks = splitMarkdown(text, 8);
+    expect(chunks).toEqual(['A'.repeat(8), 'A'.repeat(8), 'A'.repeat(4)]);
+  });
+
+  it('returns empty array content for empty string', () => {
+    expect(splitMarkdown('', 100)).toEqual(['']);
+  });
+});
+
+describe('buildCardContent', () => {
+  it('wraps markdown in JSON 2.0 card structure', () => {
+    const result = buildCardContent('**hello**');
+    const parsed = JSON.parse(result);
+    expect(parsed).toEqual({
+      schema: '2.0',
+      body: {
+        elements: [{ tag: 'markdown', content: '**hello**' }],
+      },
+    });
+  });
+
+  it('includes schema 2.0 declaration', () => {
+    const parsed = JSON.parse(buildCardContent('test'));
+    expect(parsed.schema).toBe('2.0');
+  });
+
+  it('returns valid JSON string', () => {
+    const result = buildCardContent('test');
+    expect(() => JSON.parse(result)).not.toThrow();
   });
 });

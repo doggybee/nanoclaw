@@ -12,13 +12,106 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
-// Lark's message API limits text to ~4000 characters per call.
-// Messages exceeding this are split into sequential chunks.
-const MAX_MESSAGE_LENGTH = 4000;
+// Lark text messages: conservative split limit to stay within API payload size.
+const MAX_TEXT_LENGTH = 4000;
 
 // Dedup window: ignore duplicate message_id within this TTL (ms)
 const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Convert standard markdown to Lark card-compatible markdown.
+ * With JSON 2.0 cards, Lark supports full CommonMark (H1–H6, nested lists,
+ * quotes, tables, etc.).
+ *
+ * Claude tends to insert blank lines between list items for readability in
+ * source form, but Lark's card renderer treats each blank line as a hard
+ * paragraph break, producing excessive vertical whitespace.  We collapse
+ * those gaps so the rendered card looks compact.
+ */
+export function toLarkMarkdown(text: string): string {
+  // Remove blank lines between list items (ordered & unordered).
+  // Claude often adds blank lines between items for source readability,
+  // but Lark renders them as excessive paragraph spacing.
+  const lines = text.split('\n');
+  const result: string[] = [];
+  const listRe = /^[ \t]*(?:[-*]|\d+\.)\s/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Skip blank lines that sit between two list items
+    if (line.trim() === '') {
+      // Look ahead to next non-blank line
+      let next = i + 1;
+      while (next < lines.length && lines[next].trim() === '') next++;
+      // If both the previous content line and the next content line are list items, skip all blanks
+      if (
+        result.length > 0 &&
+        listRe.test(result[result.length - 1]) &&
+        next < lines.length &&
+        listRe.test(lines[next])
+      ) {
+        continue; // drop this blank line
+      }
+    }
+    result.push(line);
+  }
+  return result.join('\n');
+}
+
+/**
+ * Build a Lark interactive card JSON payload (JSON 2.0) containing a single markdown element.
+ * JSON 2.0 supports full CommonMark syntax including headings, nested lists,
+ * quotes, tables, and code blocks.
+ */
+export function buildCardContent(markdown: string): string {
+  return JSON.stringify({
+    schema: '2.0',
+    body: {
+      elements: [{ tag: 'markdown', content: markdown }],
+    },
+  });
+}
+
+/**
+ * Split markdown text at paragraph / line boundaries so each chunk
+ * fits within maxLen. Falls back to hard-cut if a single paragraph exceeds maxLen.
+ */
+export function splitMarkdown(text: string, maxLen: number): string[] {
+  if (text.length <= maxLen) return [text];
+
+  const chunks: string[] = [];
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    if (remaining.length <= maxLen) {
+      chunks.push(remaining);
+      break;
+    }
+
+    // Try to split at a double-newline (paragraph boundary) within the limit
+    let splitIdx = remaining.lastIndexOf('\n\n', maxLen);
+    if (splitIdx > 0) {
+      chunks.push(remaining.slice(0, splitIdx));
+      remaining = remaining.slice(splitIdx + 2); // skip the \n\n
+      continue;
+    }
+
+    // Try to split at a single newline within the limit
+    splitIdx = remaining.lastIndexOf('\n', maxLen);
+    if (splitIdx > 0) {
+      chunks.push(remaining.slice(0, splitIdx));
+      remaining = remaining.slice(splitIdx + 1);
+      continue;
+    }
+
+    // Hard cut — no good boundary found
+    chunks.push(remaining.slice(0, maxLen));
+    remaining = remaining.slice(maxLen);
+  }
+
+  return chunks;
+}
 
 export interface LarkChannelOpts {
   onMessage: OnInboundMessage;
@@ -257,9 +350,7 @@ export class LarkChannel implements Channel {
     });
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
-    const chatId = jid.replace(/^lark:/, '');
-
+  async sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void> {
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
       logger.info(
@@ -270,38 +361,78 @@ export class LarkChannel implements Channel {
     }
 
     try {
-      // Lark limits messages to ~4000 characters; split if needed
-      if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content: JSON.stringify({ text }),
-            msg_type: 'text',
-          },
-        });
-      } else {
-        for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
+      await this._sendDirect(jid, text, opts?.replyToMessageId, opts?.mentionUser);
+    } catch (err) {
+      // Fallback: retry as a single unsplit message
+      logger.warn({ jid, err }, 'Send failed, retrying as single message');
+      try {
+        const fallbackText = opts?.mentionUser
+          ? `<at user_id="${opts.mentionUser.id}">${opts.mentionUser.name}</at> ${text}`
+          : text;
+        if (opts?.replyToMessageId) {
+          await this.client.im.v1.message.reply({
+            path: { message_id: opts.replyToMessageId },
+            data: {
+              content: JSON.stringify({ text: fallbackText }),
+              msg_type: 'text',
+            },
+          });
+        } else {
+          const chatId = jid.replace(/^lark:/, '');
           await this.client.im.v1.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
               receive_id: chatId,
-              content: JSON.stringify({
-                text: text.slice(i, i + MAX_MESSAGE_LENGTH),
-              }),
+              content: JSON.stringify({ text: fallbackText }),
               msg_type: 'text',
             },
           });
         }
+        logger.info({ jid, length: text.length }, 'Lark message sent (text fallback)');
+      } catch (fallbackErr) {
+        this.outgoingQueue.push({ jid, text });
+        logger.warn(
+          { jid, err: fallbackErr, queueSize: this.outgoingQueue.length },
+          'Failed to send Lark message, queued',
+        );
       }
-      logger.info({ jid, length: text.length }, 'Lark message sent');
-    } catch (err) {
-      this.outgoingQueue.push({ jid, text });
-      logger.warn(
-        { jid, err, queueSize: this.outgoingQueue.length },
-        'Failed to send Lark message, queued',
-      );
     }
+  }
+
+  /**
+   * Core send logic: split long text and send as plain text messages.
+   * When replyToMessageId is provided, the first chunk is sent as a reply
+   * (quote-reply) to that message; subsequent chunks use message.create.
+   * When mentionUser is provided, the first chunk is prefixed with an @mention.
+   */
+  private async _sendDirect(
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+    mentionUser?: { id: string; name: string },
+  ): Promise<void> {
+    const chatId = jid.replace(/^lark:/, '');
+    const chunks = splitMarkdown(text, MAX_TEXT_LENGTH);
+
+    for (let i = 0; i < chunks.length; i++) {
+      // Prepend @mention to the first chunk only
+      const chunkText = i === 0 && mentionUser
+        ? `<at user_id="${mentionUser.id}">${mentionUser.name}</at> ${chunks[i]}`
+        : chunks[i];
+      const content = JSON.stringify({ text: chunkText });
+      if (i === 0 && replyToMessageId) {
+        await this.client.im.v1.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content, msg_type: 'text' },
+        });
+      } else {
+        await this.client.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chatId, content, msg_type: 'text' },
+        });
+      }
+    }
+    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent');
   }
 
   isConnected(): boolean {
@@ -386,19 +517,7 @@ export class LarkChannel implements Channel {
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
-        const chatId = item.jid.replace(/^lark:/, '');
-        await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content: JSON.stringify({ text: item.text }),
-            msg_type: 'text',
-          },
-        });
-        logger.info(
-          { jid: item.jid, length: item.text.length },
-          'Queued Lark message sent',
-        );
+        await this._sendDirect(item.jid, item.text);
       }
     } finally {
       this.flushing = false;
