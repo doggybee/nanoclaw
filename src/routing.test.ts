@@ -22,6 +22,16 @@ describe('JID ownership patterns', () => {
     const jid = '12345678@s.whatsapp.net';
     expect(jid.endsWith('@s.whatsapp.net')).toBe(true);
   });
+
+  it('Lark group JID: starts with lark:', () => {
+    const jid = 'lark:oc_test123';
+    expect(jid.startsWith('lark:')).toBe(true);
+  });
+
+  it('Lark chat JID: starts with lark:', () => {
+    const jid = 'lark:oc_abcdef';
+    expect(jid.startsWith('lark:')).toBe(true);
+  });
 });
 
 // --- getAvailableGroups ---
@@ -166,5 +176,56 @@ describe('getAvailableGroups', () => {
   it('returns empty array when no chats exist', () => {
     const groups = getAvailableGroups();
     expect(groups).toHaveLength(0);
+  });
+
+  it('includes Lark group JIDs', () => {
+    storeChatMetadata('lark:oc_test123', '2024-01-01T00:00:01.000Z', 'Lark Group', 'lark', true);
+    storeChatMetadata('user@s.whatsapp.net', '2024-01-01T00:00:02.000Z', 'User DM', 'whatsapp', false);
+
+    const groups = getAvailableGroups();
+    expect(groups).toHaveLength(1);
+    expect(groups[0].jid).toBe('lark:oc_test123');
+  });
+
+  it('returns Lark p2p JIDs as groups when is_group is true', () => {
+    storeChatMetadata('lark:oc_dm123', '2024-01-01T00:00:01.000Z', 'Lark DM', 'lark', true);
+
+    const groups = getAvailableGroups();
+    expect(groups).toHaveLength(1);
+    expect(groups[0].jid).toBe('lark:oc_dm123');
+    expect(groups[0].name).toBe('Lark DM');
+  });
+
+  it('marks registered Lark groups correctly', () => {
+    storeChatMetadata('lark:oc_reg123', '2024-01-01T00:00:01.000Z', 'Lark Registered', 'lark', true);
+    storeChatMetadata('lark:oc_unreg456', '2024-01-01T00:00:02.000Z', 'Lark Unregistered', 'lark', true);
+
+    _setRegisteredGroups({
+      'lark:oc_reg123': {
+        name: 'Lark Registered',
+        folder: 'lark-registered',
+        trigger: '@Andy',
+        added_at: '2024-01-01T00:00:00.000Z',
+      },
+    });
+
+    const groups = getAvailableGroups();
+    const larkReg = groups.find((g) => g.jid === 'lark:oc_reg123');
+    const larkUnreg = groups.find((g) => g.jid === 'lark:oc_unreg456');
+
+    expect(larkReg?.isRegistered).toBe(true);
+    expect(larkUnreg?.isRegistered).toBe(false);
+  });
+
+  it('mixes WhatsApp and Lark chats ordered by activity', () => {
+    storeChatMetadata('wa@g.us', '2024-01-01T00:00:01.000Z', 'WhatsApp', 'whatsapp', true);
+    storeChatMetadata('lark:oc_100', '2024-01-01T00:00:03.000Z', 'Lark', 'lark', true);
+    storeChatMetadata('wa2@g.us', '2024-01-01T00:00:02.000Z', 'WhatsApp 2', 'whatsapp', true);
+
+    const groups = getAvailableGroups();
+    expect(groups).toHaveLength(3);
+    expect(groups[0].jid).toBe('lark:oc_100');
+    expect(groups[1].jid).toBe('wa2@g.us');
+    expect(groups[2].jid).toBe('wa@g.us');
   });
 });

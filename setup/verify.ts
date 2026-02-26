@@ -94,7 +94,7 @@ export async function run(_args: string[]): Promise<void> {
     }
   }
 
-  // 3. Check credentials
+  // 3. Check credentials (.env or ~/.claude/.credentials.json)
   let credentials = 'missing';
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
@@ -103,15 +103,17 @@ export async function run(_args: string[]): Promise<void> {
       credentials = 'configured';
     }
   }
-
-  // 4. Check WhatsApp auth
-  let whatsappAuth = 'not_found';
-  const authDir = path.join(projectRoot, 'store', 'auth');
-  if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) {
-    whatsappAuth = 'authenticated';
+  if (credentials === 'missing') {
+    const credsPath = path.join(process.env.HOME || '/root', '.claude', '.credentials.json');
+    try {
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+      if (creds?.claudeAiOauth?.accessToken) credentials = 'configured';
+    } catch {
+      // Not available
+    }
   }
 
-  // 5. Check registered groups (using better-sqlite3, not sqlite3 CLI)
+  // 4. Check registered groups (using better-sqlite3, not sqlite3 CLI)
   let registeredGroups = 0;
   const dbPath = path.join(STORE_DIR, 'messages.db');
   if (fs.existsSync(dbPath)) {
@@ -127,7 +129,7 @@ export async function run(_args: string[]): Promise<void> {
     }
   }
 
-  // 6. Check mount allowlist
+  // 5. Check mount allowlist
   let mountAllowlist = 'missing';
   if (
     fs.existsSync(
@@ -141,7 +143,6 @@ export async function run(_args: string[]): Promise<void> {
   const status =
     service === 'running' &&
     credentials !== 'missing' &&
-    whatsappAuth !== 'not_found' &&
     registeredGroups > 0
       ? 'success'
       : 'failed';
@@ -152,7 +153,6 @@ export async function run(_args: string[]): Promise<void> {
     SERVICE: service,
     CONTAINER_RUNTIME: containerRuntime,
     CREDENTIALS: credentials,
-    WHATSAPP_AUTH: whatsappAuth,
     REGISTERED_GROUPS: registeredGroups,
     MOUNT_ALLOWLIST: mountAllowlist,
     STATUS: status,

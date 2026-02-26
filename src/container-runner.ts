@@ -15,6 +15,7 @@ import {
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
+import { getClaudeOAuthToken } from './claude-credentials.js';
 import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -25,6 +26,30 @@ import {
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+/** Recursively chown a directory tree so the container's node user can write.
+ *  Skips files/dirs that already have the correct ownership. */
+function chownRecursive(dir: string, uid: number, gid: number): void {
+  try {
+    const stat = fs.statSync(dir);
+    if (stat.uid !== uid || stat.gid !== gid) {
+      fs.chownSync(dir, uid, gid);
+    }
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        chownRecursive(full, uid, gid);
+      } else {
+        const s = fs.statSync(full);
+        if (s.uid !== uid || s.gid !== gid) {
+          fs.chownSync(full, uid, gid);
+        }
+      }
+    }
+  } catch {
+    // Best-effort: don't crash if chown fails (e.g. on non-Linux)
+  }
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -134,6 +159,7 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
+  // Only copies when source files are newer to avoid redundant I/O on every spawn.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
@@ -141,7 +167,19 @@ function buildVolumeMounts(
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      if (!fs.existsSync(dstDir)) {
+        fs.cpSync(srcDir, dstDir, { recursive: true });
+      } else {
+        // Only copy individual files that are newer
+        for (const file of fs.readdirSync(srcDir)) {
+          const srcFile = path.join(srcDir, file);
+          const dstFile = path.join(dstDir, file);
+          if (!fs.existsSync(dstFile) ||
+              fs.statSync(srcFile).mtimeMs > fs.statSync(dstFile).mtimeMs) {
+            fs.cpSync(srcFile, dstFile, { recursive: true });
+          }
+        }
+      }
     }
   }
   mounts.push({
@@ -162,30 +200,6 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Copy agent-runner source into a per-group writable location so agents
-  // can customize it (add tools, change behavior) without affecting other
-  // groups. Recompiled on container startup via entrypoint.sh.
-  const agentRunnerSrc = path.join(
-    projectRoot,
-    'container',
-    'agent-runner',
-    'src',
-  );
-  const groupAgentRunnerDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    'agent-runner-src',
-  );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
-  }
-  mounts.push({
-    hostPath: groupAgentRunnerDir,
-    containerPath: '/app/src',
-    readonly: false,
-  });
-
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -196,15 +210,34 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  // When running as root on the host, the container runs as node (uid 1000).
+  // Ensure ALL writable mount directories are owned by the container user
+  // so the agent can read, write, and delete files freely.
+  if (process.getuid?.() === 0) {
+    for (const mount of mounts) {
+      if (!mount.readonly) {
+        chownRecursive(mount.hostPath, 1000, 1000);
+      }
+    }
+  }
+
   return mounts;
 }
 
 /**
  * Read allowed secrets from .env for passing to the container via stdin.
+ * Falls back to ~/.claude/.credentials.json with auto-refresh.
  * Secrets are never written to disk or mounted as files.
  */
-function readSecrets(): Record<string, string> {
-  return readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+async function readSecrets(): Promise<Record<string, string>> {
+  const envSecrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  if (envSecrets.CLAUDE_CODE_OAUTH_TOKEN || envSecrets.ANTHROPIC_API_KEY) {
+    return envSecrets;
+  }
+  // Fall back to Claude CLI credentials with auto-refresh
+  const token = await getClaudeOAuthToken();
+  if (token) return { CLAUDE_CODE_OAUTH_TOKEN: token };
+  return {};
 }
 
 function buildContainerArgs(
@@ -215,6 +248,12 @@ function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Pass model override if configured
+  const envModel = readEnvFile(['CLAUDE_MODEL']).CLAUDE_MODEL;
+  if (envModel) {
+    args.push('-e', `CLAUDE_MODEL=${envModel}`);
+  }
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -250,7 +289,11 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  // Run buildVolumeMounts and readSecrets in parallel — they're independent.
+  const [mounts, secrets] = await Promise.all([
+    Promise.resolve(buildVolumeMounts(group, input.isMain)),
+    readSecrets(),
+  ]);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -294,7 +337,7 @@ export async function runContainerAgent(
     let stderrTruncated = false;
 
     // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = readSecrets();
+    input.secrets = secrets;
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs
