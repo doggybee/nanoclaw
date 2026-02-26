@@ -1,0 +1,21 @@
+skill: lark
+version: 1.0.0
+description: "Lark (Larksuite) Bot integration via @larksuiteoapi/node-sdk with WebSocket"
+core_version: 0.1.0
+adds:
+  - src/channels/lark.ts
+  - src/channels/lark.test.ts
+modifies:
+  - src/index.ts
+  - src/config.ts
+  - src/routing.test.ts
+structured:
+  npm_dependencies:
+    "@larksuiteoapi/node-sdk": "^1.32.0"
+  env_additions:
+    - LARK_APP_ID
+    - LARK_APP_SECRET
+    - LARK_ONLY
+conflicts: []
+depends: []
+test: "npx vitest run src/channels/lark.test.ts"
