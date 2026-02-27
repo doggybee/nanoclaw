@@ -111,7 +111,7 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { LarkChannel, LarkChannelOpts, toLarkMarkdown, splitMarkdown, buildCardContent } from './lark.js';
+import { LarkChannel, LarkChannelOpts, markdownToPostContent, splitMarkdown } from './lark.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import * as LarkSdk from '@larksuiteoapi/node-sdk';
@@ -498,7 +498,7 @@ describe('LarkChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends message as plain text', async () => {
+    it('sends message as post with markdown support', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -510,8 +510,8 @@ describe('LarkChannel', () => {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'Hello' }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('Hello')),
+          msg_type: 'post',
         },
       });
     });
@@ -528,7 +528,7 @@ describe('LarkChannel', () => {
         expect.objectContaining({
           data: expect.objectContaining({
             receive_id: 'oc_other456',
-            msg_type: 'text',
+            msg_type: 'post',
           }),
         }),
       );
@@ -587,7 +587,7 @@ describe('LarkChannel', () => {
       });
     });
 
-    it('splits long messages into multiple text messages', async () => {
+    it('splits long messages into multiple post messages', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -597,27 +597,27 @@ describe('LarkChannel', () => {
       const longText = 'A'.repeat(4500);
       await channel.sendMessage('lark:oc_test123', longText);
 
-      // Should be split into 2 text messages: 4000 + 500
+      // Should be split into 2 post messages: 4000 + 500
       expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(2);
       expect(mockClient.im.v1.message.create).toHaveBeenNthCalledWith(1, {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'A'.repeat(4000) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('A'.repeat(4000))),
+          msg_type: 'post',
         },
       });
       expect(mockClient.im.v1.message.create).toHaveBeenNthCalledWith(2, {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'A'.repeat(500) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('A'.repeat(500))),
+          msg_type: 'post',
         },
       });
     });
 
-    it('sends exactly-4000-char messages as a single text message', async () => {
+    it('sends exactly-4000-char messages as a single post message', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -629,7 +629,7 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(1);
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: expect.objectContaining({ msg_type: 'text' }),
+          data: expect.objectContaining({ msg_type: 'post' }),
         }),
       );
     });
@@ -660,8 +660,8 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_001' },
         data: {
-          content: JSON.stringify({ text: 'Reply text' }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('Reply text')),
+          msg_type: 'post',
         },
       });
       expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
@@ -683,8 +683,8 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_002' },
         data: {
-          content: JSON.stringify({ text: 'A'.repeat(4000) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('A'.repeat(4000))),
+          msg_type: 'post',
         },
       });
 
@@ -694,8 +694,8 @@ describe('LarkChannel', () => {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'A'.repeat(500) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('A'.repeat(500))),
+          msg_type: 'post',
         },
       });
     });
@@ -714,8 +714,8 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_010' },
         data: {
-          content: JSON.stringify({ text: '<at user_id="ou_USER_456">Alice</at> Hello there' }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('<at user_id="ou_USER_456">Alice</at> Hello there')),
+          msg_type: 'post',
         },
       });
     });
@@ -736,8 +736,8 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_011' },
         data: {
-          content: JSON.stringify({ text: '<at user_id="ou_USER_456">Alice</at> ' + 'A'.repeat(4000) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('<at user_id="ou_USER_456">Alice</at> ' + 'A'.repeat(4000))),
+          msg_type: 'post',
         },
       });
 
@@ -746,8 +746,8 @@ describe('LarkChannel', () => {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'A'.repeat(500) }),
-          msg_type: 'text',
+          content: JSON.stringify(markdownToPostContent('A'.repeat(500))),
+          msg_type: 'post',
         },
       });
     });
@@ -808,16 +808,16 @@ describe('LarkChannel', () => {
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            content: JSON.stringify({ text: 'First queued' }),
-            msg_type: 'text',
+            content: JSON.stringify(markdownToPostContent('First queued')),
+            msg_type: 'post',
           }),
         }),
       );
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            content: JSON.stringify({ text: 'Second queued' }),
-            msg_type: 'text',
+            content: JSON.stringify(markdownToPostContent('Second queued')),
+            msg_type: 'post',
           }),
         }),
       );
@@ -1008,54 +1008,96 @@ describe('LarkChannel', () => {
 
 // --- Standalone helper function tests ---
 
-describe('toLarkMarkdown', () => {
-  it('passes through standard markdown unchanged', () => {
-    const input = '**bold** and *italic* and `code`';
-    expect(toLarkMarkdown(input)).toBe(input);
+describe('markdownToPostContent', () => {
+  it('converts plain text to post content structure', () => {
+    const result = markdownToPostContent('Hello world');
+    expect(result).toEqual({
+      zh_cn: { content: [[{ tag: 'text', text: 'Hello world' }]] },
+      en_us: { content: [[{ tag: 'text', text: 'Hello world' }]] },
+    });
   });
 
-  it('preserves all heading levels (H1–H6) for JSON 2.0', () => {
-    expect(toLarkMarkdown('# Title')).toBe('# Title');
-    expect(toLarkMarkdown('## Subtitle')).toBe('## Subtitle');
-    expect(toLarkMarkdown('### Section')).toBe('### Section');
-    expect(toLarkMarkdown('#### Deep')).toBe('#### Deep');
-    expect(toLarkMarkdown('##### Deeper')).toBe('##### Deeper');
-    expect(toLarkMarkdown('###### Deepest')).toBe('###### Deepest');
+  it('converts bold text with ** and style', () => {
+    const result = markdownToPostContent('**bold text**');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'bold text', style: ['bold'] }],
+    ]);
   });
 
-  it('preserves nested lists for JSON 2.0', () => {
-    const input = '- top\n    - nested\n        - deep';
-    expect(toLarkMarkdown(input)).toBe(input);
+  it('converts italic text with * and style', () => {
+    const result = markdownToPostContent('*italic text*');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'italic text', style: ['italic'] }],
+    ]);
   });
 
-  it('collapses blank lines between unordered list items', () => {
-    const input = '- item 1\n\n- item 2\n\n- item 3';
-    expect(toLarkMarkdown(input)).toBe('- item 1\n- item 2\n- item 3');
+  it('converts inline code with backticks and style', () => {
+    const result = markdownToPostContent('`code block`');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'code block', style: ['code'] }],
+    ]);
   });
 
-  it('collapses blank lines between ordered list items', () => {
-    const input = '1. first\n\n2. second\n\n3. third';
-    expect(toLarkMarkdown(input)).toBe('1. first\n2. second\n3. third');
+  it('converts markdown links to a tags', () => {
+    const result = markdownToPostContent('[click here](https://example.com)');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'a', text: 'click here', href: 'https://example.com' }],
+    ]);
   });
 
-  it('collapses multiple blank lines between list items', () => {
-    const input = '- a\n\n\n\n- b';
-    expect(toLarkMarkdown(input)).toBe('- a\n- b');
+  it('converts mixed inline formatting', () => {
+    const result = markdownToPostContent('Normal **bold** and `code`');
+    expect(result.zh_cn.content).toEqual([
+      [
+        { tag: 'text', text: 'Normal ' },
+        { tag: 'text', text: 'bold', style: ['bold'] },
+        { tag: 'text', text: ' and ' },
+        { tag: 'text', text: 'code', style: ['code'] },
+      ],
+    ]);
   });
 
-  it('preserves blank lines between non-list paragraphs', () => {
-    const input = 'paragraph 1\n\nparagraph 2';
-    expect(toLarkMarkdown(input)).toBe(input);
+  it('handles multiple lines', () => {
+    const result = markdownToPostContent('Line 1\nLine 2\nLine 3');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'Line 1' }],
+      [{ tag: 'text', text: 'Line 2' }],
+      [{ tag: 'text', text: 'Line 3' }],
+    ]);
   });
 
-  it('preserves code blocks', () => {
-    const input = '```js\nconst x = 1;\n```';
-    expect(toLarkMarkdown(input)).toBe(input);
+  it('preserves empty lines as paragraph breaks', () => {
+    const result = markdownToPostContent('Para 1\n\nPara 2');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'Para 1' }],
+      [{ tag: 'text', text: '' }],
+      [{ tag: 'text', text: 'Para 2' }],
+    ]);
   });
 
-  it('preserves links', () => {
-    const input = '[click](https://example.com)';
-    expect(toLarkMarkdown(input)).toBe(input);
+  it('parses Lark <at> tags into proper at elements', () => {
+    const result = markdownToPostContent('<at user_id="ou_123">Alice</at> hello');
+    expect(result.zh_cn.content[0]).toEqual([
+      { tag: 'at', user_id: 'ou_123', user_name: 'Alice' },
+      { tag: 'text', text: ' hello' },
+    ]);
+  });
+
+  it('converts headings to bold text', () => {
+    const result = markdownToPostContent('## Section Title');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: 'Section Title', style: ['bold'] }],
+    ]);
+  });
+
+  it('preserves fenced code blocks as raw text', () => {
+    const result = markdownToPostContent('```python\nprint("hello")\nx = 1\n```');
+    expect(result.zh_cn.content).toEqual([
+      [{ tag: 'text', text: '```python' }],
+      [{ tag: 'text', text: 'print("hello")' }],
+      [{ tag: 'text', text: 'x = 1' }],
+      [{ tag: 'text', text: '```' }],
+    ]);
   });
 });
 
@@ -1090,25 +1132,3 @@ describe('splitMarkdown', () => {
   });
 });
 
-describe('buildCardContent', () => {
-  it('wraps markdown in JSON 2.0 card structure', () => {
-    const result = buildCardContent('**hello**');
-    const parsed = JSON.parse(result);
-    expect(parsed).toEqual({
-      schema: '2.0',
-      body: {
-        elements: [{ tag: 'markdown', content: '**hello**' }],
-      },
-    });
-  });
-
-  it('includes schema 2.0 declaration', () => {
-    const parsed = JSON.parse(buildCardContent('test'));
-    expect(parsed.schema).toBe('2.0');
-  });
-
-  it('returns valid JSON string', () => {
-    const result = buildCardContent('test');
-    expect(() => JSON.parse(result)).not.toThrow();
-  });
-});

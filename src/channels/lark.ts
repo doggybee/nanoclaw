@@ -20,57 +20,134 @@ const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
- * Convert standard markdown to Lark card-compatible markdown.
- * With JSON 2.0 cards, Lark supports full CommonMark (H1–H6, nested lists,
- * quotes, tables, etc.).
- *
- * Claude tends to insert blank lines between list items for readability in
- * source form, but Lark's card renderer treats each blank line as a hard
- * paragraph break, producing excessive vertical whitespace.  We collapse
- * those gaps so the rendered card looks compact.
+ * Parse a single line of text into an array of Lark post elements.
+ * Handles:
+ * - <at user_id="...">name</at> → {tag: "at", user_id: "..."}
+ * - [text](url)                 → {tag: "a", text, href}
+ * - **bold**                    → {tag: "text", text, style: ["bold"]}
+ * - *italic*                    → {tag: "text", text, style: ["italic"]}
+ * - `code`                      → {tag: "text", text, style: ["code"]}
+ * - Plain text                  → {tag: "text", text}
  */
-export function toLarkMarkdown(text: string): string {
-  // Remove blank lines between list items (ordered & unordered).
-  // Claude often adds blank lines between items for source readability,
-  // but Lark renders them as excessive paragraph spacing.
-  const lines = text.split('\n');
-  const result: string[] = [];
-  const listRe = /^[ \t]*(?:[-*]|\d+\.)\s/;
+function parseLineToElements(line: string): any[] {
+  const elements: any[] = [];
+  let remaining = line;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    // Skip blank lines that sit between two list items
-    if (line.trim() === '') {
-      // Look ahead to next non-blank line
-      let next = i + 1;
-      while (next < lines.length && lines[next].trim() === '') next++;
-      // If both the previous content line and the next content line are list items, skip all blanks
-      if (
-        result.length > 0 &&
-        listRe.test(result[result.length - 1]) &&
-        next < lines.length &&
-        listRe.test(lines[next])
-      ) {
-        continue; // drop this blank line
-      }
+  while (remaining.length > 0) {
+    // Lark @mention: <at user_id="...">name</at>
+    const atMatch = remaining.match(/^<at user_id="([^"]+)">([^<]*)<\/at>/);
+    if (atMatch) {
+      elements.push({ tag: 'at', user_id: atMatch[1], user_name: atMatch[2] });
+      remaining = remaining.slice(atMatch[0].length);
+      continue;
     }
-    result.push(line);
+
+    // Markdown links: [text](url)
+    const linkMatch = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
+    if (linkMatch) {
+      elements.push({ tag: 'a', text: linkMatch[1], href: linkMatch[2] });
+      remaining = remaining.slice(linkMatch[0].length);
+      continue;
+    }
+
+    // Inline code: `code`
+    const codeMatch = remaining.match(/^`([^`]+)`/);
+    if (codeMatch) {
+      elements.push({ tag: 'text', text: codeMatch[1], style: ['code'] });
+      remaining = remaining.slice(codeMatch[0].length);
+      continue;
+    }
+
+    // Bold: **text**
+    const boldMatch = remaining.match(/^\*\*(.+?)\*\*/);
+    if (boldMatch) {
+      elements.push({ tag: 'text', text: boldMatch[1], style: ['bold'] });
+      remaining = remaining.slice(boldMatch[0].length);
+      continue;
+    }
+
+    // Italic: *text* (but not **)
+    const italicMatch = remaining.match(/^\*([^*]+)\*/);
+    if (italicMatch) {
+      elements.push({ tag: 'text', text: italicMatch[1], style: ['italic'] });
+      remaining = remaining.slice(italicMatch[0].length);
+      continue;
+    }
+
+    // Plain text: consume until next special character
+    const plainMatch = remaining.match(/^([^*`\[<]+)/);
+    if (plainMatch) {
+      elements.push({ tag: 'text', text: plainMatch[1] });
+      remaining = remaining.slice(plainMatch[0].length);
+      continue;
+    }
+
+    // Fallback: consume one character
+    elements.push({ tag: 'text', text: remaining[0] });
+    remaining = remaining.slice(1);
   }
-  return result.join('\n');
+
+  return elements;
 }
 
 /**
- * Build a Lark interactive card JSON payload (JSON 2.0) containing a single markdown element.
- * JSON 2.0 supports full CommonMark syntax including headings, nested lists,
- * quotes, tables, and code blocks.
+ * Convert markdown text to Lark post message content structure.
+ * Post messages are rich text (NOT cards).
+ *
+ * Supported: text (with bold/italic/code styles), a (links), at (@mentions).
+ * Headings (# ...) → bold text.
+ * Fenced code blocks (```) → preserved as plain text lines.
  */
-export function buildCardContent(markdown: string): string {
-  return JSON.stringify({
-    schema: '2.0',
-    body: {
-      elements: [{ tag: 'markdown', content: markdown }],
-    },
-  });
+export function markdownToPostContent(text: string): any {
+  const lines = text.split('\n');
+  const content: any[][] = [];
+  let inCodeBlock = false;
+
+  for (const line of lines) {
+    // Fenced code block toggle: ```
+    // Post format has no code_block tag, so preserve raw text as-is.
+    if (line.trimStart().startsWith('```')) {
+      inCodeBlock = !inCodeBlock;
+      content.push([{ tag: 'text', text: line }]);
+      continue;
+    }
+
+    // Inside code block: emit raw text without markdown parsing
+    if (inCodeBlock) {
+      content.push([{ tag: 'text', text: line }]);
+      continue;
+    }
+
+    // Heading: "## Title" → bold text
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)/);
+    if (headingMatch) {
+      const headingElements = parseLineToElements(headingMatch[2]);
+      // Wrap all elements with bold style
+      for (const el of headingElements) {
+        if (el.tag === 'text') {
+          el.style = el.style ? [...el.style, 'bold'] : ['bold'];
+        }
+      }
+      content.push(headingElements);
+      continue;
+    }
+
+    // Empty line → paragraph break
+    if (line.length === 0) {
+      content.push([{ tag: 'text', text: '' }]);
+      continue;
+    }
+
+    const elements = parseLineToElements(line);
+    if (elements.length > 0) {
+      content.push(elements);
+    }
+  }
+
+  return {
+    zh_cn: { content },
+    en_us: { content },
+  };
 }
 
 /**
@@ -363,8 +440,8 @@ export class LarkChannel implements Channel {
     try {
       await this._sendDirect(jid, text, opts?.replyToMessageId, opts?.mentionUser);
     } catch (err) {
-      // Fallback: retry as a single unsplit message
-      logger.warn({ jid, err }, 'Send failed, retrying as single message');
+      // Fallback: retry as a plain text message (without markdown parsing)
+      logger.warn({ jid, err }, 'Send failed, retrying as plain text');
       try {
         const fallbackText = opts?.mentionUser
           ? `<at user_id="${opts.mentionUser.id}">${opts.mentionUser.name}</at> ${text}`
@@ -400,7 +477,7 @@ export class LarkChannel implements Channel {
   }
 
   /**
-   * Core send logic: split long text and send as plain text messages.
+   * Core send logic: split long text and send as post (rich text) messages with markdown support.
    * When replyToMessageId is provided, the first chunk is sent as a reply
    * (quote-reply) to that message; subsequent chunks use message.create.
    * When mentionUser is provided, the first chunk is prefixed with an @mention.
@@ -419,20 +496,24 @@ export class LarkChannel implements Channel {
       const chunkText = i === 0 && mentionUser
         ? `<at user_id="${mentionUser.id}">${mentionUser.name}</at> ${chunks[i]}`
         : chunks[i];
-      const content = JSON.stringify({ text: chunkText });
+
+      // Convert markdown to post message content
+      const postContent = markdownToPostContent(chunkText);
+      const content = JSON.stringify(postContent);
+
       if (i === 0 && replyToMessageId) {
         await this.client.im.v1.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'text' },
+          data: { content, msg_type: 'post' },
         });
       } else {
         await this.client.im.v1.message.create({
           params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, content, msg_type: 'text' },
+          data: { receive_id: chatId, content, msg_type: 'post' },
         });
       }
     }
-    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent');
+    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (post with markdown)');
   }
 
   isConnected(): boolean {
