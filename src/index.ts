@@ -59,6 +59,29 @@ let lark: LarkChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
+// Wake signal: resolves immediately to interrupt the polling sleep
+let wakeResolve: (() => void) | null = null;
+
+function wakeMessageLoop(): void {
+  if (wakeResolve) {
+    wakeResolve();
+    wakeResolve = null;
+  }
+}
+
+function sleepUntilWake(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      wakeResolve = null;
+      resolve();
+    }, ms);
+    wakeResolve = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  });
+}
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -457,7 +480,7 @@ async function startMessageLoop(): Promise<void> {
     } catch (err) {
       logger.error({ err }, 'Error in message loop');
     }
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+    await sleepUntilWake(POLL_INTERVAL);
   }
 }
 
@@ -502,7 +525,10 @@ async function main(): Promise<void> {
 
   // Channel callbacks (shared by all channels)
   const channelOpts = {
-    onMessage: (_chatJid: string, msg: NewMessage) => storeMessage(msg),
+    onMessage: (_chatJid: string, msg: NewMessage) => {
+      storeMessage(msg);
+      wakeMessageLoop();
+    },
     onChatMetadata: (
       chatJid: string,
       timestamp: string,
