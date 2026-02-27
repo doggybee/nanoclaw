@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
@@ -31,6 +32,12 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
+
+# Install Bun runtime (required by QMD) to shared path accessible by all users
+RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
+
+# Install QMD CLI (local search: BM25 + vector + LLM reranking)
+RUN npm install -g @tobilu/qmd
 
 # Create app directory
 WORKDIR /app
