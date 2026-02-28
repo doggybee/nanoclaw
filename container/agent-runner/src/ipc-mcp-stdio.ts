@@ -7,6 +7,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
@@ -38,6 +39,70 @@ const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
 });
+
+server.tool(
+  'get_chat_history',
+  'Fetch recent chat messages from the current group. Use this to get context about what was discussed before your trigger message. Returns messages newest-first.',
+  {
+    count: z.number().default(20).describe('Number of messages to fetch (max 50)'),
+    before: z.string().optional().describe('Fetch messages before this ISO timestamp (for pagination)'),
+  },
+  async (args) => {
+    const DB_PATH = '/workspace/store/messages.db';
+    if (!fs.existsSync(DB_PATH)) {
+      return {
+        content: [{ type: 'text' as const, text: 'Chat history database not available.' }],
+        isError: true,
+      };
+    }
+
+    const limit = Math.min(Math.max(args.count, 1), 50);
+
+    let db: InstanceType<typeof Database>;
+    try {
+      db = new Database(DB_PATH, { readonly: true });
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Failed to open database: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+
+    try {
+      let rows: Array<{ sender_name: string; content: string; timestamp: string }>;
+      if (args.before) {
+        rows = db.prepare(
+          `SELECT sender_name, content, timestamp FROM messages
+           WHERE chat_jid = ? AND timestamp < ?
+           ORDER BY timestamp DESC LIMIT ?`,
+        ).all(chatJid, args.before, limit) as typeof rows;
+      } else {
+        rows = db.prepare(
+          `SELECT sender_name, content, timestamp FROM messages
+           WHERE chat_jid = ?
+           ORDER BY timestamp DESC LIMIT ?`,
+        ).all(chatJid, limit) as typeof rows;
+      }
+
+      if (rows.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
+      }
+
+      const formatted = rows
+        .map((r) => `[${r.timestamp}] ${r.sender_name}: ${r.content}`)
+        .join('\n');
+
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Database query failed: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    } finally {
+      db.close();
+    }
+  },
+);
 
 server.tool(
   'send_message',

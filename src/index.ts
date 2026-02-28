@@ -211,7 +211,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  // Only send trigger messages to the agent — it can use get_chat_history
+  // MCP tool to fetch surrounding context on demand, saving tokens.
+  const messagesToFormat = group.requiresTrigger !== false
+    ? missedMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+    : missedMessages;
+  const prompt = formatMessages(messagesToFormat);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -444,24 +449,21 @@ async function startMessageLoop(): Promise<void> {
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
+          // Only send trigger messages to the agent — it can use
+          // get_chat_history MCP tool to fetch context on demand.
+          const triggerOnly = groupMessages
+            .filter((m) => !needsTrigger || TRIGGER_PATTERN.test(m.content.trim()));
+          const formatted = formatMessages(triggerOnly);
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, count: triggerOnly.length },
               'Piped messages to active container',
             );
+            // Advance cursor past ALL messages (not just triggers) so
+            // non-trigger messages aren't re-processed on next poll.
             lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+              groupMessages[groupMessages.length - 1].timestamp;
             saveState();
             // Update reply target so the callback picks up the new trigger message
             pendingReplyTo[chatJid] = findReplyTarget(groupMessages, needsTrigger);

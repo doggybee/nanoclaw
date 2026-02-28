@@ -13,6 +13,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  STORE_DIR,
   TIMEZONE,
 } from './config.js';
 import { getClaudeOAuthToken } from './claude-credentials.js';
@@ -124,6 +125,14 @@ function buildVolumeMounts(
       });
     }
   }
+
+  // Message store (read-only) — enables get_chat_history MCP tool in container.
+  // WAL mode on the host ensures concurrent reads don't conflict with writes.
+  mounts.push({
+    hostPath: STORE_DIR,
+    containerPath: '/workspace/store',
+    readonly: true,
+  });
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
