@@ -544,6 +544,15 @@ export class LarkChannel implements Channel {
     // no-op: Lark Bot API has no typing indicator endpoint
   }
 
+  async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
+    await this.client.request({
+      method: 'POST',
+      url: `/open-apis/im/v1/messages/${messageId}/reactions`,
+      data: { reaction_type: { emoji_type: emojiType } },
+    });
+    logger.info({ messageId, emojiType }, 'Lark reaction added');
+  }
+
   /**
    * Sync chat metadata from Lark.
    * Fetches chats the bot is a member of and stores their names in the DB.

@@ -63,6 +63,29 @@ server.tool(
 );
 
 server.tool(
+  'add_reaction',
+  'React to a message with an emoji. Use the message ID from the <message id="..."> attribute in the conversation. Common emoji types: "THUMBSUP", "SMILE", "HEART", "YES", "FireCracker", "OK". The full list of supported emoji types is in the Lark documentation.',
+  {
+    message_id: z.string().describe('The message ID to react to (from the id attribute in <message> tags)'),
+    emoji_type: z.string().describe('The emoji type (e.g., "THUMBSUP", "SMILE", "HEART", "YES", "FireCracker", "OK")'),
+  },
+  async (args) => {
+    const data = {
+      type: 'add_reaction',
+      chatJid,
+      messageId: args.message_id,
+      emojiType: args.emoji_type,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji_type} added to message ${args.message_id}.` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

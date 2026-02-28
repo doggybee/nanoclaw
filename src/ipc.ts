@@ -17,6 +17,7 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  addReaction?: (jid: string, messageId: string, emojiType: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -88,6 +89,30 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'add_reaction' && data.chatJid && data.messageId && data.emojiType) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.addReaction) {
+                    await deps.addReaction(data.chatJid, data.messageId, data.emojiType);
+                    logger.info(
+                      { chatJid: data.chatJid, messageId: data.messageId, emojiType: data.emojiType, sourceGroup },
+                      'IPC reaction added',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'addReaction not available on channel',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC add_reaction attempt blocked',
                   );
                 }
               }
