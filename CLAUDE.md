@@ -32,6 +32,18 @@ Single Node.js process that connects to WhatsApp, routes messages to Claude Agen
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 
+## Local Search (QMD)
+
+Use `qmd` for codebase search to save tokens. Prefer it over multiple grep/read cycles.
+
+```bash
+qmd collection add . --name project   # Index codebase (one-time)
+qmd query "how does container spawning work"  # Semantic search
+qmd search "container-runner" -n 5    # Fast keyword search
+```
+
+**Rule of thumb:** If you'd need more than 3 grep attempts, use `qmd query` instead.
+
 ## Development
 
 Run commands directly—don't tell the user to run them.

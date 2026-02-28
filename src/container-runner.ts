@@ -188,6 +188,15 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Per-group QMD cache: persist index + downloaded models across conversations
+  const qmdCacheDir = path.join(DATA_DIR, 'sessions', group.folder, '.qmd-cache');
+  fs.mkdirSync(qmdCacheDir, { recursive: true });
+  mounts.push({
+    hostPath: qmdCacheDir,
+    containerPath: '/home/node/.cache/qmd',
+    readonly: false,
+  });
+
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
