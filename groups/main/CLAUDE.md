@@ -56,7 +56,15 @@
 - Read and write files in your workspace
 - Run bash commands in your sandbox
 - Schedule tasks to run later or on a recurring basis
-- Send messages back to the chat
+- Send messages, images, and files back to the chat
+- **Edit messages** you previously sent (use `mcp__nanoclaw__edit_message` with the message ID)
+- **Fetch chat history** to get context about recent conversations (use `mcp__nanoclaw__get_chat_history`)
+- **Send interactive cards** with buttons/menus (use `mcp__nanoclaw__send_card`)
+- React to messages with emoji
+
+### Getting Context
+
+You only receive messages that directly @mention you. If you need more context about what others said in the group, use `mcp__nanoclaw__get_chat_history` to fetch recent messages. This returns messages from all participants (including your own bot messages with their message IDs, useful for editing).
 
 ## Communication
 
@@ -142,7 +150,7 @@ Available groups are provided in `/workspace/ipc/available_groups.json`:
 }
 ```
 
-Groups are ordered by most recent activity. The list is synced from WhatsApp daily.
+Groups are ordered by most recent activity. The list is synced from the messaging platform periodically.
 
 If a group the user mentions isn't in the list, request a fresh sync:
 

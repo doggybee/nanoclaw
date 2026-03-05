@@ -9,6 +9,7 @@ import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import {
   Channel,
+  ChatHistoryMessage,
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
@@ -393,14 +394,15 @@ export class LarkChannel implements Channel {
     if (!message) return;
 
     const messageId = message.message_id;
+    logger.info({ messageId, messageType: message.message_type, content: message.content?.slice?.(0, 200) }, 'Incoming Lark message');
 
     // Dedup by message_id
     if (messageId && this.seenMessages.has(messageId)) return;
     if (messageId) this.seenMessages.set(messageId, Date.now());
 
     const messageType = message.message_type; // 'text', 'image', 'file', 'post'
-    // Only process text, image, and file messages
-    if (!['text', 'image', 'file'].includes(messageType)) return;
+    // Only process text, image, file, and post (rich text with images) messages
+    if (!['text', 'image', 'file', 'post'].includes(messageType)) return;
 
     const chatId = message.chat_id;
     if (!chatId) return;
@@ -431,9 +433,10 @@ export class LarkChannel implements Channel {
       ? ASSISTANT_NAME
       : sender?.sender_id?.open_id || 'unknown';
 
-    // --- Extract content based on message type ---
+    // --- Extract content and embedded image keys based on message type ---
     let content = '';
     let hasTrigger = false;
+    const embeddedImageKeys: string[] = [];
 
     if (messageType === 'text') {
       try {
@@ -443,11 +446,10 @@ export class LarkChannel implements Channel {
         return;
       }
     } else if (messageType === 'image') {
-      // Image messages: only process if bot is @mentioned or in non-trigger groups
-      // The image_key is used to download it later via downloadResource
       try {
         const parsed = JSON.parse(message.content);
         content = `[image:${parsed.image_key}]`;
+        embeddedImageKeys.push(parsed.image_key);
       } catch {
         return;
       }
@@ -458,13 +460,35 @@ export class LarkChannel implements Channel {
       } catch {
         return;
       }
+    } else if (messageType === 'post') {
+      // Rich text: extract text and image_keys from nested content array
+      try {
+        const parsed = JSON.parse(message.content);
+        // Post content structure: { title, content: [[{tag, ...}]] }
+        const rows = parsed.content as Array<Array<{ tag: string; text?: string; image_key?: string; user_id?: string }>>;
+        const textParts: string[] = [];
+        if (parsed.title) textParts.push(parsed.title);
+        for (const row of rows || []) {
+          for (const el of row) {
+            if (el.tag === 'text' && el.text) {
+              textParts.push(el.text);
+            } else if (el.tag === 'at' && el.user_id) {
+              textParts.push(el.user_id); // @_user_N placeholder
+            } else if (el.tag === 'img' && el.image_key) {
+              embeddedImageKeys.push(el.image_key);
+            }
+          }
+        }
+        content = textParts.join('');
+      } catch {
+        return;
+      }
     }
 
-    if (!content) return;
+    if (!content && embeddedImageKeys.length === 0) return;
 
     // Normalize @mentions: Lark uses @_user_N placeholder in text
     // Replace mentions of our bot with the trigger pattern
-    const originalContent = content;
     if (!isBotMessage) {
       const mentions = message.mentions as
         | Array<{ key: string; id?: { open_id?: string }; name?: string }>
@@ -485,32 +509,27 @@ export class LarkChannel implements Channel {
       }
     }
 
-    // For image/file messages without trigger text, check if the group
-    // doesn't require a trigger (p2p chats). Otherwise skip non-triggered media.
+    // For media messages without trigger, check if group requires trigger
+    const hasMedia = embeddedImageKeys.length > 0 || messageType === 'file';
     const group = groups[jid];
-    if ((messageType === 'image' || messageType === 'file') && !hasTrigger) {
+    if (hasMedia && !hasTrigger && !content) {
       if (group?.requiresTrigger !== false) {
-        // Media without trigger in a trigger-required group — skip
         return;
       }
     }
 
-    // For triggered image/file messages, download the resource
-    if ((messageType === 'image' || messageType === 'file') &&
-        (hasTrigger || group?.requiresTrigger === false)) {
+    // Download images/files when triggered (or in non-trigger groups)
+    if (embeddedImageKeys.length > 0 && (hasTrigger || group?.requiresTrigger === false)) {
       try {
         const groupFolder = group?.folder || 'main';
         const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
         fs.mkdirSync(tmpDir, { recursive: true });
 
-        if (messageType === 'image') {
-          const parsed = JSON.parse(message.content);
-          const imageKey = parsed.image_key;
-          const ext = '.png';
-          const filename = `img_${Date.now()}${ext}`;
+        const downloadedPaths: string[] = [];
+        for (const imageKey of embeddedImageKeys) {
+          const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`;
           const destPath = path.join(tmpDir, filename);
 
-          // Use messageResource.get to download user-sent images
           const resp = await this.client.im.v1.messageResource.get({
             path: { message_id: messageId, file_key: imageKey },
             params: { type: 'image' },
@@ -518,34 +537,55 @@ export class LarkChannel implements Channel {
 
           if (resp) {
             await resp.writeFile(destPath);
-            // chown to container user (uid 1000) so agent can read
             try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
-            content = `@${ASSISTANT_NAME} [User sent an image. File saved at: /workspace/group/tmp/${filename} — use the Read tool to view it]`;
+            downloadedPaths.push(`/workspace/group/tmp/${filename}`);
             logger.info({ jid, imageKey, destPath }, 'Image downloaded for agent');
           }
-        } else if (messageType === 'file') {
-          const parsed = JSON.parse(message.content);
-          const fileKey = parsed.file_key;
-          const fileName = parsed.file_name || `file_${Date.now()}`;
-          const destPath = path.join(tmpDir, fileName);
+        }
 
-          const resp = await this.client.im.v1.messageResource.get({
-            path: { message_id: messageId, file_key: fileKey },
-            params: { type: 'file' },
-          });
-
-          if (resp) {
-            await resp.writeFile(destPath);
-            try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
-            content = `@${ASSISTANT_NAME} [User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`;
-            logger.info({ jid, fileKey, destPath }, 'File downloaded for agent');
-          }
+        if (downloadedPaths.length > 0) {
+          const imageRef = downloadedPaths.length === 1
+            ? `[User sent an image. File saved at: ${downloadedPaths[0]} — use the Read tool to view it]`
+            : `[User sent ${downloadedPaths.length} images. Files saved at: ${downloadedPaths.join(', ')} — use the Read tool to view them]`;
+          // Prepend trigger if not already present
+          content = content
+            ? `${content}\n${imageRef}`
+            : `@${ASSISTANT_NAME} ${imageRef}`;
         }
       } catch (err) {
-        logger.warn({ jid, messageType, err }, 'Failed to download media');
-        // Keep the original content tag so agent knows media was sent
+        logger.warn({ jid, err }, 'Failed to download image');
       }
     }
+
+    if (messageType === 'file' && (hasTrigger || group?.requiresTrigger === false)) {
+      try {
+        const parsed = JSON.parse(message.content);
+        const fileKey = parsed.file_key;
+        const fileName = parsed.file_name || `file_${Date.now()}`;
+        const groupFolder = group?.folder || 'main';
+        const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+        const destPath = path.join(tmpDir, fileName);
+
+        const resp = await this.client.im.v1.messageResource.get({
+          path: { message_id: messageId, file_key: fileKey },
+          params: { type: 'file' },
+        });
+
+        if (resp) {
+          await resp.writeFile(destPath);
+          try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
+          content = content
+            ? `${content}\n[User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`
+            : `@${ASSISTANT_NAME} [User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`;
+          logger.info({ jid, fileKey, destPath }, 'File downloaded for agent');
+        }
+      } catch (err) {
+        logger.warn({ jid, err }, 'Failed to download file');
+      }
+    }
+
+    if (!content) return;
 
     this.opts.onMessage(jid, {
       id: messageId || message.create_time || '',
@@ -563,12 +603,14 @@ export class LarkChannel implements Channel {
     try {
       const action = data?.action;
       const operatorId = data?.operator?.open_id;
-      const chatId = data?.open_chat_id;
-      const messageId = data?.open_message_id;
+      // Schema 2.0 uses open_chat_id at top level; also check context.open_chat_id
+      const chatId = data?.open_chat_id || data?.context?.open_chat_id;
+      const messageId = data?.open_message_id || data?.context?.open_message_id;
 
       if (!action || !operatorId) return;
 
       const actionTag = action.tag; // 'button', 'select_static', etc.
+      // Schema 2.0 behaviors put value in action.value; also check action.behaviors
       const actionValue = action.value || {};
       const actionId = actionValue.action_id || action.name || actionTag;
 
@@ -631,14 +673,14 @@ export class LarkChannel implements Channel {
     const existing = this.streamingCards.get(jid);
 
     if (existing) {
-      // Append to existing streaming card
-      existing.accumulatedText += '\n\n' + text;
+      // Replace with latest full text (API calculates diff for typewriter effect)
+      existing.accumulatedText = text;
       existing.sequence++;
       await this.client.cardkit.v1.cardElement.content({
         path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
-        data: { content: existing.accumulatedText, sequence: existing.sequence },
+        data: { content: text, sequence: existing.sequence },
       });
-      logger.info({ jid, cardId: existing.cardId, length: existing.accumulatedText.length }, 'Streaming card text appended');
+      logger.info({ jid, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
@@ -790,6 +832,38 @@ export class LarkChannel implements Channel {
     // no-op: Lark Bot API has no typing indicator endpoint
   }
 
+  /**
+   * Send an interactive card with buttons/selects.
+   * cardJson should be a Lark Card JSON schema 2.0 object.
+   */
+  async sendCard(jid: string, cardJson: object, replyToMessageId?: string): Promise<void> {
+    const chatId = jid.replace(/^lark:/, '');
+
+    const createResult = await this.client.cardkit.v1.card.create({
+      data: {
+        type: 'card_json',
+        data: JSON.stringify(cardJson),
+      },
+    });
+    const cardId = createResult?.data?.card_id;
+    if (!cardId) throw new Error('Failed to create interactive card');
+
+    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+
+    if (replyToMessageId) {
+      await this.client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: 'interactive' },
+      });
+    } else {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, content, msg_type: 'interactive' },
+      });
+    }
+    logger.info({ jid, cardId }, 'Lark interactive card sent');
+  }
+
   async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
     await this.client.request({
       method: 'POST',
@@ -878,10 +952,29 @@ export class LarkChannel implements Channel {
   }
 
   /**
-   * Edit a previously sent message. Replaces content with new text.
-   * Only works for messages sent by the bot.
+   * Edit a previously sent bot message. Supports both card messages (via CardKit)
+   * and text/post messages (via message.patch).
    */
   async editMessage(_jid: string, messageId: string, text: string): Promise<void> {
+    // Try CardKit path first: convert message_id → card_id, then update the card element.
+    try {
+      const convertResult = await this.client.cardkit.v1.card.idConvert({
+        data: { message_id: messageId },
+      });
+      const cardId = convertResult?.data?.card_id;
+      if (cardId) {
+        await this.client.cardkit.v1.cardElement.content({
+          path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
+          data: { content: text, sequence: Date.now() },
+        });
+        logger.info({ messageId, cardId, length: text.length }, 'Lark card message edited');
+        return;
+      }
+    } catch {
+      // Not a card message or conversion failed — fall through to message.patch
+    }
+
+    // Fallback: edit text/post messages via im.v1.message.patch
     const postContent = markdownToPostContent(text);
     await this.client.im.v1.message.patch({
       path: { message_id: messageId },
@@ -890,6 +983,77 @@ export class LarkChannel implements Channel {
       },
     });
     logger.info({ messageId, length: text.length }, 'Lark message edited');
+  }
+
+  /**
+   * Fetch recent chat history from Lark API.
+   * Returns messages in reverse chronological order (newest first).
+   */
+  async getChatHistory(jid: string, count: number, beforeTimestamp?: string): Promise<ChatHistoryMessage[]> {
+    const chatId = jid.replace(/^lark:/, '');
+    const endTime = beforeTimestamp
+      ? String(Math.floor(new Date(beforeTimestamp).getTime() / 1000))
+      : undefined;
+
+    const result = await this.client.im.v1.message.list({
+      params: {
+        container_id_type: 'chat',
+        container_id: chatId,
+        page_size: Math.min(count, 50),
+        sort_type: 'ByCreateTimeDesc',
+        ...(endTime ? { end_time: endTime } : {}),
+      },
+    });
+
+    const items = result?.data?.items || [];
+    return items.map((item) => {
+      let content = '';
+      try {
+        if (item.body?.content) {
+          const parsed = JSON.parse(item.body.content);
+          if (typeof parsed === 'string') {
+            content = parsed;
+          } else if (parsed.text) {
+            content = parsed.text;
+          } else if (parsed.content) {
+            // post type: extract text from nested structure
+            content = this.extractPostText(parsed.content);
+          } else {
+            content = JSON.stringify(parsed);
+          }
+        }
+      } catch {
+        content = item.body?.content || '';
+      }
+
+      return {
+        message_id: item.message_id || '',
+        sender_id: item.sender?.id || '',
+        sender_type: item.sender?.sender_type || 'unknown',
+        msg_type: item.msg_type || 'unknown',
+        content,
+        create_time: item.create_time
+          ? new Date(Number(item.create_time) * 1000).toISOString()
+          : '',
+      };
+    });
+  }
+
+  /** Extract plain text from a Lark post content structure. */
+  private extractPostText(content: any[][]): string {
+    if (!Array.isArray(content)) return '';
+    return content
+      .map((line) =>
+        (Array.isArray(line) ? line : [])
+          .map((el: any) => {
+            if (el.tag === 'text') return el.text || '';
+            if (el.tag === 'at') return `@${el.user_name || el.user_id || ''}`;
+            if (el.tag === 'a') return el.text || el.href || '';
+            return '';
+          })
+          .join(''),
+      )
+      .join('\n');
   }
 
   /**

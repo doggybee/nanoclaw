@@ -164,12 +164,15 @@ function findReplyTarget(
 ): { messageId: string; senderId: string; senderName: string } | undefined {
   if (requiresTrigger) {
     for (let i = messages.length - 1; i >= 0; i--) {
+      // Skip synthetic card-action messages — their IDs aren't valid Lark message IDs
+      if (messages[i].id.startsWith('card-action-')) continue;
       if (TRIGGER_PATTERN.test(messages[i].content.trim())) {
         return { messageId: messages[i].id, senderId: messages[i].sender, senderName: messages[i].sender_name };
       }
     }
   } else {
     for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].id.startsWith('card-action-')) continue;
       if (!messages[i].is_bot_message) {
         return { messageId: messages[i].id, senderId: messages[i].sender, senderName: messages[i].sender_name };
       }
@@ -211,7 +214,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  // For trigger-required groups, only send messages that contain the trigger.
+  // The agent can use get_chat_history to fetch surrounding context if needed.
+  const relevantMessages = group.requiresTrigger !== false
+    ? missedMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+    : missedMessages;
+
+  const prompt = formatMessages(relevantMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -239,12 +248,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  // Set reply target in shared state so both initial and piped outputs use it
-  pendingReplyTo[chatJid] = findReplyTarget(missedMessages, group.requiresTrigger !== false);
+  // Set reply target in shared state so both initial and piped outputs use it.
+  // If onCardAction already set a reply target (real card message_id), keep it.
+  if (!pendingReplyTo[chatJid]) {
+    pendingReplyTo[chatJid] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
+  }
 
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+
+  let lastStreamedText = '';
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
@@ -255,16 +269,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+
       if (text) {
-        // Read and consume reply target from shared state
-        const target = pendingReplyTo[chatJid];
-        pendingReplyTo[chatJid] = undefined;
-        const opts = target
-          ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
-          : undefined;
-        await channel.sendMessage(chatJid, text, opts);
-        outputSentToUser = true;
+        if (result.isStreaming) {
+          // Real-time streaming chunk from assistant — push incrementally to card
+          logger.info({ group: group.name }, `Streaming chunk: ${text.slice(0, 100)}`);
+          lastStreamedText = text;
+          const target = pendingReplyTo[chatJid];
+          pendingReplyTo[chatJid] = undefined;
+          const opts = target
+            ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
+            : undefined;
+          await channel.sendMessage(chatJid, text, opts);
+          outputSentToUser = true;
+        } else {
+          // Final result — only send if different from what we already streamed
+          logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+          if (text !== lastStreamedText) {
+            const target = pendingReplyTo[chatJid];
+            pendingReplyTo[chatJid] = undefined;
+            const opts = target
+              ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
+              : undefined;
+            await channel.sendMessage(chatJid, text, opts);
+            outputSentToUser = true;
+          }
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -445,24 +475,24 @@ async function startMessageLoop(): Promise<void> {
             if (!hasTrigger) continue;
           }
 
-          // Pull all messages since lastAgentTimestamp so non-trigger
-          // context that accumulated between triggers is included.
-          const allPending = getMessagesSince(
-            chatJid,
-            lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
-          );
-          const messagesToSend =
-            allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
+          // Only send trigger messages to the agent (consistent with processGroupMessages).
+          // The agent can use get_chat_history to pull surrounding context if needed.
+          const triggerMessages = needsTrigger
+            ? groupMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+            : groupMessages;
+          const formatted = formatMessages(triggerMessages);
 
           if (queue.sendMessage(chatJid, formatted)) {
+            // End current streaming card so the next reply creates a new one
+            await channel.endStreaming?.(chatJid);
+
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, count: triggerMessages.length },
               'Piped messages to active container',
             );
+            // Advance cursor past ALL messages (including non-trigger) to avoid re-processing
             lastAgentTimestamp[chatJid] =
-              messagesToSend[messagesToSend.length - 1].timestamp;
+              groupMessages[groupMessages.length - 1].timestamp;
             saveState();
             // Update reply target so the callback picks up the new trigger message
             pendingReplyTo[chatJid] = findReplyTarget(groupMessages, needsTrigger);
@@ -542,8 +572,11 @@ async function main(): Promise<void> {
       const group = registeredGroups[chatJid];
       if (!group) return;
       const actionText = `@${ASSISTANT_NAME} [Card action: ${action.actionId}${action.value ? ` data=${JSON.stringify(action.value)}` : ''} by user ${action.userId}]`;
+      // Synthetic ID must be unique per click (same card can be clicked many times).
+      // Store the real Lark message_id in the content so findReplyTarget can use it.
+      const syntheticId = `card-action-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       storeMessage({
-        id: `card-action-${Date.now()}`,
+        id: syntheticId,
         chat_jid: chatJid,
         sender: action.userId,
         sender_name: action.userId,
@@ -552,6 +585,11 @@ async function main(): Promise<void> {
         is_from_me: false,
         is_bot_message: false,
       });
+      // Pre-set reply target to the real card message so the agent's reply
+      // references the card, not the synthetic message ID.
+      if (action.messageId) {
+        pendingReplyTo[chatJid] = { messageId: action.messageId, senderId: action.userId, senderName: action.userId };
+      }
       wakeMessageLoop();
     },
     registeredGroups: () => registeredGroups,
@@ -604,6 +642,16 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel?.editMessage) throw new Error(`No channel with edit support for JID: ${jid}`);
       return channel.editMessage(jid, messageId, text);
+    },
+    getChatHistory: (jid, count, beforeTimestamp) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.getChatHistory) throw new Error(`No channel with chat history support for JID: ${jid}`);
+      return channel.getChatHistory(jid, count, beforeTimestamp);
+    },
+    sendCard: (jid, cardJson, replyToMessageId) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendCard) throw new Error(`No channel with card support for JID: ${jid}`);
+      return channel.sendCard(jid, cardJson, replyToMessageId);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

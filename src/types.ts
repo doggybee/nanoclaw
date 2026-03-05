@@ -99,6 +99,19 @@ export interface Channel {
   editMessage?(jid: string, messageId: string, text: string): Promise<void>;
   // Optional: download a message resource (image/file) to a local path.
   downloadResource?(messageId: string, resourceKey: string, destPath: string): Promise<string>;
+  // Optional: fetch chat history from the platform API.
+  getChatHistory?(jid: string, count: number, beforeTimestamp?: string): Promise<ChatHistoryMessage[]>;
+  // Optional: send an interactive card (buttons, selects, etc.)
+  sendCard?(jid: string, cardJson: object, replyToMessageId?: string): Promise<void>;
+}
+
+export interface ChatHistoryMessage {
+  message_id: string;
+  sender_id: string;
+  sender_type: string; // "user" | "bot" | "app"
+  msg_type: string;    // "text" | "post" | "interactive" | "image" | etc.
+  content: string;     // parsed text content
+  create_time: string; // ISO timestamp
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -13,7 +13,7 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { ChatHistoryMessage, RegisteredGroup } from './types.js';
 
 /**
  * Resolve a container-internal path to the corresponding host path.
@@ -34,6 +34,8 @@ export interface IpcDeps {
   sendImage?: (jid: string, imagePath: string) => Promise<void>;
   sendFile?: (jid: string, filePath: string) => Promise<void>;
   editMessage?: (jid: string, messageId: string, text: string) => Promise<void>;
+  getChatHistory?: (jid: string, count: number, beforeTimestamp?: string) => Promise<ChatHistoryMessage[]>;
+  sendCard?: (jid: string, cardJson: object, replyToMessageId?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -131,6 +133,30 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'Unauthorized IPC add_reaction attempt blocked',
                   );
                 }
+              } else if (data.type === 'edit_message' && data.chatJid && data.messageId && data.text) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.editMessage) {
+                    await deps.editMessage(data.chatJid, data.messageId, data.text);
+                    logger.info(
+                      { chatJid: data.chatJid, messageId: data.messageId, sourceGroup },
+                      'IPC message edited',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'editMessage not available on channel',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC edit_message attempt blocked',
+                  );
+                }
               } else if (data.type === 'send_image' && data.chatJid && data.imagePath) {
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
@@ -170,6 +196,73 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC send_file attempt blocked',
+                  );
+                }
+              } else if (data.type === 'send_card' && data.chatJid && data.cardJson) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.sendCard) {
+                    await deps.sendCard(data.chatJid, data.cardJson, data.replyToMessageId);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'IPC card sent',
+                    );
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'sendCard not available on channel',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_card attempt blocked',
+                  );
+                }
+              } else if (data.type === 'get_chat_history' && data.chatJid && data.requestId) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.getChatHistory) {
+                    try {
+                      const messages = await deps.getChatHistory(
+                        data.chatJid,
+                        data.count || 20,
+                        data.beforeTimestamp || undefined,
+                      );
+                      // Write response file for the agent to pick up
+                      const responseDir = path.join(ipcBaseDir, sourceGroup, 'responses');
+                      fs.mkdirSync(responseDir, { recursive: true });
+                      const responsePath = path.join(responseDir, `${data.requestId}.json`);
+                      const tempPath = `${responsePath}.tmp`;
+                      fs.writeFileSync(tempPath, JSON.stringify({ status: 'ok', messages }));
+                      fs.renameSync(tempPath, responsePath);
+                      logger.info(
+                        { chatJid: data.chatJid, count: messages.length, requestId: data.requestId, sourceGroup },
+                        'IPC chat history fetched',
+                      );
+                    } catch (err) {
+                      const responseDir = path.join(ipcBaseDir, sourceGroup, 'responses');
+                      fs.mkdirSync(responseDir, { recursive: true });
+                      const responsePath = path.join(responseDir, `${data.requestId}.json`);
+                      fs.writeFileSync(responsePath, JSON.stringify({ status: 'error', error: String(err) }));
+                      logger.error({ err, requestId: data.requestId, sourceGroup }, 'IPC chat history fetch failed');
+                    }
+                  } else {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup },
+                      'getChatHistory not available on channel',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC get_chat_history attempt blocked',
                   );
                 }
               }

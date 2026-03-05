@@ -86,6 +86,142 @@ server.tool(
 );
 
 server.tool(
+  'get_chat_history',
+  `Fetch recent chat history from the messaging platform. Returns messages in reverse chronological order (newest first).
+Use this to get context about the conversation — especially messages from other users that weren't sent directly to you.
+Each returned message includes message_id, sender_id, sender_type ("user" or "bot"), msg_type, content, and create_time.`,
+  {
+    count: z.number().min(1).max(50).default(20).describe('Number of messages to fetch (1-50, default 20)'),
+    before_timestamp: z.string().optional().describe('ISO timestamp — only return messages before this time. Omit for latest messages.'),
+  },
+  async (args) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'get_chat_history',
+      chatJid,
+      count: args.count || 20,
+      beforeTimestamp: args.before_timestamp || undefined,
+      requestId,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    // Poll for response file
+    const responsePath = path.join(IPC_DIR, 'responses', `${requestId}.json`);
+    const timeout = 15_000;
+    const pollMs = 300;
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+      if (fs.existsSync(responsePath)) {
+        const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
+        try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
+        if (data.status === 'error') {
+          return { content: [{ type: 'text' as const, text: `Error fetching chat history: ${data.error}` }], isError: true };
+        }
+        const messages = data.messages || [];
+        if (messages.length === 0) {
+          return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
+        }
+        const formatted = messages.map((m: any) =>
+          `[${m.create_time}] ${m.sender_type === 'bot' ? '(bot)' : '(user)'} ${m.sender_id}: [${m.msg_type}] ${m.content}`
+        ).join('\n');
+        return { content: [{ type: 'text' as const, text: formatted }] };
+      }
+      await new Promise((r) => setTimeout(r, pollMs));
+    }
+
+    return { content: [{ type: 'text' as const, text: 'Timeout waiting for chat history response.' }], isError: true };
+  },
+);
+
+server.tool(
+  'send_card',
+  `Send an interactive card with buttons or menus. The user can click buttons and the action will be sent back to you as a message.
+
+Uses Lark Card schema 2.0. IMPORTANT: schema 2.0 does NOT support the "action" wrapper tag. Place buttons directly in elements, or use column_set for horizontal layout.
+
+Example — single button:
+{
+  "schema": "2.0",
+  "header": { "title": { "tag": "plain_text", "content": "Title" } },
+  "body": { "elements": [
+    { "tag": "markdown", "content": "Which do you prefer?" },
+    { "tag": "button", "text": { "tag": "plain_text", "content": "Option A" }, "type": "primary",
+      "behaviors": [{ "type": "callback", "value": { "action_id": "choose", "choice": "A" } }] }
+  ]}
+}
+
+Example — multiple buttons side by side (use column_set):
+{
+  "schema": "2.0",
+  "header": { "title": { "tag": "plain_text", "content": "Pick" } },
+  "body": { "elements": [
+    { "tag": "markdown", "content": "Choose one:" },
+    { "tag": "column_set", "columns": [
+      { "tag": "column", "width": "auto", "elements": [
+        { "tag": "button", "text": { "tag": "plain_text", "content": "A" }, "type": "primary",
+          "behaviors": [{ "type": "callback", "value": { "action_id": "choose", "choice": "A" } }] }
+      ]},
+      { "tag": "column", "width": "auto", "elements": [
+        { "tag": "button", "text": { "tag": "plain_text", "content": "B" }, "type": "danger",
+          "behaviors": [{ "type": "callback", "value": { "action_id": "choose", "choice": "B" } }] }
+      ]}
+    ]}
+  ]}
+}
+
+Button types: "primary" (blue), "danger" (red), "default" (gray). Sizes: "small", "medium", "large".
+Each button MUST have "behaviors": [{"type": "callback", "value": {...}}] for the click to work.
+When a user clicks, you receive: [Card action: choose data={"action_id":"choose","choice":"A"} by user <open_id>]`,
+  {
+    card_json: z.string().describe('Lark Card JSON (schema 2.0) as a string'),
+  },
+  async (args) => {
+    let cardJson: object;
+    try {
+      cardJson = JSON.parse(args.card_json);
+    } catch {
+      return { content: [{ type: 'text' as const, text: 'Invalid JSON in card_json' }], isError: true };
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'send_card',
+      chatJid,
+      cardJson,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: 'Interactive card sent.' }] };
+  },
+);
+
+server.tool(
+  'edit_message',
+  'Edit a previously sent message. Only works for messages sent by the bot. Use the message ID from the <message id="..."> attribute. The message content will be fully replaced with the new text.',
+  {
+    message_id: z.string().describe('The message ID of the bot message to edit (from the id attribute in <message> tags)'),
+    text: z.string().describe('The new message text to replace the old content'),
+  },
+  async (args) => {
+    const data = {
+      type: 'edit_message',
+      chatJid,
+      messageId: args.message_id,
+      text: args.text,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
+  },
+);
+
+server.tool(
   'send_image',
   'Send an image file to the user or group. The image must exist at the given path within the container filesystem (e.g., /workspace/group/tmp/screenshot.png).',
   {

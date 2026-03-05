@@ -71,6 +71,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  isStreaming?: boolean;
 }
 
 interface VolumeMount {
