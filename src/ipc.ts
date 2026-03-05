@@ -11,13 +11,29 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+
+/**
+ * Resolve a container-internal path to the corresponding host path.
+ * Container mounts: /workspace/group → groups/{folder}
+ */
+function resolveContainerPath(containerPath: string, groupFolder: string): string {
+  if (containerPath.startsWith('/workspace/group/')) {
+    const relative = containerPath.slice('/workspace/group/'.length);
+    return path.join(resolveGroupFolderPath(groupFolder), relative);
+  }
+  // Fallback: return as-is (may be absolute host path already)
+  return containerPath;
+}
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   addReaction?: (jid: string, messageId: string, emojiType: string) => Promise<void>;
+  sendImage?: (jid: string, imagePath: string) => Promise<void>;
+  sendFile?: (jid: string, filePath: string) => Promise<void>;
+  editMessage?: (jid: string, messageId: string, text: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -113,6 +129,47 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC add_reaction attempt blocked',
+                  );
+                }
+              } else if (data.type === 'send_image' && data.chatJid && data.imagePath) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.sendImage) {
+                    // Resolve container path to host path
+                    const hostPath = resolveContainerPath(data.imagePath, sourceGroup);
+                    await deps.sendImage(data.chatJid, hostPath);
+                    logger.info(
+                      { chatJid: data.chatJid, imagePath: hostPath, sourceGroup },
+                      'IPC image sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_image attempt blocked',
+                  );
+                }
+              } else if (data.type === 'send_file' && data.chatJid && data.filePath) {
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  if (deps.sendFile) {
+                    const hostPath = resolveContainerPath(data.filePath, sourceGroup);
+                    await deps.sendFile(data.chatJid, hostPath);
+                    logger.info(
+                      { chatJid: data.chatJid, filePath: hostPath, sourceGroup },
+                      'IPC file sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC send_file attempt blocked',
                   );
                 }
               }

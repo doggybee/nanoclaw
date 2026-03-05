@@ -280,6 +280,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   });
 
   await channel.setTyping?.(chatJid, false);
+  await channel.endStreaming?.(chatJid);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -536,6 +537,23 @@ async function main(): Promise<void> {
       channel?: string,
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    onCardAction: (chatJid: string, action: { actionId: string; value?: Record<string, string>; userId: string; messageId?: string }) => {
+      // Inject card action as a synthetic message so the agent can process it
+      const group = registeredGroups[chatJid];
+      if (!group) return;
+      const actionText = `@${ASSISTANT_NAME} [Card action: ${action.actionId}${action.value ? ` data=${JSON.stringify(action.value)}` : ''} by user ${action.userId}]`;
+      storeMessage({
+        id: `card-action-${Date.now()}`,
+        chat_jid: chatJid,
+        sender: action.userId,
+        sender_name: action.userId,
+        content: actionText,
+        timestamp: new Date().toISOString(),
+        is_from_me: false,
+        is_bot_message: false,
+      });
+      wakeMessageLoop();
+    },
     registeredGroups: () => registeredGroups,
   };
 
@@ -571,6 +589,21 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel?.addReaction) throw new Error(`No channel with reaction support for JID: ${jid}`);
       return channel.addReaction(jid, messageId, emojiType);
+    },
+    sendImage: (jid, imagePath) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendImage) throw new Error(`No channel with image support for JID: ${jid}`);
+      return channel.sendImage(jid, imagePath);
+    },
+    sendFile: (jid, filePath) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.sendFile) throw new Error(`No channel with file support for JID: ${jid}`);
+      return channel.sendFile(jid, filePath);
+    },
+    editMessage: (jid, messageId, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel?.editMessage) throw new Error(`No channel with edit support for JID: ${jid}`);
+      return channel.editMessage(jid, messageId, text);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

@@ -1,4 +1,6 @@
+import * as fs from 'fs';
 import * as http from 'http';
+import * as path from 'path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
@@ -190,10 +192,27 @@ export function splitMarkdown(text: string, maxLen: number): string[] {
   return chunks;
 }
 
+export type OnCardAction = (chatJid: string, action: {
+  actionId: string;
+  value?: Record<string, string>;
+  userId: string;
+  messageId?: string;
+}) => void;
+
 export interface LarkChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
+  onCardAction?: OnCardAction;
   registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+// Streaming card element ID
+const STREAMING_ELEMENT_ID = 'streaming_md';
+
+interface StreamingCard {
+  cardId: string;
+  accumulatedText: string;
+  sequence: number;
 }
 
 export class LarkChannel implements Channel {
@@ -207,6 +226,7 @@ export class LarkChannel implements Channel {
   private flushing = false;
   private seenMessages = new Map<string, number>();
   private dedupTimer: ReturnType<typeof setInterval> | undefined;
+  private streamingCards = new Map<string, StreamingCard>();
 
   private appId: string;
   private appSecret: string;
@@ -267,15 +287,46 @@ export class LarkChannel implements Channel {
       },
     });
 
+    // Card action handler for interactive card callbacks
+    const cardActionPath = env.LARK_WEBHOOK_PATH
+      ? `${env.LARK_WEBHOOK_PATH.replace(/\/$/, '')}/card`
+      : '/lark/card';
+    const cardActionHandler = new Lark.CardActionHandler(
+      {
+        encryptKey: env.LARK_ENCRYPT_KEY || undefined,
+        verificationToken: env.LARK_VERIFICATION_TOKEN || undefined,
+      },
+      async (data: any) => {
+        await this.handleCardAction(data);
+        // Return empty to acknowledge without updating card
+        return undefined as any;
+      },
+    );
+
     // Create HTTP webhook handler using Lark SDK adapter
     const webhookHandler = (Lark as any).adaptDefault(
       webhookPath,
       eventDispatcher,
       { autoChallenge: true },
     );
+    const cardWebhookHandler = (Lark as any).adaptDefault(
+      cardActionPath,
+      cardActionHandler,
+      { autoChallenge: true },
+    );
 
-    // Start HTTP server for receiving Lark event callbacks
+    // Start HTTP server for receiving Lark event callbacks and card actions
     this.server = http.createServer((req, res) => {
+      if (req.url && req.url.startsWith(cardActionPath)) {
+        cardWebhookHandler(req, res).catch((err: Error) => {
+          logger.error({ err }, 'Lark card action handler error');
+          if (!res.headersSent) {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
+          }
+        });
+        return;
+      }
       if (req.url && !req.url.startsWith(webhookPath)) {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
@@ -347,19 +398,9 @@ export class LarkChannel implements Channel {
     if (messageId && this.seenMessages.has(messageId)) return;
     if (messageId) this.seenMessages.set(messageId, Date.now());
 
-    // Only process text messages
-    if (message.message_type !== 'text') return;
-
-    // Parse content JSON: {"text": "..."}
-    let textContent: string;
-    try {
-      const parsed = JSON.parse(message.content);
-      textContent = parsed.text;
-    } catch {
-      return;
-    }
-
-    if (!textContent) return;
+    const messageType = message.message_type; // 'text', 'image', 'file', 'post'
+    // Only process text, image, and file messages
+    if (!['text', 'image', 'file'].includes(messageType)) return;
 
     const chatId = message.chat_id;
     if (!chatId) return;
@@ -390,12 +431,41 @@ export class LarkChannel implements Channel {
       ? ASSISTANT_NAME
       : sender?.sender_id?.open_id || 'unknown';
 
+    // --- Extract content based on message type ---
+    let content = '';
+    let hasTrigger = false;
+
+    if (messageType === 'text') {
+      try {
+        const parsed = JSON.parse(message.content);
+        content = parsed.text || '';
+      } catch {
+        return;
+      }
+    } else if (messageType === 'image') {
+      // Image messages: only process if bot is @mentioned or in non-trigger groups
+      // The image_key is used to download it later via downloadResource
+      try {
+        const parsed = JSON.parse(message.content);
+        content = `[image:${parsed.image_key}]`;
+      } catch {
+        return;
+      }
+    } else if (messageType === 'file') {
+      try {
+        const parsed = JSON.parse(message.content);
+        content = `[file:${parsed.file_key}:${parsed.file_name || 'unknown'}]`;
+      } catch {
+        return;
+      }
+    }
+
+    if (!content) return;
+
     // Normalize @mentions: Lark uses @_user_N placeholder in text
     // Replace mentions of our bot with the trigger pattern
-    let content = textContent;
+    const originalContent = content;
     if (!isBotMessage) {
-      // Lark @mentions appear as @_user_N in text, with mention details in
-      // message.mentions array. Check if our bot is mentioned.
       const mentions = message.mentions as
         | Array<{ key: string; id?: { open_id?: string }; name?: string }>
         | undefined;
@@ -403,15 +473,77 @@ export class LarkChannel implements Channel {
         for (const mention of mentions) {
           if (mention.id?.open_id === this.botOpenId && mention.key) {
             content = content.replace(mention.key, `@${ASSISTANT_NAME}`);
+            hasTrigger = true;
           }
         }
       }
-      // If bot was @mentioned but content doesn't start with trigger, prepend it
       if (
-        content !== textContent &&
+        hasTrigger &&
         !TRIGGER_PATTERN.test(content)
       ) {
         content = `@${ASSISTANT_NAME} ${content}`;
+      }
+    }
+
+    // For image/file messages without trigger text, check if the group
+    // doesn't require a trigger (p2p chats). Otherwise skip non-triggered media.
+    const group = groups[jid];
+    if ((messageType === 'image' || messageType === 'file') && !hasTrigger) {
+      if (group?.requiresTrigger !== false) {
+        // Media without trigger in a trigger-required group — skip
+        return;
+      }
+    }
+
+    // For triggered image/file messages, download the resource
+    if ((messageType === 'image' || messageType === 'file') &&
+        (hasTrigger || group?.requiresTrigger === false)) {
+      try {
+        const groupFolder = group?.folder || 'main';
+        const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        if (messageType === 'image') {
+          const parsed = JSON.parse(message.content);
+          const imageKey = parsed.image_key;
+          const ext = '.png';
+          const filename = `img_${Date.now()}${ext}`;
+          const destPath = path.join(tmpDir, filename);
+
+          // Use messageResource.get to download user-sent images
+          const resp = await this.client.im.v1.messageResource.get({
+            path: { message_id: messageId, file_key: imageKey },
+            params: { type: 'image' },
+          });
+
+          if (resp) {
+            await resp.writeFile(destPath);
+            // chown to container user (uid 1000) so agent can read
+            try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
+            content = `@${ASSISTANT_NAME} [User sent an image. File saved at: /workspace/group/tmp/${filename} — use the Read tool to view it]`;
+            logger.info({ jid, imageKey, destPath }, 'Image downloaded for agent');
+          }
+        } else if (messageType === 'file') {
+          const parsed = JSON.parse(message.content);
+          const fileKey = parsed.file_key;
+          const fileName = parsed.file_name || `file_${Date.now()}`;
+          const destPath = path.join(tmpDir, fileName);
+
+          const resp = await this.client.im.v1.messageResource.get({
+            path: { message_id: messageId, file_key: fileKey },
+            params: { type: 'file' },
+          });
+
+          if (resp) {
+            await resp.writeFile(destPath);
+            try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
+            content = `@${ASSISTANT_NAME} [User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`;
+            logger.info({ jid, fileKey, destPath }, 'File downloaded for agent');
+          }
+        }
+      } catch (err) {
+        logger.warn({ jid, messageType, err }, 'Failed to download media');
+        // Keep the original content tag so agent knows media was sent
       }
     }
 
@@ -427,6 +559,38 @@ export class LarkChannel implements Channel {
     });
   }
 
+  private async handleCardAction(data: any): Promise<void> {
+    try {
+      const action = data?.action;
+      const operatorId = data?.operator?.open_id;
+      const chatId = data?.open_chat_id;
+      const messageId = data?.open_message_id;
+
+      if (!action || !operatorId) return;
+
+      const actionTag = action.tag; // 'button', 'select_static', etc.
+      const actionValue = action.value || {};
+      const actionId = actionValue.action_id || action.name || actionTag;
+
+      logger.info(
+        { actionId, actionTag, operatorId, chatId, messageId },
+        'Card action received',
+      );
+
+      if (chatId && this.opts.onCardAction) {
+        const jid = `lark:${chatId}`;
+        this.opts.onCardAction(jid, {
+          actionId,
+          value: actionValue,
+          userId: operatorId,
+          messageId,
+        });
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error handling card action');
+    }
+  }
+
   async sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void> {
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -438,34 +602,11 @@ export class LarkChannel implements Channel {
     }
 
     try {
-      await this._sendDirect(jid, text, opts?.replyToMessageId, opts?.mentionUser);
+      await this._sendStreaming(jid, text, opts?.replyToMessageId, opts?.mentionUser);
     } catch (err) {
-      // Fallback: retry as a plain text message (without markdown parsing)
-      logger.warn({ jid, err }, 'Send failed, retrying as plain text');
+      logger.warn({ jid, err }, 'Streaming card send failed, falling back to post');
       try {
-        const fallbackText = opts?.mentionUser
-          ? `<at user_id="${opts.mentionUser.id}">${opts.mentionUser.name}</at> ${text}`
-          : text;
-        if (opts?.replyToMessageId) {
-          await this.client.im.v1.message.reply({
-            path: { message_id: opts.replyToMessageId },
-            data: {
-              content: JSON.stringify({ text: fallbackText }),
-              msg_type: 'text',
-            },
-          });
-        } else {
-          const chatId = jid.replace(/^lark:/, '');
-          await this.client.im.v1.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chatId,
-              content: JSON.stringify({ text: fallbackText }),
-              msg_type: 'text',
-            },
-          });
-        }
-        logger.info({ jid, length: text.length }, 'Lark message sent (text fallback)');
+        await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
       } catch (fallbackErr) {
         this.outgoingQueue.push({ jid, text });
         logger.warn(
@@ -477,12 +618,119 @@ export class LarkChannel implements Channel {
   }
 
   /**
-   * Core send logic: split long text and send as post (rich text) messages with markdown support.
-   * When replyToMessageId is provided, the first chunk is sent as a reply
-   * (quote-reply) to that message; subsequent chunks use message.create.
-   * When mentionUser is provided, the first chunk is prefixed with an @mention.
+   * Send or append text via streaming card.
+   * First call for a jid: creates card entity, sends it, pushes initial text.
+   * Subsequent calls: appends text to the same card with typewriter effect.
    */
-  private async _sendDirect(
+  private async _sendStreaming(
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+    mentionUser?: { id: string; name: string },
+  ): Promise<void> {
+    const existing = this.streamingCards.get(jid);
+
+    if (existing) {
+      // Append to existing streaming card
+      existing.accumulatedText += '\n\n' + text;
+      existing.sequence++;
+      await this.client.cardkit.v1.cardElement.content({
+        path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
+        data: { content: existing.accumulatedText, sequence: existing.sequence },
+      });
+      logger.info({ jid, cardId: existing.cardId, length: existing.accumulatedText.length }, 'Streaming card text appended');
+    } else {
+      // Create new streaming card
+      const mentionPrefix = mentionUser
+        ? `<at id=${mentionUser.id}></at> `
+        : '';
+
+      const cardJson = {
+        schema: '2.0',
+        config: {
+          streaming_mode: true,
+          summary: { content: '' },
+          streaming_config: {
+            print_frequency_ms: { default: 50 },
+            print_step: { default: 2 },
+            print_strategy: 'fast',
+          },
+        },
+        body: {
+          elements: [{
+            tag: 'markdown',
+            content: ' ',
+            element_id: STREAMING_ELEMENT_ID,
+          }],
+        },
+      };
+
+      const createResult = await this.client.cardkit.v1.card.create({
+        data: {
+          type: 'card_json',
+          data: JSON.stringify(cardJson),
+        },
+      });
+
+      const cardId = createResult?.data?.card_id;
+      if (!cardId) throw new Error('Failed to create card entity');
+
+      // Send the card as a message
+      const chatId = jid.replace(/^lark:/, '');
+      const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+
+      if (replyToMessageId) {
+        await this.client.im.v1.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content, msg_type: 'interactive' },
+        });
+      } else {
+        await this.client.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: { receive_id: chatId, content, msg_type: 'interactive' },
+        });
+      }
+
+      const fullText = mentionPrefix + text;
+      this.streamingCards.set(jid, { cardId, accumulatedText: fullText, sequence: 1 });
+
+      // Push initial text with typewriter effect
+      await this.client.cardkit.v1.cardElement.content({
+        path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
+        data: { content: fullText, sequence: 1 },
+      });
+
+      logger.info({ jid, cardId, length: fullText.length }, 'Streaming card created and sent');
+    }
+  }
+
+  /**
+   * End the streaming session for a chat: disable streaming mode and clean up.
+   */
+  async endStreaming(jid: string): Promise<void> {
+    const card = this.streamingCards.get(jid);
+    if (!card) return;
+
+    try {
+      card.sequence++;
+      await this.client.cardkit.v1.card.settings({
+        path: { card_id: card.cardId },
+        data: {
+          settings: JSON.stringify({ config: { streaming_mode: false } }),
+          sequence: card.sequence,
+        },
+      });
+      logger.info({ jid, cardId: card.cardId }, 'Streaming mode disabled');
+    } catch (err) {
+      logger.warn({ jid, err }, 'Failed to disable streaming mode');
+    }
+    this.streamingCards.delete(jid);
+  }
+
+  /**
+   * Fallback: send as post (rich text) messages when streaming card fails.
+   */
+  private async _sendPostFallback(
     jid: string,
     text: string,
     replyToMessageId?: string,
@@ -492,12 +740,10 @@ export class LarkChannel implements Channel {
     const chunks = splitMarkdown(text, MAX_TEXT_LENGTH);
 
     for (let i = 0; i < chunks.length; i++) {
-      // Prepend @mention to the first chunk only
       const chunkText = i === 0 && mentionUser
         ? `<at user_id="${mentionUser.id}">${mentionUser.name}</at> ${chunks[i]}`
         : chunks[i];
 
-      // Convert markdown to post message content
       const postContent = markdownToPostContent(chunkText);
       const content = JSON.stringify(postContent);
 
@@ -513,7 +759,7 @@ export class LarkChannel implements Channel {
         });
       }
     }
-    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (post with markdown)');
+    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (post fallback)');
   }
 
   isConnected(): boolean {
@@ -551,6 +797,131 @@ export class LarkChannel implements Channel {
       data: { reaction_type: { emoji_type: emojiType } },
     });
     logger.info({ messageId, emojiType }, 'Lark reaction added');
+  }
+
+  /**
+   * Send an image file to a chat.
+   * Uploads the image first via im.v1.image.create, then sends it as a message.
+   */
+  async sendImage(jid: string, imagePath: string, replyToMessageId?: string): Promise<void> {
+    const imageData = fs.readFileSync(imagePath);
+    const uploadResp = await this.client.im.v1.image.create({
+      data: {
+        image_type: 'message',
+        image: Buffer.from(imageData),
+      },
+    });
+
+    const imageKey = uploadResp?.image_key;
+    if (!imageKey) throw new Error('Failed to upload image');
+
+    const chatId = jid.replace(/^lark:/, '');
+    const content = JSON.stringify({ image_key: imageKey });
+
+    if (replyToMessageId) {
+      await this.client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: 'image' },
+      });
+    } else {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, content, msg_type: 'image' },
+      });
+    }
+    logger.info({ jid, imagePath, imageKey }, 'Lark image sent');
+  }
+
+  /**
+   * Send a file to a chat.
+   * Uploads the file first via im.v1.file.create, then sends it as a message.
+   */
+  async sendFile(jid: string, filePath: string, replyToMessageId?: string): Promise<void> {
+    const fileName = path.basename(filePath);
+    const fileData = fs.readFileSync(filePath);
+    // Determine file type from extension
+    const ext = path.extname(fileName).toLowerCase();
+    type LarkFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
+    const fileTypeMap: Record<string, LarkFileType> = {
+      '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc',
+      '.xls': 'xls', '.xlsx': 'xls', '.ppt': 'ppt', '.pptx': 'ppt',
+      '.mp4': 'mp4',
+    };
+    const fileType: LarkFileType = fileTypeMap[ext] || 'stream';
+
+    const uploadResp = await this.client.im.v1.file.create({
+      data: {
+        file_type: fileType,
+        file_name: fileName,
+        file: Buffer.from(fileData),
+      },
+    });
+
+    const fileKey = uploadResp?.file_key;
+    if (!fileKey) throw new Error('Failed to upload file');
+
+    const chatId = jid.replace(/^lark:/, '');
+    const content = JSON.stringify({ file_key: fileKey });
+
+    if (replyToMessageId) {
+      await this.client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: 'file' },
+      });
+    } else {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, content, msg_type: 'file' },
+      });
+    }
+    logger.info({ jid, filePath, fileKey }, 'Lark file sent');
+  }
+
+  /**
+   * Edit a previously sent message. Replaces content with new text.
+   * Only works for messages sent by the bot.
+   */
+  async editMessage(_jid: string, messageId: string, text: string): Promise<void> {
+    const postContent = markdownToPostContent(text);
+    await this.client.im.v1.message.patch({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify(postContent),
+      },
+    });
+    logger.info({ messageId, length: text.length }, 'Lark message edited');
+  }
+
+  /**
+   * Download a message resource (image/file) to a local path.
+   * Returns the path where the file was saved.
+   */
+  async downloadResource(messageId: string, resourceKey: string, destPath: string): Promise<string> {
+    // Try as image first, then as file
+    try {
+      const resp = await this.client.im.v1.messageResource.get({
+        path: { message_id: messageId, file_key: resourceKey },
+        params: { type: 'image' },
+      });
+      if (resp) {
+        await resp.writeFile(destPath);
+        logger.info({ messageId, resourceKey, destPath }, 'Image resource downloaded');
+        return destPath;
+      }
+    } catch {
+      // Not an image, try as file
+    }
+
+    const resp = await this.client.im.v1.messageResource.get({
+      path: { message_id: messageId, file_key: resourceKey },
+      params: { type: 'file' },
+    });
+    if (resp) {
+      await resp.writeFile(destPath);
+      logger.info({ messageId, resourceKey, destPath }, 'File resource downloaded');
+      return destPath;
+    }
+    throw new Error(`Failed to download resource ${resourceKey}`);
   }
 
   /**
@@ -607,7 +978,7 @@ export class LarkChannel implements Channel {
       );
       while (this.outgoingQueue.length > 0) {
         const item = this.outgoingQueue.shift()!;
-        await this._sendDirect(item.jid, item.text);
+        await this._sendStreaming(item.jid, item.text);
       }
     } finally {
       this.flushing = false;

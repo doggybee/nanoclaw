@@ -86,6 +86,58 @@ server.tool(
 );
 
 server.tool(
+  'send_image',
+  'Send an image file to the user or group. The image must exist at the given path within the container filesystem (e.g., /workspace/group/tmp/screenshot.png).',
+  {
+    image_path: z.string().describe('Absolute path to the image file inside the container'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.image_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `Image file not found: ${args.image_path}` }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'send_image',
+      chatJid,
+      imagePath: args.image_path,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: `Image sent: ${args.image_path}` }] };
+  },
+);
+
+server.tool(
+  'send_file',
+  'Send a file to the user or group. The file must exist at the given path within the container filesystem.',
+  {
+    file_path: z.string().describe('Absolute path to the file inside the container'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    writeIpcFile(MESSAGES_DIR, {
+      type: 'send_file',
+      chatJid,
+      filePath: args.file_path,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    });
+
+    return { content: [{ type: 'text' as const, text: `File sent: ${args.file_path}` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

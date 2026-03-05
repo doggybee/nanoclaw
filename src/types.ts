@@ -89,6 +89,16 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: emoji reaction on a message.
   addReaction?(jid: string, messageId: string, emojiType: string): Promise<void>;
+  // Optional: end a streaming card session (Lark streaming cards).
+  endStreaming?(jid: string): Promise<void>;
+  // Optional: send an image file.
+  sendImage?(jid: string, imagePath: string, replyToMessageId?: string): Promise<void>;
+  // Optional: send a file.
+  sendFile?(jid: string, filePath: string, replyToMessageId?: string): Promise<void>;
+  // Optional: edit a previously sent message.
+  editMessage?(jid: string, messageId: string, text: string): Promise<void>;
+  // Optional: download a message resource (image/file) to a local path.
+  downloadResource?(messageId: string, resourceKey: string, destPath: string): Promise<string>;
 }
 
 // Callback type that channels use to deliver inbound messages
