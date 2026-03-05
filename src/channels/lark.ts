@@ -811,11 +811,10 @@ export class LarkChannel implements Channel {
    * Uploads the image first via im.v1.image.create, then sends it as a message.
    */
   async sendImage(jid: string, imagePath: string, replyToMessageId?: string): Promise<void> {
-    const imageData = fs.readFileSync(imagePath);
     const uploadResp = await this.client.im.v1.image.create({
       data: {
         image_type: 'message',
-        image: Buffer.from(imageData),
+        image: fs.readFileSync(imagePath),
       },
     });
 
@@ -833,7 +832,6 @@ export class LarkChannel implements Channel {
    */
   async sendFile(jid: string, filePath: string, replyToMessageId?: string): Promise<void> {
     const fileName = path.basename(filePath);
-    const fileData = fs.readFileSync(filePath);
     // Determine file type from extension
     const ext = path.extname(fileName).toLowerCase();
     type LarkFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
@@ -848,7 +846,7 @@ export class LarkChannel implements Channel {
       data: {
         file_type: fileType,
         file_name: fileName,
-        file: Buffer.from(fileData),
+        file: fs.readFileSync(filePath),
       },
     });
 
@@ -866,21 +864,23 @@ export class LarkChannel implements Channel {
    */
   async editMessage(_jid: string, messageId: string, text: string): Promise<void> {
     // Try CardKit path first: convert message_id → card_id, then update the card element.
+    let cardId: string | undefined;
     try {
       const convertResult = await this.client.cardkit.v1.card.idConvert({
         data: { message_id: messageId },
       });
-      const cardId = convertResult?.data?.card_id;
-      if (cardId) {
-        await this.client.cardkit.v1.cardElement.content({
-          path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
-          data: { content: text, sequence: Date.now() },
-        });
-        logger.info({ messageId, cardId, length: text.length }, 'Lark card message edited');
-        return;
-      }
+      cardId = convertResult?.data?.card_id;
     } catch {
-      // Not a card message or conversion failed — fall through to message.patch
+      // Not a card message — fall through to message.patch
+    }
+
+    if (cardId) {
+      await this.client.cardkit.v1.cardElement.content({
+        path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
+        data: { content: text, sequence: Date.now() },
+      });
+      logger.info({ messageId, cardId, length: text.length }, 'Lark card message edited');
+      return;
     }
 
     // Fallback: edit text/post messages via im.v1.message.patch
@@ -942,7 +942,7 @@ export class LarkChannel implements Channel {
         msg_type: item.msg_type || 'unknown',
         content,
         create_time: item.create_time
-          ? new Date(Number(item.create_time) * 1000).toISOString()
+          ? new Date(Number(item.create_time)).toISOString()
           : '',
       };
     });
@@ -1126,8 +1126,9 @@ export class LarkChannel implements Channel {
         'Flushing Lark outgoing queue',
       );
       while (this.outgoingQueue.length > 0) {
-        const item = this.outgoingQueue.shift()!;
+        const item = this.outgoingQueue[0];
         await this._sendStreaming(item.jid, item.text);
+        this.outgoingQueue.shift();
       }
     } finally {
       this.flushing = false;

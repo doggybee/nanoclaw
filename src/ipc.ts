@@ -123,7 +123,11 @@ async function processIpcMessage(
     }
 
     case 'send_image': {
-      if (!data.imagePath || !deps.sendImage) return;
+      if (!data.imagePath) return;
+      if (!deps.sendImage) {
+        logger.warn({ chatJid, sourceGroup }, 'sendImage not available on channel');
+        return;
+      }
       const hostPath = resolveContainerPath(data.imagePath, sourceGroup);
       await deps.sendImage(chatJid, hostPath);
       logger.info({ chatJid, imagePath: hostPath, sourceGroup }, 'IPC image sent');
@@ -131,7 +135,11 @@ async function processIpcMessage(
     }
 
     case 'send_file': {
-      if (!data.filePath || !deps.sendFile) return;
+      if (!data.filePath) return;
+      if (!deps.sendFile) {
+        logger.warn({ chatJid, sourceGroup }, 'sendFile not available on channel');
+        return;
+      }
       const hostPath = resolveContainerPath(data.filePath, sourceGroup);
       await deps.sendFile(chatJid, hostPath);
       logger.info({ chatJid, filePath: hostPath, sourceGroup }, 'IPC file sent');
@@ -154,6 +162,7 @@ async function processIpcMessage(
       const responsePath = path.join(ipcBaseDir, sourceGroup, 'responses', `${data.requestId}.json`);
       if (!deps.getChatHistory) {
         logger.warn({ chatJid, sourceGroup }, 'getChatHistory not available on channel');
+        writeIpcResponse(responsePath, { status: 'error', error: 'getChatHistory not available on this channel' });
         return;
       }
       try {
