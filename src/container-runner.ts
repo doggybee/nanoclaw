@@ -76,6 +76,8 @@ export interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** Override model for this run (from model router). */
+  model?: string;
 }
 
 export interface ContainerOutput {

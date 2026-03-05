@@ -28,6 +28,8 @@ interface ContainerInput {
   isScheduledTask?: boolean;
   assistantName?: string;
   secrets?: Record<string, string>;
+  /** Override model for this run (from model router). */
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -418,7 +420,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      model: process.env.CLAUDE_MODEL || undefined,
+      model: containerInput.model || process.env.CLAUDE_MODEL || undefined,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,

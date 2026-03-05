@@ -66,6 +66,15 @@ export const TRIGGER_PATTERN = new RegExp(
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+// Model routing configuration
+// MODEL_ROUTER: 'auto' = heuristic-based routing, 'off' = always use CLAUDE_MODEL
+// MODEL_FAST: model for simple Q&A (e.g. claude-haiku-4-5-20251001)
+// MODEL_FULL: model for complex tasks (defaults to CLAUDE_MODEL)
+const routerEnv = readEnvFile(['MODEL_ROUTER', 'MODEL_FAST', 'MODEL_FULL']);
+export const MODEL_ROUTER = (process.env.MODEL_ROUTER || routerEnv.MODEL_ROUTER || 'off') as 'auto' | 'off';
+export const MODEL_FAST = process.env.MODEL_FAST || routerEnv.MODEL_FAST || '';
+export const MODEL_FULL = process.env.MODEL_FULL || routerEnv.MODEL_FULL || '';
+
 // Lark configuration
 // LARK_APP_ID and LARK_APP_SECRET are read directly by LarkChannel
 // from .env via readEnvFile() to keep secrets off the config module entirely.

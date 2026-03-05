@@ -525,7 +525,7 @@ describe('LarkChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends immediate text then creates streaming card', async () => {
+    it('creates streaming card and sends with content in parallel', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -533,25 +533,21 @@ describe('LarkChannel', () => {
       const mockClient = currentClient();
       await channel.sendMessage('lark:oc_test123', 'Hello');
 
-      // First: immediate text message for fast feedback
+      // Creates a streaming card entity
+      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+      // Sends the card as an interactive message
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ text: 'Hello' }),
-          msg_type: 'text',
+          content: JSON.stringify({ type: 'card', data: { card_id: 'card_test_001' } }),
+          msg_type: 'interactive',
         },
       });
-      // Then: streaming card created and sent
-      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
-      // Card text pushed
+      // Pushes initial text to the card (in parallel with send)
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
         path: { card_id: 'card_test_001', element_id: 'streaming_md' },
         data: { content: 'Hello', sequence: 1 },
-      });
-      // Placeholder deleted after card is ready
-      expect(mockClient.im.v1.message.delete).toHaveBeenCalledWith({
-        path: { message_id: 'om_placeholder_001' },
       });
     });
 
@@ -608,16 +604,13 @@ describe('LarkChannel', () => {
       await channel.connect();
 
       const mockClient = currentClient();
-      // Streaming card creation fails (after immediate text succeeds)
+      // Streaming card creation fails
       mockClient.cardkit.v1.card.create.mockRejectedValueOnce(new Error('Card error'));
 
       await channel.sendMessage('lark:oc_test123', 'Fallback message');
 
-      // Falls back to post format (second create call after immediate text)
-      const calls = mockClient.im.v1.message.create.mock.calls;
-      expect(calls.length).toBe(2);
-      // Second call is the post fallback
-      expect(calls[1][0]).toEqual({
+      // Falls back to post format
+      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
@@ -646,7 +639,7 @@ describe('LarkChannel', () => {
       });
     });
 
-    it('sends immediate reply when replyToMessageId is provided', async () => {
+    it('replies with streaming card when replyToMessageId is provided', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -656,19 +649,18 @@ describe('LarkChannel', () => {
         replyToMessageId: 'om_trigger_msg_001',
       });
 
-      // Immediate text sent as reply
+      // Card sent as reply
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_001' },
         data: {
-          content: JSON.stringify({ text: 'Reply text' }),
-          msg_type: 'text',
+          content: JSON.stringify({ type: 'card', data: { card_id: 'card_test_001' } }),
+          msg_type: 'interactive',
         },
       });
-      // Then streaming card created
-      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
     });
 
-    it('prepends @mention to text when mentionUser is provided', async () => {
+    it('prepends @mention to streaming card text when mentionUser is provided', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -679,13 +671,10 @@ describe('LarkChannel', () => {
         mentionUser: { id: 'ou_USER_456', name: 'Alice' },
       });
 
-      // Immediate text includes mention prefix
-      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
-        path: { message_id: 'om_trigger_msg_010' },
-        data: {
-          content: JSON.stringify({ text: '<at id=ou_USER_456></at> Hello there' }),
-          msg_type: 'text',
-        },
+      // Card content includes mention prefix
+      expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
+        path: { card_id: 'card_test_001', element_id: 'streaming_md' },
+        data: { content: '<at id=ou_USER_456></at> Hello there', sequence: 1 },
       });
     });
 
