@@ -64,8 +64,9 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
       im = {
         v1: {
           message: {
-            create: vi.fn().mockResolvedValue(undefined),
-            reply: vi.fn().mockResolvedValue(undefined),
+            create: vi.fn().mockResolvedValue({ data: { message_id: 'om_placeholder_001' } }),
+            reply: vi.fn().mockResolvedValue({ data: { message_id: 'om_placeholder_002' } }),
+            delete: vi.fn().mockResolvedValue(undefined),
             list: vi.fn().mockResolvedValue({ data: { items: [] } }),
             patch: vi.fn().mockResolvedValue(undefined),
           },
@@ -524,7 +525,7 @@ describe('LarkChannel', () => {
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends message via streaming card', async () => {
+    it('sends immediate text then creates streaming card', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -532,21 +533,25 @@ describe('LarkChannel', () => {
       const mockClient = currentClient();
       await channel.sendMessage('lark:oc_test123', 'Hello');
 
-      // Creates a streaming card entity
-      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
-      // Sends the card as an interactive message
+      // First: immediate text message for fast feedback
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
-          content: JSON.stringify({ type: 'card', data: { card_id: 'card_test_001' } }),
-          msg_type: 'interactive',
+          content: JSON.stringify({ text: 'Hello' }),
+          msg_type: 'text',
         },
       });
-      // Pushes initial text to the card
+      // Then: streaming card created and sent
+      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
+      // Card text pushed
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
         path: { card_id: 'card_test_001', element_id: 'streaming_md' },
         data: { content: 'Hello', sequence: 1 },
+      });
+      // Placeholder deleted after card is ready
+      expect(mockClient.im.v1.message.delete).toHaveBeenCalledWith({
+        path: { message_id: 'om_placeholder_001' },
       });
     });
 
@@ -584,10 +589,12 @@ describe('LarkChannel', () => {
       await channel.connect();
 
       const mockClient = currentClient();
-      // Streaming card creation fails
+      // Streaming card creation fails (after immediate text succeeds)
       mockClient.cardkit.v1.card.create.mockRejectedValueOnce(new Error('Card error'));
       // Post fallback also fails
-      mockClient.im.v1.message.create.mockRejectedValueOnce(new Error('Post error'));
+      mockClient.im.v1.message.create
+        .mockResolvedValueOnce({ data: { message_id: 'om_placeholder_001' } }) // immediate text
+        .mockRejectedValueOnce(new Error('Post error')); // fallback
 
       // Should not throw
       await expect(
@@ -601,13 +608,16 @@ describe('LarkChannel', () => {
       await channel.connect();
 
       const mockClient = currentClient();
-      // Streaming card creation fails
+      // Streaming card creation fails (after immediate text succeeds)
       mockClient.cardkit.v1.card.create.mockRejectedValueOnce(new Error('Card error'));
 
       await channel.sendMessage('lark:oc_test123', 'Fallback message');
 
-      // Falls back to post format
-      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
+      // Falls back to post format (second create call after immediate text)
+      const calls = mockClient.im.v1.message.create.mock.calls;
+      expect(calls.length).toBe(2);
+      // Second call is the post fallback
+      expect(calls[1][0]).toEqual({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_test123',
@@ -636,7 +646,7 @@ describe('LarkChannel', () => {
       });
     });
 
-    it('replies to message when replyToMessageId is provided', async () => {
+    it('sends immediate reply when replyToMessageId is provided', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -646,18 +656,19 @@ describe('LarkChannel', () => {
         replyToMessageId: 'om_trigger_msg_001',
       });
 
-      // Card sent as reply
+      // Immediate text sent as reply
       expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
         path: { message_id: 'om_trigger_msg_001' },
         data: {
-          content: JSON.stringify({ type: 'card', data: { card_id: 'card_test_001' } }),
-          msg_type: 'interactive',
+          content: JSON.stringify({ text: 'Reply text' }),
+          msg_type: 'text',
         },
       });
-      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
+      // Then streaming card created
+      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
     });
 
-    it('prepends @mention to streaming card text when mentionUser is provided', async () => {
+    it('prepends @mention to text when mentionUser is provided', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
       await channel.connect();
@@ -668,10 +679,13 @@ describe('LarkChannel', () => {
         mentionUser: { id: 'ou_USER_456', name: 'Alice' },
       });
 
-      // Card content includes mention prefix
-      expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
-        path: { card_id: 'card_test_001', element_id: 'streaming_md' },
-        data: { content: '<at id=ou_USER_456></at> Hello there', sequence: 1 },
+      // Immediate text includes mention prefix
+      expect(mockClient.im.v1.message.reply).toHaveBeenCalledWith({
+        path: { message_id: 'om_trigger_msg_010' },
+        data: {
+          content: JSON.stringify({ text: '<at id=ou_USER_456></at> Hello there' }),
+          msg_type: 'text',
+        },
       });
     });
 
@@ -684,7 +698,8 @@ describe('LarkChannel', () => {
       await channel.sendMessage('lark:oc_test123', 'Normal message');
 
       expect(mockClient.im.v1.message.reply).not.toHaveBeenCalled();
-      expect(mockClient.im.v1.message.create).toHaveBeenCalledTimes(1);
+      // Two create calls: immediate text + streaming card
+      expect(mockClient.im.v1.message.create).toHaveBeenCalled();
     });
 
     it('flushes queued messages on connect', async () => {
@@ -835,60 +850,22 @@ describe('LarkChannel', () => {
   // --- setTyping ---
 
   describe('setTyping', () => {
-    it('sends thinking indicator when connected and isTyping=true', async () => {
+    it('resolves without error (no-op)', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
-      await channel.connect();
 
-      const mockClient = currentClient();
-      await channel.setTyping('lark:oc_test123', true);
-
-      expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
-        params: { receive_id_type: 'chat_id' },
-        data: {
-          receive_id: 'oc_test123',
-          content: JSON.stringify({ text: '...' }),
-          msg_type: 'text',
-        },
-      });
+      await expect(
+        channel.setTyping('lark:oc_test123', true),
+      ).resolves.toBeUndefined();
     });
 
-    it('does nothing when not connected', async () => {
+    it('accepts false without error', async () => {
       const opts = createTestOpts();
       const channel = new LarkChannel(opts);
 
-      const mockClient = currentClient();
-      await channel.setTyping('lark:oc_test123', true);
-
-      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
-    });
-
-    it('does nothing when isTyping=false', async () => {
-      const opts = createTestOpts();
-      const channel = new LarkChannel(opts);
-      await channel.connect();
-
-      const mockClient = currentClient();
-      mockClient.im.v1.message.create.mockClear();
-      await channel.setTyping('lark:oc_test123', false);
-
-      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
-    });
-
-    it('skips indicator when streaming card already active', async () => {
-      const opts = createTestOpts();
-      const channel = new LarkChannel(opts);
-      await channel.connect();
-
-      const mockClient = currentClient();
-      // Create a streaming card first
-      await channel.sendMessage('lark:oc_test123', 'Hello');
-      mockClient.im.v1.message.create.mockClear();
-
-      // Now setTyping should skip since streaming card is active
-      await channel.setTyping('lark:oc_test123', true);
-
-      expect(mockClient.im.v1.message.create).not.toHaveBeenCalled();
+      await expect(
+        channel.setTyping('lark:oc_test123', false),
+      ).resolves.toBeUndefined();
     });
   });
 

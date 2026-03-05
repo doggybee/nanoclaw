@@ -213,6 +213,8 @@ const STREAMING_ELEMENT_ID = 'streaming_md';
 interface StreamingCard {
   cardId: string;
   sequence: number;
+  /** message_id of the initial text message (to delete after card is ready) */
+  placeholderMessageId?: string;
 }
 
 /** Strip the `lark:` prefix to get the raw Lark chat_id. */
@@ -618,8 +620,12 @@ export class LarkChannel implements Channel {
 
   /**
    * Send or append text via streaming card.
-   * First call for a jid: creates card entity, sends it, pushes initial text.
-   * Subsequent calls: appends text to the same card with typewriter effect.
+   *
+   * First call: sends a plain text message immediately (sub-second feedback),
+   * then creates the streaming card in the background. The placeholder text
+   * message is deleted once the card is ready.
+   *
+   * Subsequent calls: appends text to the existing card with typewriter effect.
    */
   private async _sendStreaming(
     jid: string,
@@ -630,6 +636,12 @@ export class LarkChannel implements Channel {
     const existing = this.streamingCards.get(jid);
 
     if (existing) {
+      // Delete placeholder text message if it still exists (card is now ready)
+      if (existing.placeholderMessageId) {
+        const msgId = existing.placeholderMessageId;
+        existing.placeholderMessageId = undefined;
+        this.client.im.v1.message.delete({ path: { message_id: msgId } }).catch(() => {});
+      }
       // Replace with latest full text (API calculates diff for typewriter effect)
       existing.sequence++;
       await this.client.cardkit.v1.cardElement.content({
@@ -638,11 +650,31 @@ export class LarkChannel implements Channel {
       });
       logger.info({ jid, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
     } else {
-      // Create new streaming card
       const mentionPrefix = mentionUser
         ? `<at id=${mentionUser.id}></at> `
         : '';
+      const fullText = mentionPrefix + text;
 
+      // Step 1: Send immediate text message so user sees response instantly
+      let placeholderMessageId: string | undefined;
+      try {
+        const textContent = JSON.stringify({ text: fullText });
+        const placeholderResp = replyToMessageId
+          ? await this.client.im.v1.message.reply({
+              path: { message_id: replyToMessageId },
+              data: { content: textContent, msg_type: 'text' },
+            })
+          : await this.client.im.v1.message.create({
+              params: { receive_id_type: 'chat_id' },
+              data: { receive_id: extractChatId(jid), content: textContent, msg_type: 'text' },
+            });
+        placeholderMessageId = placeholderResp?.data?.message_id;
+        logger.info({ jid, length: fullText.length }, 'Immediate text reply sent');
+      } catch (err) {
+        logger.warn({ jid, err }, 'Failed to send immediate text reply');
+      }
+
+      // Step 2: Create streaming card in background — subsequent chunks will use it
       const cardJson = {
         schema: '2.0',
         config: {
@@ -675,16 +707,21 @@ export class LarkChannel implements Channel {
 
       // Send the card as a message
       const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-      await this.sendToChat(jid, content, 'interactive', replyToMessageId);
+      await this.sendToChat(jid, content, 'interactive');
 
-      const fullText = mentionPrefix + text;
-      this.streamingCards.set(jid, { cardId, sequence: 1 });
+      this.streamingCards.set(jid, { cardId, sequence: 1, placeholderMessageId });
 
-      // Push initial text with typewriter effect
+      // Push initial text to the card
       await this.client.cardkit.v1.cardElement.content({
         path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
         data: { content: fullText, sequence: 1 },
       });
+
+      // Delete placeholder now that card has content
+      if (placeholderMessageId) {
+        this.streamingCards.get(jid)!.placeholderMessageId = undefined;
+        this.client.im.v1.message.delete({ path: { message_id: placeholderMessageId } }).catch(() => {});
+      }
 
       logger.info({ jid, cardId, length: fullText.length }, 'Streaming card created and sent');
     }
@@ -758,23 +795,11 @@ export class LarkChannel implements Channel {
     }
   }
 
-  /**
-   * Simulate typing indicator by sending a lightweight "thinking" text message.
-   * Lark Bot API has no native typing indicator, so we send a placeholder that
-   * gets replaced by the streaming card once the agent starts responding.
-   */
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    if (!isTyping || !this.connected) return;
-    // Only send if there's no active streaming card (avoid duplicate indicators)
-    if (this.streamingCards.has(jid)) return;
-    try {
-      const content = JSON.stringify({ text: '...' });
-      await this.sendToChat(jid, content, 'text');
-      logger.debug({ jid }, 'Lark thinking indicator sent');
-    } catch (err) {
-      // Best-effort — don't block the pipeline if this fails
-      logger.debug({ jid, err }, 'Failed to send thinking indicator');
-    }
+  // Lark does not expose a typing indicator API for bots.
+  // Immediate visual feedback is handled by _sendStreaming() which sends
+  // a text message before creating the streaming card.
+  async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
+    // no-op
   }
 
   /**
