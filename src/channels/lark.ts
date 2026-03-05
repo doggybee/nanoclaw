@@ -212,7 +212,6 @@ const STREAMING_ELEMENT_ID = 'streaming_md';
 
 interface StreamingCard {
   cardId: string;
-  accumulatedText: string;
   sequence: number;
 }
 
@@ -243,14 +242,7 @@ export class LarkChannel implements Channel {
 
     // Read credentials from .env (not process.env — keeps secrets off the
     // environment so they don't leak to child processes)
-    const env = readEnvFile([
-      'LARK_APP_ID',
-      'LARK_APP_SECRET',
-      'LARK_ENCRYPT_KEY',
-      'LARK_VERIFICATION_TOKEN',
-      'LARK_WEBHOOK_PORT',
-      'LARK_WEBHOOK_PATH',
-    ]);
+    const env = readEnvFile(['LARK_APP_ID', 'LARK_APP_SECRET']);
     this.appId = env.LARK_APP_ID;
     this.appSecret = env.LARK_APP_SECRET;
 
@@ -307,10 +299,12 @@ export class LarkChannel implements Channel {
     // EventDispatcher is transport-agnostic — works with both WSClient and HTTP adapter.
     // Lark international (Domain.Lark) does NOT support WebSocket for events,
     // so we use the Webhook HTTP adapter mode.
-    const eventDispatcher = new Lark.EventDispatcher({
+    const eventConfig = {
       encryptKey: env.LARK_ENCRYPT_KEY || undefined,
       verificationToken: env.LARK_VERIFICATION_TOKEN || undefined,
-    }).register({
+    };
+
+    const eventDispatcher = new Lark.EventDispatcher(eventConfig).register({
       'im.message.receive_v1': async (data) => {
         await this.handleIncomingMessage(data);
       },
@@ -321,10 +315,7 @@ export class LarkChannel implements Channel {
       ? `${env.LARK_WEBHOOK_PATH.replace(/\/$/, '')}/card`
       : '/lark/card';
     const cardActionHandler = new Lark.CardActionHandler(
-      {
-        encryptKey: env.LARK_ENCRYPT_KEY || undefined,
-        verificationToken: env.LARK_VERIFICATION_TOKEN || undefined,
-      },
+      eventConfig,
       async (data: any) => {
         await this.handleCardAction(data);
         // Return empty to acknowledge without updating card
@@ -344,16 +335,18 @@ export class LarkChannel implements Channel {
       { autoChallenge: true },
     );
 
+    const handleError = (res: http.ServerResponse, err: Error, label: string) => {
+      logger.error({ err }, label);
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Internal Server Error');
+      }
+    };
+
     // Start HTTP server for receiving Lark event callbacks and card actions
     this.server = http.createServer((req, res) => {
       if (req.url && req.url.startsWith(cardActionPath)) {
-        cardWebhookHandler(req, res).catch((err: Error) => {
-          logger.error({ err }, 'Lark card action handler error');
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'text/plain' });
-            res.end('Internal Server Error');
-          }
-        });
+        cardWebhookHandler(req, res).catch((err: Error) => handleError(res, err, 'Lark card action handler error'));
         return;
       }
       if (req.url && !req.url.startsWith(webhookPath)) {
@@ -361,13 +354,7 @@ export class LarkChannel implements Channel {
         res.end('Not Found');
         return;
       }
-      webhookHandler(req, res).catch((err: Error) => {
-        logger.error({ err }, 'Lark webhook handler error');
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('Internal Server Error');
-        }
-      });
+      webhookHandler(req, res).catch((err: Error) => handleError(res, err, 'Lark webhook handler error'));
     });
 
     await new Promise<void>((resolve, reject) => {
@@ -644,7 +631,6 @@ export class LarkChannel implements Channel {
 
     if (existing) {
       // Replace with latest full text (API calculates diff for typewriter effect)
-      existing.accumulatedText = text;
       existing.sequence++;
       await this.client.cardkit.v1.cardElement.content({
         path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
@@ -692,7 +678,7 @@ export class LarkChannel implements Channel {
       await this.sendToChat(jid, content, 'interactive', replyToMessageId);
 
       const fullText = mentionPrefix + text;
-      this.streamingCards.set(jid, { cardId, accumulatedText: fullText, sequence: 1 });
+      this.streamingCards.set(jid, { cardId, sequence: 1 });
 
       // Push initial text with typewriter effect
       await this.client.cardkit.v1.cardElement.content({
@@ -760,6 +746,7 @@ export class LarkChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    this.streamingCards.clear();
     if (this.dedupTimer) {
       clearInterval(this.dedupTimer);
       this.dedupTimer = undefined;
@@ -960,23 +947,24 @@ export class LarkChannel implements Channel {
       const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
       fs.mkdirSync(tmpDir, { recursive: true });
 
-      const downloadedPaths: string[] = [];
-      for (const imageKey of imageKeys) {
+      const results = await Promise.allSettled(imageKeys.map(async (imageKey) => {
         const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`;
         const destPath = path.join(tmpDir, filename);
-
         const resp = await this.client.im.v1.messageResource.get({
           path: { message_id: messageId, file_key: imageKey },
           params: { type: 'image' },
         });
-
         if (resp) {
           await resp.writeFile(destPath);
           try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
-          downloadedPaths.push(`/workspace/group/tmp/${filename}`);
           logger.info({ jid, imageKey, destPath }, 'Image downloaded for agent');
+          return `/workspace/group/tmp/${filename}`;
         }
-      }
+        return null;
+      }));
+      const downloadedPaths = results
+        .filter((r): r is PromiseFulfilledResult<string> => r.status === 'fulfilled' && r.value !== null)
+        .map((r) => r.value);
 
       if (downloadedPaths.length > 0) {
         const imageRef = downloadedPaths.length === 1
