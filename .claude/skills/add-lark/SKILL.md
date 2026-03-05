@@ -75,9 +75,10 @@ If the user doesn't have a Lark app, share [LARK_SETUP.md](LARK_SETUP.md) which 
 Quick summary of what's needed:
 1. Create a custom app at [open.larksuite.com](https://open.larksuite.com)
 2. Enable Bot capability
-3. Add permissions: `im:message`, `im:message:send_as_bot`, `im:chat:readonly`, `contact:user.base:readonly`
+3. Add permissions: `im:message`, `im:message:send_as_bot`, `im:message:send_multi_content`, `im:chat:readonly`, `im:resource`, `im:message:readonly`, `contact:user.base:readonly`
 4. Subscribe to event: `im.message.receive_v1`
 5. Set up **Webhook** event subscription with your public callback URL
+6. Set up **Card Request URL** for interactive card callbacks (same base URL + `/card` suffix)
 6. Copy App ID (`cli_...`) and App Secret
 7. Publish app version and get admin approval
 
@@ -111,10 +112,13 @@ Options:
 - **ngrok**: `ngrok http 3000`
 - **Reverse proxy**: Configure nginx/Caddy to forward to localhost:3000
 
-Then set the webhook callback URL in the Lark developer console:
+Then set the callback URLs in the Lark developer console:
 1. Go to **Event Subscriptions**
 2. Set the **Request URL** to `https://your-public-url/lark/events`
 3. Lark will send a verification challenge — the bot handles this automatically with `autoChallenge: true`
+4. Go to **Card Request URL** (in the bot configuration)
+5. Set it to `https://your-public-url/lark/events/card`
+6. This enables interactive card button callbacks
 
 ### Build and restart
 
@@ -237,11 +241,17 @@ If the chat ID is hard to find:
 The Lark channel supports:
 - **Group chats** — Bot must be added to the group
 - **Direct messages** — Users can DM the bot directly
+- **Streaming cards** — Responses appear with a typewriter effect via CardKit streaming
+- **Rich text output** — Markdown formatting (bold, italic, code, links, headings) rendered as Lark post messages
+- **Image/file support** — Receive and send images and files (auto-downloaded for agent processing)
+- **Message editing** — Edit previously sent messages (both card and text/post types)
+- **Chat history** — Agent can fetch recent messages on demand via `im.v1.message.list`
+- **Interactive cards** — Send Card Schema 2.0 cards with buttons/selects that trigger callbacks
+- **Reactions** — Add emoji reactions to messages
 
 ## Known Limitations
 
-- **Text only** — The bot only processes text messages. Images, files, rich cards, and other content types are not forwarded to the agent.
 - **No typing indicator** — Lark Bot API does not expose a typing indicator endpoint. The `setTyping()` method is a no-op.
-- **Message splitting is naive** — Long messages are split at a fixed 4000-character boundary, which may break mid-word or mid-sentence.
 - **@mention format** — Lark uses `@_user_N` placeholders in message text. The bot translates bot mentions to trigger format, but other user mentions remain as placeholders.
-- **Requires public URL** — Unlike WebSocket mode, Webhook mode requires your server to be reachable from the internet for Lark to deliver events.
+- **Requires public URL** — Webhook mode requires your server to be reachable from the internet for Lark to deliver events.
+- **Card callbacks require separate URL** — Interactive card button clicks need the Card Request URL configured in the Lark developer console (separate from the event subscription URL).

@@ -216,6 +216,11 @@ interface StreamingCard {
   sequence: number;
 }
 
+/** Strip the `lark:` prefix to get the raw Lark chat_id. */
+function extractChatId(jid: string): string {
+  return jid.replace(/^lark:/, '');
+}
+
 export class LarkChannel implements Channel {
   name = 'lark';
 
@@ -263,6 +268,29 @@ export class LarkChannel implements Channel {
 
     // Start dedup cleanup timer
     this.dedupTimer = setInterval(() => this.cleanupDedup(), DEDUP_CLEANUP_INTERVAL_MS);
+  }
+
+  /**
+   * Send a message to a chat, handling reply-or-create branching.
+   * All outbound methods funnel through this to eliminate duplication.
+   */
+  private async sendToChat(
+    jid: string,
+    content: string,
+    msgType: string,
+    replyToMessageId?: string,
+  ): Promise<void> {
+    if (replyToMessageId) {
+      await this.client.im.v1.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: msgType },
+      });
+    } else {
+      await this.client.im.v1.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: extractChatId(jid), content, msg_type: msgType },
+      });
+    }
   }
 
   async connect(): Promise<void> {
@@ -520,69 +548,11 @@ export class LarkChannel implements Channel {
 
     // Download images/files when triggered (or in non-trigger groups)
     if (embeddedImageKeys.length > 0 && (hasTrigger || group?.requiresTrigger === false)) {
-      try {
-        const groupFolder = group?.folder || 'main';
-        const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
-        fs.mkdirSync(tmpDir, { recursive: true });
-
-        const downloadedPaths: string[] = [];
-        for (const imageKey of embeddedImageKeys) {
-          const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`;
-          const destPath = path.join(tmpDir, filename);
-
-          const resp = await this.client.im.v1.messageResource.get({
-            path: { message_id: messageId, file_key: imageKey },
-            params: { type: 'image' },
-          });
-
-          if (resp) {
-            await resp.writeFile(destPath);
-            try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
-            downloadedPaths.push(`/workspace/group/tmp/${filename}`);
-            logger.info({ jid, imageKey, destPath }, 'Image downloaded for agent');
-          }
-        }
-
-        if (downloadedPaths.length > 0) {
-          const imageRef = downloadedPaths.length === 1
-            ? `[User sent an image. File saved at: ${downloadedPaths[0]} — use the Read tool to view it]`
-            : `[User sent ${downloadedPaths.length} images. Files saved at: ${downloadedPaths.join(', ')} — use the Read tool to view them]`;
-          // Prepend trigger if not already present
-          content = content
-            ? `${content}\n${imageRef}`
-            : `@${ASSISTANT_NAME} ${imageRef}`;
-        }
-      } catch (err) {
-        logger.warn({ jid, err }, 'Failed to download image');
-      }
+      content = await this.downloadImages(jid, messageId, embeddedImageKeys, group?.folder || 'main', content);
     }
 
     if (messageType === 'file' && (hasTrigger || group?.requiresTrigger === false)) {
-      try {
-        const parsed = JSON.parse(message.content);
-        const fileKey = parsed.file_key;
-        const fileName = parsed.file_name || `file_${Date.now()}`;
-        const groupFolder = group?.folder || 'main';
-        const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
-        fs.mkdirSync(tmpDir, { recursive: true });
-        const destPath = path.join(tmpDir, fileName);
-
-        const resp = await this.client.im.v1.messageResource.get({
-          path: { message_id: messageId, file_key: fileKey },
-          params: { type: 'file' },
-        });
-
-        if (resp) {
-          await resp.writeFile(destPath);
-          try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
-          content = content
-            ? `${content}\n[User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`
-            : `@${ASSISTANT_NAME} [User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`;
-          logger.info({ jid, fileKey, destPath }, 'File downloaded for agent');
-        }
-      } catch (err) {
-        logger.warn({ jid, err }, 'Failed to download file');
-      }
+      content = await this.downloadFile(jid, messageId, message.content, group?.folder || 'main', content);
     }
 
     if (!content) return;
@@ -718,20 +688,8 @@ export class LarkChannel implements Channel {
       if (!cardId) throw new Error('Failed to create card entity');
 
       // Send the card as a message
-      const chatId = jid.replace(/^lark:/, '');
       const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-
-      if (replyToMessageId) {
-        await this.client.im.v1.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'interactive' },
-        });
-      } else {
-        await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, content, msg_type: 'interactive' },
-        });
-      }
+      await this.sendToChat(jid, content, 'interactive', replyToMessageId);
 
       const fullText = mentionPrefix + text;
       this.streamingCards.set(jid, { cardId, accumulatedText: fullText, sequence: 1 });
@@ -778,7 +736,6 @@ export class LarkChannel implements Channel {
     replyToMessageId?: string,
     mentionUser?: { id: string; name: string },
   ): Promise<void> {
-    const chatId = jid.replace(/^lark:/, '');
     const chunks = splitMarkdown(text, MAX_TEXT_LENGTH);
 
     for (let i = 0; i < chunks.length; i++) {
@@ -788,18 +745,7 @@ export class LarkChannel implements Channel {
 
       const postContent = markdownToPostContent(chunkText);
       const content = JSON.stringify(postContent);
-
-      if (i === 0 && replyToMessageId) {
-        await this.client.im.v1.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'post' },
-        });
-      } else {
-        await this.client.im.v1.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: { receive_id: chatId, content, msg_type: 'post' },
-        });
-      }
+      await this.sendToChat(jid, content, 'post', i === 0 ? replyToMessageId : undefined);
     }
     logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (post fallback)');
   }
@@ -837,8 +783,6 @@ export class LarkChannel implements Channel {
    * cardJson should be a Lark Card JSON schema 2.0 object.
    */
   async sendCard(jid: string, cardJson: object, replyToMessageId?: string): Promise<void> {
-    const chatId = jid.replace(/^lark:/, '');
-
     const createResult = await this.client.cardkit.v1.card.create({
       data: {
         type: 'card_json',
@@ -849,18 +793,7 @@ export class LarkChannel implements Channel {
     if (!cardId) throw new Error('Failed to create interactive card');
 
     const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-
-    if (replyToMessageId) {
-      await this.client.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: { content, msg_type: 'interactive' },
-      });
-    } else {
-      await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, content, msg_type: 'interactive' },
-      });
-    }
+    await this.sendToChat(jid, content, 'interactive', replyToMessageId);
     logger.info({ jid, cardId }, 'Lark interactive card sent');
   }
 
@@ -889,20 +822,8 @@ export class LarkChannel implements Channel {
     const imageKey = uploadResp?.image_key;
     if (!imageKey) throw new Error('Failed to upload image');
 
-    const chatId = jid.replace(/^lark:/, '');
     const content = JSON.stringify({ image_key: imageKey });
-
-    if (replyToMessageId) {
-      await this.client.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: { content, msg_type: 'image' },
-      });
-    } else {
-      await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, content, msg_type: 'image' },
-      });
-    }
+    await this.sendToChat(jid, content, 'image', replyToMessageId);
     logger.info({ jid, imagePath, imageKey }, 'Lark image sent');
   }
 
@@ -934,20 +855,8 @@ export class LarkChannel implements Channel {
     const fileKey = uploadResp?.file_key;
     if (!fileKey) throw new Error('Failed to upload file');
 
-    const chatId = jid.replace(/^lark:/, '');
     const content = JSON.stringify({ file_key: fileKey });
-
-    if (replyToMessageId) {
-      await this.client.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: { content, msg_type: 'file' },
-      });
-    } else {
-      await this.client.im.v1.message.create({
-        params: { receive_id_type: 'chat_id' },
-        data: { receive_id: chatId, content, msg_type: 'file' },
-      });
-    }
+    await this.sendToChat(jid, content, 'file', replyToMessageId);
     logger.info({ jid, filePath, fileKey }, 'Lark file sent');
   }
 
@@ -990,7 +899,7 @@ export class LarkChannel implements Channel {
    * Returns messages in reverse chronological order (newest first).
    */
   async getChatHistory(jid: string, count: number, beforeTimestamp?: string): Promise<ChatHistoryMessage[]> {
-    const chatId = jid.replace(/^lark:/, '');
+    const chatId = extractChatId(jid);
     const endTime = beforeTimestamp
       ? String(Math.floor(new Date(beforeTimestamp).getTime() / 1000))
       : undefined;
@@ -1037,6 +946,82 @@ export class LarkChannel implements Channel {
           : '',
       };
     });
+  }
+
+  /** Download embedded images and return updated content with file references. */
+  private async downloadImages(
+    jid: string,
+    messageId: string,
+    imageKeys: string[],
+    groupFolder: string,
+    content: string,
+  ): Promise<string> {
+    try {
+      const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
+      fs.mkdirSync(tmpDir, { recursive: true });
+
+      const downloadedPaths: string[] = [];
+      for (const imageKey of imageKeys) {
+        const filename = `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.png`;
+        const destPath = path.join(tmpDir, filename);
+
+        const resp = await this.client.im.v1.messageResource.get({
+          path: { message_id: messageId, file_key: imageKey },
+          params: { type: 'image' },
+        });
+
+        if (resp) {
+          await resp.writeFile(destPath);
+          try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
+          downloadedPaths.push(`/workspace/group/tmp/${filename}`);
+          logger.info({ jid, imageKey, destPath }, 'Image downloaded for agent');
+        }
+      }
+
+      if (downloadedPaths.length > 0) {
+        const imageRef = downloadedPaths.length === 1
+          ? `[User sent an image. File saved at: ${downloadedPaths[0]} — use the Read tool to view it]`
+          : `[User sent ${downloadedPaths.length} images. Files saved at: ${downloadedPaths.join(', ')} — use the Read tool to view them]`;
+        return content ? `${content}\n${imageRef}` : `@${ASSISTANT_NAME} ${imageRef}`;
+      }
+    } catch (err) {
+      logger.warn({ jid, err }, 'Failed to download image');
+    }
+    return content;
+  }
+
+  /** Download a file attachment and return updated content with file reference. */
+  private async downloadFile(
+    jid: string,
+    messageId: string,
+    rawContent: string,
+    groupFolder: string,
+    content: string,
+  ): Promise<string> {
+    try {
+      const parsed = JSON.parse(rawContent);
+      const fileKey = parsed.file_key;
+      const fileName = parsed.file_name || `file_${Date.now()}`;
+      const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const destPath = path.join(tmpDir, fileName);
+
+      const resp = await this.client.im.v1.messageResource.get({
+        path: { message_id: messageId, file_key: fileKey },
+        params: { type: 'file' },
+      });
+
+      if (resp) {
+        await resp.writeFile(destPath);
+        try { fs.chownSync(destPath, 1000, 1000); } catch { /* non-root */ }
+        const fileRef = `[User sent a file: ${fileName}. File saved at: /workspace/group/tmp/${fileName} — use the Read tool to view it]`;
+        content = content ? `${content}\n${fileRef}` : `@${ASSISTANT_NAME} ${fileRef}`;
+        logger.info({ jid, fileKey, destPath }, 'File downloaded for agent');
+      }
+    } catch (err) {
+      logger.warn({ jid, err }, 'Failed to download file');
+    }
+    return content;
   }
 
   /** Extract plain text from a Lark post content structure. */

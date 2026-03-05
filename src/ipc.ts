@@ -50,6 +50,129 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
+/** Check if sourceGroup is authorized to act on chatJid. */
+function isAuthorized(
+  isMain: boolean,
+  sourceGroup: string,
+  chatJid: string,
+  registeredGroups: Record<string, RegisteredGroup>,
+): boolean {
+  if (isMain) return true;
+  const target = registeredGroups[chatJid];
+  return !!target && target.folder === sourceGroup;
+}
+
+/** Write an IPC response file atomically. */
+function writeIpcResponse(responsePath: string, data: object): void {
+  const dir = path.dirname(responsePath);
+  fs.mkdirSync(dir, { recursive: true });
+  const tempPath = `${responsePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data));
+  fs.renameSync(tempPath, responsePath);
+}
+
+/**
+ * Process a single IPC message. Returns void; errors are thrown to caller.
+ */
+async function processIpcMessage(
+  data: any,
+  sourceGroup: string,
+  isMain: boolean,
+  deps: IpcDeps,
+  ipcBaseDir: string,
+): Promise<void> {
+  const registeredGroups = deps.registeredGroups();
+  const { type, chatJid } = data;
+
+  if (!chatJid) return;
+
+  // --- Fire-and-forget message types (authorization required) ---
+  if (!isAuthorized(isMain, sourceGroup, chatJid, registeredGroups)) {
+    logger.warn({ type, chatJid, sourceGroup }, `Unauthorized IPC ${type} attempt blocked`);
+    return;
+  }
+
+  switch (type) {
+    case 'message': {
+      if (!data.text) return;
+      await deps.sendMessage(chatJid, data.text);
+      logger.info({ chatJid, sourceGroup }, 'IPC message sent');
+      return;
+    }
+
+    case 'add_reaction': {
+      if (!data.messageId || !data.emojiType) return;
+      if (!deps.addReaction) {
+        logger.warn({ chatJid, sourceGroup }, 'addReaction not available on channel');
+        return;
+      }
+      await deps.addReaction(chatJid, data.messageId, data.emojiType);
+      logger.info({ chatJid, messageId: data.messageId, emojiType: data.emojiType, sourceGroup }, 'IPC reaction added');
+      return;
+    }
+
+    case 'edit_message': {
+      if (!data.messageId || !data.text) return;
+      if (!deps.editMessage) {
+        logger.warn({ chatJid, sourceGroup }, 'editMessage not available on channel');
+        return;
+      }
+      await deps.editMessage(chatJid, data.messageId, data.text);
+      logger.info({ chatJid, messageId: data.messageId, sourceGroup }, 'IPC message edited');
+      return;
+    }
+
+    case 'send_image': {
+      if (!data.imagePath || !deps.sendImage) return;
+      const hostPath = resolveContainerPath(data.imagePath, sourceGroup);
+      await deps.sendImage(chatJid, hostPath);
+      logger.info({ chatJid, imagePath: hostPath, sourceGroup }, 'IPC image sent');
+      return;
+    }
+
+    case 'send_file': {
+      if (!data.filePath || !deps.sendFile) return;
+      const hostPath = resolveContainerPath(data.filePath, sourceGroup);
+      await deps.sendFile(chatJid, hostPath);
+      logger.info({ chatJid, filePath: hostPath, sourceGroup }, 'IPC file sent');
+      return;
+    }
+
+    case 'send_card': {
+      if (!data.cardJson) return;
+      if (!deps.sendCard) {
+        logger.warn({ chatJid, sourceGroup }, 'sendCard not available on channel');
+        return;
+      }
+      await deps.sendCard(chatJid, data.cardJson, data.replyToMessageId);
+      logger.info({ chatJid, sourceGroup }, 'IPC card sent');
+      return;
+    }
+
+    case 'get_chat_history': {
+      if (!data.requestId) return;
+      const responsePath = path.join(ipcBaseDir, sourceGroup, 'responses', `${data.requestId}.json`);
+      if (!deps.getChatHistory) {
+        logger.warn({ chatJid, sourceGroup }, 'getChatHistory not available on channel');
+        return;
+      }
+      try {
+        const messages = await deps.getChatHistory(chatJid, data.count || 20, data.beforeTimestamp || undefined);
+        writeIpcResponse(responsePath, { status: 'ok', messages });
+        logger.info({ chatJid, count: messages.length, requestId: data.requestId, sourceGroup }, 'IPC chat history fetched');
+      } catch (err) {
+        writeIpcResponse(responsePath, { status: 'error', error: String(err) });
+        logger.error({ err, requestId: data.requestId, sourceGroup }, 'IPC chat history fetch failed');
+      }
+      return;
+    }
+
+    default:
+      // Unknown message type — silently ignore (may be a future type)
+      return;
+  }
+}
+
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -74,8 +197,6 @@ export function startIpcWatcher(deps: IpcDeps): void {
       return;
     }
 
-    const registeredGroups = deps.registeredGroups();
-
     for (const sourceGroup of groupFolders) {
       const isMain = sourceGroup === MAIN_GROUP_FOLDER;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
@@ -91,181 +212,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
-                // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  await deps.sendMessage(data.chatJid, data.text);
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'IPC message sent',
-                  );
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC message attempt blocked',
-                  );
-                }
-              } else if (data.type === 'add_reaction' && data.chatJid && data.messageId && data.emojiType) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.addReaction) {
-                    await deps.addReaction(data.chatJid, data.messageId, data.emojiType);
-                    logger.info(
-                      { chatJid: data.chatJid, messageId: data.messageId, emojiType: data.emojiType, sourceGroup },
-                      'IPC reaction added',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'addReaction not available on channel',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC add_reaction attempt blocked',
-                  );
-                }
-              } else if (data.type === 'edit_message' && data.chatJid && data.messageId && data.text) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.editMessage) {
-                    await deps.editMessage(data.chatJid, data.messageId, data.text);
-                    logger.info(
-                      { chatJid: data.chatJid, messageId: data.messageId, sourceGroup },
-                      'IPC message edited',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'editMessage not available on channel',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC edit_message attempt blocked',
-                  );
-                }
-              } else if (data.type === 'send_image' && data.chatJid && data.imagePath) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.sendImage) {
-                    // Resolve container path to host path
-                    const hostPath = resolveContainerPath(data.imagePath, sourceGroup);
-                    await deps.sendImage(data.chatJid, hostPath);
-                    logger.info(
-                      { chatJid: data.chatJid, imagePath: hostPath, sourceGroup },
-                      'IPC image sent',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC send_image attempt blocked',
-                  );
-                }
-              } else if (data.type === 'send_file' && data.chatJid && data.filePath) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.sendFile) {
-                    const hostPath = resolveContainerPath(data.filePath, sourceGroup);
-                    await deps.sendFile(data.chatJid, hostPath);
-                    logger.info(
-                      { chatJid: data.chatJid, filePath: hostPath, sourceGroup },
-                      'IPC file sent',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC send_file attempt blocked',
-                  );
-                }
-              } else if (data.type === 'send_card' && data.chatJid && data.cardJson) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.sendCard) {
-                    await deps.sendCard(data.chatJid, data.cardJson, data.replyToMessageId);
-                    logger.info(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'IPC card sent',
-                    );
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'sendCard not available on channel',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC send_card attempt blocked',
-                  );
-                }
-              } else if (data.type === 'get_chat_history' && data.chatJid && data.requestId) {
-                const targetGroup = registeredGroups[data.chatJid];
-                if (
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup)
-                ) {
-                  if (deps.getChatHistory) {
-                    try {
-                      const messages = await deps.getChatHistory(
-                        data.chatJid,
-                        data.count || 20,
-                        data.beforeTimestamp || undefined,
-                      );
-                      // Write response file for the agent to pick up
-                      const responseDir = path.join(ipcBaseDir, sourceGroup, 'responses');
-                      fs.mkdirSync(responseDir, { recursive: true });
-                      const responsePath = path.join(responseDir, `${data.requestId}.json`);
-                      const tempPath = `${responsePath}.tmp`;
-                      fs.writeFileSync(tempPath, JSON.stringify({ status: 'ok', messages }));
-                      fs.renameSync(tempPath, responsePath);
-                      logger.info(
-                        { chatJid: data.chatJid, count: messages.length, requestId: data.requestId, sourceGroup },
-                        'IPC chat history fetched',
-                      );
-                    } catch (err) {
-                      const responseDir = path.join(ipcBaseDir, sourceGroup, 'responses');
-                      fs.mkdirSync(responseDir, { recursive: true });
-                      const responsePath = path.join(responseDir, `${data.requestId}.json`);
-                      fs.writeFileSync(responsePath, JSON.stringify({ status: 'error', error: String(err) }));
-                      logger.error({ err, requestId: data.requestId, sourceGroup }, 'IPC chat history fetch failed');
-                    }
-                  } else {
-                    logger.warn(
-                      { chatJid: data.chatJid, sourceGroup },
-                      'getChatHistory not available on channel',
-                    );
-                  }
-                } else {
-                  logger.warn(
-                    { chatJid: data.chatJid, sourceGroup },
-                    'Unauthorized IPC get_chat_history attempt blocked',
-                  );
-                }
-              }
+              await processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir);
               fs.unlinkSync(filePath);
             } catch (err) {
               logger.error(
