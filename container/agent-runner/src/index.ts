@@ -58,7 +58,7 @@ interface SDKUserMessage {
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 500;
+const IPC_POLL_MS = 200;
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.

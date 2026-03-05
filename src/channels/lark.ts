@@ -758,11 +758,23 @@ export class LarkChannel implements Channel {
     }
   }
 
-  // Lark does not expose a typing indicator API for bots.
-  // This no-op satisfies the Channel interface so the orchestrator
-  // doesn't need channel-specific branching.
-  async setTyping(_jid: string, _isTyping: boolean): Promise<void> {
-    // no-op: Lark Bot API has no typing indicator endpoint
+  /**
+   * Simulate typing indicator by sending a lightweight "thinking" text message.
+   * Lark Bot API has no native typing indicator, so we send a placeholder that
+   * gets replaced by the streaming card once the agent starts responding.
+   */
+  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    if (!isTyping || !this.connected) return;
+    // Only send if there's no active streaming card (avoid duplicate indicators)
+    if (this.streamingCards.has(jid)) return;
+    try {
+      const content = JSON.stringify({ text: '...' });
+      await this.sendToChat(jid, content, 'text');
+      logger.debug({ jid }, 'Lark thinking indicator sent');
+    } catch (err) {
+      // Best-effort — don't block the pipeline if this fails
+      logger.debug({ jid, err }, 'Failed to send thinking indicator');
+    }
   }
 
   /**

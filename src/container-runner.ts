@@ -27,6 +27,11 @@ import {
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
+// In-memory caches to avoid redundant FS operations across spawns.
+// Reset naturally on process restart.
+const createdDirs = new Set<string>();
+const chownedDirs = new Set<string>();
+
 /** Recursively chown a directory tree so the container's node user can write.
  *  Skips files/dirs that already have the correct ownership. */
 function chownRecursive(dir: string, uid: number, gid: number): void {
@@ -49,6 +54,13 @@ function chownRecursive(dir: string, uid: number, gid: number): void {
   } catch {
     // Best-effort: don't crash if chown fails (e.g. on non-Linux)
   }
+}
+
+/** mkdir with in-memory cache — skips syscall if already created this process. */
+function cachedMkdir(dir: string): void {
+  if (createdDirs.has(dir)) return;
+  fs.mkdirSync(dir, { recursive: true });
+  createdDirs.add(dir);
 }
 
 // Sentinel markers for robust output parsing (must match agent-runner)
@@ -145,7 +157,7 @@ function buildVolumeMounts(
     group.folder,
     '.claude',
   );
-  fs.mkdirSync(groupSessionsDir, { recursive: true });
+  cachedMkdir(groupSessionsDir);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -202,7 +214,7 @@ function buildVolumeMounts(
 
   // Per-group QMD cache: persist index + downloaded models across conversations
   const qmdCacheDir = path.join(DATA_DIR, 'sessions', group.folder, '.qmd-cache');
-  fs.mkdirSync(qmdCacheDir, { recursive: true });
+  cachedMkdir(qmdCacheDir);
   mounts.push({
     hostPath: qmdCacheDir,
     containerPath: '/home/node/.cache/qmd',
@@ -212,9 +224,9 @@ function buildVolumeMounts(
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
-  fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  cachedMkdir(path.join(groupIpcDir, 'messages'));
+  cachedMkdir(path.join(groupIpcDir, 'tasks'));
+  cachedMkdir(path.join(groupIpcDir, 'input'));
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -234,10 +246,12 @@ function buildVolumeMounts(
   // When running as root on the host, the container runs as node (uid 1000).
   // Ensure ALL writable mount directories are owned by the container user
   // so the agent can read, write, and delete files freely.
+  // Cached: only chown on first spawn per mount path to avoid redundant tree walks.
   if (process.getuid?.() === 0) {
     for (const mount of mounts) {
-      if (!mount.readonly) {
+      if (!mount.readonly && !chownedDirs.has(mount.hostPath)) {
         chownRecursive(mount.hostPath, 1000, 1000);
+        chownedDirs.add(mount.hostPath);
       }
     }
   }
@@ -308,7 +322,7 @@ export async function runContainerAgent(
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);
-  fs.mkdirSync(groupDir, { recursive: true });
+  cachedMkdir(groupDir);
 
   // Run buildVolumeMounts and readSecrets in parallel — they're independent.
   const [mounts, secrets] = await Promise.all([
@@ -343,7 +357,7 @@ export async function runContainerAgent(
   );
 
   const logsDir = path.join(groupDir, 'logs');
-  fs.mkdirSync(logsDir, { recursive: true });
+  cachedMkdir(logsDir);
 
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
