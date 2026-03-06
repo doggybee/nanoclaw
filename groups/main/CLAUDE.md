@@ -76,6 +76,7 @@
 - **Browse the web** with `agent-browser` — open pages, click, fill forms, take screenshots, extract data (run `agent-browser open <url>` to start, then `agent-browser snapshot -i` to see interactive elements)
 - Read and write files in your workspace
 - Run bash commands in your sandbox
+- **Search code with `qmd`** — `qmd query "how does X work"` for semantic search, `qmd search "keyword"` for fast keyword search. Use when you'd need more than 3 grep attempts.
 - Schedule tasks to run later or on a recurring basis
 - Send messages, images, and files back to the chat
 - **Edit messages** you previously sent (use `mcp__nanoclaw__edit_message` with the message ID)
