@@ -4,7 +4,7 @@ Personal Claude assistant. See [README.md](README.md) for philosophy and setup. 
 
 ## Quick Context
 
-Single Node.js process that connects to messaging platforms (Lark/WhatsApp), routes messages to Claude Agent SDK running in containers (Linux VMs). Each group has isolated filesystem and memory.
+Single Node.js process that connects to Lark (Feishu), routes messages to Claude Agent SDK running in Docker containers. Each group has isolated filesystem and memory. Supports per-user concurrent processing via SlotKey (`chatJid::senderId`).
 
 ## Key Files
 
@@ -25,12 +25,10 @@ Single Node.js process that connects to messaging platforms (Lark/WhatsApp), rou
 
 | Skill | When to Use |
 |-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
-| `/customize` | Adding channels, integrations, changing behavior |
+| `/setup` | First-time installation, Lark configuration, service startup |
+| `/customize` | Adding integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
 | `/update` | Pull upstream NanoClaw changes, merge with customizations, run migrations |
-| `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
-| `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
 
 ## Local Search (QMD)
 

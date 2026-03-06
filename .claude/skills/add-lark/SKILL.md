@@ -75,11 +75,11 @@ If the user doesn't have a Lark app, share [LARK_SETUP.md](LARK_SETUP.md) which 
 Quick summary of what's needed:
 1. Create a custom app at [open.larksuite.com](https://open.larksuite.com)
 2. Enable Bot capability
-3. Add permissions: `im:message`, `im:message:send_as_bot`, `im:message:send_multi_content`, `im:chat:readonly`, `im:resource`, `im:message:readonly`, `contact:user.base:readonly`
-4. Subscribe to event: `im.message.receive_v1`
+3. Add permissions — Messaging: `im:message`, `im:message:send_as_bot`, `im:message:readonly`, `im:message:send_multi_content`, `im:message.p2p_msg:readonly`, `im:message.group_msg:readonly`; Chat: `im:chat`, `im:chat:readonly`; Resources: `im:resource`; Contact: `contact:user.base:readonly`; CardKit: `cardkit:card`, `cardkit:card:update`, `cardkit:card_element`
+4. Subscribe to events: `im.message.receive_v1`, `card.action.trigger`
 5. Set up **Webhook** event subscription with your public callback URL
 6. Set up **Card Request URL** for interactive card callbacks (same base URL + `/card` suffix)
-6. Copy App ID (`cli_...`) and App Secret
+7. Copy App ID (`cli_...`) and App Secret
 7. Publish app version and get admin approval
 
 Wait for the user to provide both credentials.
