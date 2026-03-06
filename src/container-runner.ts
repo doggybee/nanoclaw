@@ -315,12 +315,181 @@ function buildContainerArgs(
   return args;
 }
 
+/**
+ * Warm container handle — returned by spawnWarmContainer().
+ * Allows setting the output callback later when the first real message arrives.
+ */
+export interface WarmContainerHandle {
+  containerName: string;
+  process: ChildProcess;
+  groupFolder: string;
+  /** Set the output callback. Must be called before piping the first message. */
+  setOnOutput(cb: (output: ContainerOutput) => Promise<void>): void;
+  /** Promise that resolves when the container exits. */
+  exited: Promise<ContainerOutput>;
+}
+
+/**
+ * Spawn a warm (pre-heated) container that waits for its first message via IPC.
+ * The container boots Node.js + agent-runner immediately but does NOT start a
+ * Claude query until a message is piped into /workspace/ipc/input/.
+ */
+export async function spawnWarmContainer(
+  group: RegisteredGroup,
+  chatJid: string,
+  isMain: boolean,
+  assistantName: string,
+  sessionId?: string,
+): Promise<WarmContainerHandle> {
+  const groupDir = resolveGroupFolderPath(group.folder);
+  cachedMkdir(groupDir);
+
+  const [mounts, secrets] = await Promise.all([
+    Promise.resolve(buildVolumeMounts(group, isMain)),
+    readSecrets(),
+  ]);
+
+  const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
+  const containerName = `nanoclaw-warm-${safeName}-${Date.now()}`;
+  const containerArgs = buildContainerArgs(mounts, containerName);
+  const logsDir = path.join(groupDir, 'logs');
+  cachedMkdir(logsDir);
+
+  logger.info({ group: group.name, containerName }, 'Spawning warm container');
+
+  const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  // Send config with empty prompt (warm mode)
+  const warmInput: ContainerInput = {
+    prompt: '',
+    sessionId,
+    groupFolder: group.folder,
+    chatJid,
+    isMain,
+    assistantName,
+    secrets,
+  };
+  container.stdin.write(JSON.stringify(warmInput));
+  container.stdin.end();
+
+  // Mutable output callback — set when container is activated
+  let onOutput: ((output: ContainerOutput) => Promise<void>) | null = null;
+  let outputChain = Promise.resolve();
+  let parseBuffer = '';
+  let newSessionId: string | undefined;
+  let hadStreamingOutput = false;
+
+  // Timeout management
+  const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+  const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+  let timedOut = false;
+
+  const killOnTimeout = () => {
+    timedOut = true;
+    logger.error({ group: group.name, containerName }, 'Warm container timeout, stopping');
+    exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
+      if (err) container.kill('SIGKILL');
+    });
+  };
+  let timeout = setTimeout(killOnTimeout, timeoutMs);
+  const resetTimeout = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(killOnTimeout, timeoutMs);
+  };
+
+  container.stdout.on('data', (data) => {
+    const chunk = data.toString();
+    parseBuffer += chunk;
+    let startIdx: number;
+    while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+      const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+      if (endIdx === -1) break;
+      const jsonStr = parseBuffer.slice(startIdx + OUTPUT_START_MARKER.length, endIdx).trim();
+      parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+      try {
+        const parsed: ContainerOutput = JSON.parse(jsonStr);
+        if (parsed.newSessionId) newSessionId = parsed.newSessionId;
+        hadStreamingOutput = true;
+        resetTimeout();
+        if (onOutput) {
+          outputChain = outputChain.then(() => onOutput!(parsed));
+        }
+      } catch (err) {
+        logger.warn({ group: group.name, error: err }, 'Failed to parse warm container output');
+      }
+    }
+  });
+
+  container.stderr.on('data', (data) => {
+    const lines = data.toString().trim().split('\n');
+    for (const line of lines) {
+      if (line) logger.debug({ container: group.folder }, line);
+    }
+  });
+
+  const exited = new Promise<ContainerOutput>((resolve) => {
+    container.on('close', (code) => {
+      clearTimeout(timeout);
+      outputChain.then(() => {
+        if (timedOut && hadStreamingOutput) {
+          resolve({ status: 'success', result: null, newSessionId });
+        } else if (timedOut) {
+          resolve({ status: 'error', result: null, error: 'Warm container timed out' });
+        } else {
+          resolve({
+            status: code === 0 ? 'success' : 'error',
+            result: null,
+            newSessionId,
+            error: code !== 0 ? `Container exited with code ${code}` : undefined,
+          });
+        }
+      });
+    });
+    container.on('error', (err) => {
+      clearTimeout(timeout);
+      resolve({ status: 'error', result: null, error: err.message });
+    });
+  });
+
+  return {
+    containerName,
+    process: container,
+    groupFolder: group.folder,
+    setOnOutput(cb) { onOutput = cb; },
+    exited,
+  };
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  warmHandle?: WarmContainerHandle,
 ): Promise<ContainerOutput> {
+  // Fast path: activate a pre-warmed container instead of cold-starting
+  if (warmHandle) {
+    onProcess(warmHandle.process, warmHandle.containerName);
+    if (onOutput) warmHandle.setOnOutput(onOutput);
+
+    // Pipe the prompt via IPC (same mechanism as follow-up messages)
+    const inputDir = path.join(resolveGroupIpcPath(group.folder), 'input');
+    fs.mkdirSync(inputDir, { recursive: true });
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
+    const filepath = path.join(inputDir, filename);
+    const tempPath = `${filepath}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: input.prompt, model: input.model }));
+    fs.renameSync(tempPath, filepath);
+
+    logger.info(
+      { group: group.name, containerName: warmHandle.containerName },
+      'Activated warm container',
+    );
+    return warmHandle.exited;
+  }
+
   const startTime = Date.now();
 
   const groupDir = resolveGroupFolderPath(group.folder);

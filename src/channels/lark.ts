@@ -210,9 +210,14 @@ export interface LarkChannelOpts {
 // Streaming card element ID
 const STREAMING_ELEMENT_ID = 'streaming_md';
 
+// Loading element shown at bottom of streaming card before first content arrives
+const LOADING_ELEMENT_ID = 'streaming_loading';
+
 interface StreamingCard {
   cardId: string;
   sequence: number;
+  /** True when card was pre-created with a loading element that needs removing on first content. */
+  hasLoadingElement?: boolean;
 }
 
 /** Strip the `lark:` prefix to get the raw Lark chat_id. */
@@ -631,13 +636,18 @@ export class LarkChannel implements Channel {
     const existing = this.streamingCards.get(jid);
 
     if (existing) {
-      // Replace with latest full text (API calculates diff for typewriter effect)
       existing.sequence++;
+
+      const fullText = mentionUser && existing.sequence === 1
+        ? `<at id=${mentionUser.id}></at> ${text}`
+        : text;
+
+      // Push content with typewriter effect (same path for first chunk and subsequent chunks).
       await this.client.cardkit.v1.cardElement.content({
         path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
-        data: { content: text, sequence: existing.sequence },
+        data: { content: fullText, sequence: existing.sequence },
       });
-      logger.info({ jid, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
+      logger.info({ jid, cardId: existing.cardId, length: fullText.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
@@ -648,7 +658,7 @@ export class LarkChannel implements Channel {
         schema: '2.0',
         config: {
           streaming_mode: true,
-          summary: { content: '' },
+          summary: { content: '正在回答...' },
           streaming_config: {
             print_frequency_ms: { default: 50 },
             print_step: { default: 2 },
@@ -658,7 +668,7 @@ export class LarkChannel implements Channel {
         body: {
           elements: [{
             tag: 'markdown',
-            content: ' ',
+            content: '',
             element_id: STREAMING_ELEMENT_ID,
           }],
         },
@@ -693,26 +703,143 @@ export class LarkChannel implements Channel {
   }
 
   /**
+   * Pre-create a streaming card and send it to the chat.
+   * The card shows a placeholder until the first real chunk arrives via sendMessage.
+   * This saves ~3s on first-chunk latency by doing the two API calls (card.create +
+   * sendToChat) while the agent is still initializing.
+   */
+  async beginStreaming(
+    jid: string,
+    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } },
+  ): Promise<void> {
+    if (this.streamingCards.has(jid)) return; // already has a card
+
+    const cardJson = {
+      schema: '2.0',
+      config: {
+        streaming_mode: true,
+        summary: { content: '正在回答...' },
+        streaming_config: {
+          print_frequency_ms: { default: 50 },
+          print_step: { default: 2 },
+          print_strategy: 'fast',
+        },
+      },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: '',
+            element_id: STREAMING_ELEMENT_ID,
+          },
+          {
+            tag: 'column_set',
+            margin: '0px',
+            flex_mode: 'none',
+            columns: [{
+              tag: 'column',
+              width: 'weighted',
+              weight: 1,
+              padding: '0px',
+              elements: [{
+                tag: 'markdown',
+                content: '<font color="grey">努力回答中...</font>',
+                text_size: 'notation',
+                icon: {
+                  tag: 'standard_icon',
+                  token: 'robot_outlined',
+                  color: 'grey',
+                },
+              }],
+            }],
+            element_id: LOADING_ELEMENT_ID,
+          },
+        ],
+      },
+    };
+
+    const createResult = await this.client.cardkit.v1.card.create({
+      data: {
+        type: 'card_json',
+        data: JSON.stringify(cardJson),
+      },
+    });
+
+    const cardId = createResult?.data?.card_id;
+    if (!cardId) throw new Error('Failed to pre-create streaming card');
+
+    this.streamingCards.set(jid, { cardId, sequence: 0, hasLoadingElement: true });
+
+    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+    await this.sendToChat(jid, content, 'interactive', opts?.replyToMessageId);
+
+    logger.info({ jid, cardId }, 'Streaming card pre-created');
+  }
+
+  /**
    * End the streaming session for a chat: disable streaming mode and clean up.
    */
   async endStreaming(jid: string): Promise<void> {
     const card = this.streamingCards.get(jid);
     if (!card) return;
 
+    // Delete from map immediately to prevent concurrent calls from double-firing
+    this.streamingCards.delete(jid);
+
     try {
       card.sequence++;
-      await this.client.cardkit.v1.card.settings({
-        path: { card_id: card.cardId },
-        data: {
-          settings: JSON.stringify({ config: { streaming_mode: false } }),
-          sequence: card.sequence,
-        },
-      });
-      logger.info({ jid, cardId: card.cardId }, 'Streaming mode disabled');
+
+      if (card.hasLoadingElement) {
+        // Replace loading column_set with final disclaimer + disable streaming in one batch
+        const disclaimerElement = {
+          tag: 'column_set',
+          margin: '0px',
+          flex_mode: 'none',
+          columns: [{
+            tag: 'column',
+            width: 'weighted',
+            weight: 1,
+            padding: '0px',
+            elements: [{
+              tag: 'markdown',
+              content: '<font color="grey">以上内容由AI生成，仅供参考</font>',
+              text_size: 'notation',
+              icon: { tag: 'standard_icon', token: 'robot_outlined', color: 'grey' },
+            }],
+          }],
+        };
+        const actions = JSON.stringify([
+          {
+            action: 'update_element',
+            params: {
+              element_id: LOADING_ELEMENT_ID,
+              element: JSON.stringify(disclaimerElement),
+            },
+          },
+          {
+            action: 'partial_update_setting',
+            params: {
+              settings: JSON.stringify({ config: { streaming_mode: false } }),
+            },
+          },
+        ]);
+        await this.client.cardkit.v1.card.batchUpdate({
+          path: { card_id: card.cardId },
+          data: { actions, sequence: card.sequence },
+        });
+      } else {
+        await this.client.cardkit.v1.card.settings({
+          path: { card_id: card.cardId },
+          data: {
+            settings: JSON.stringify({ config: { streaming_mode: false } }),
+            sequence: card.sequence,
+          },
+        });
+      }
+      logger.info({ jid, cardId: card.cardId }, 'Streaming ended');
     } catch (err) {
-      logger.warn({ jid, err }, 'Failed to disable streaming mode');
+      logger.warn({ jid, err }, 'Failed to end streaming');
     }
-    this.streamingCards.delete(jid);
   }
 
   /**

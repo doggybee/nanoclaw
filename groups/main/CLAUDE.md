@@ -140,7 +140,7 @@ Available groups are provided in `/workspace/ipc/available_groups.json`:
 {
   "groups": [
     {
-      "jid": "120363336345536173@g.us",
+      "jid": "lark:oc_example456",
       "name": "Family Chat",
       "lastActivity": "2026-01-31T12:00:00.000Z",
       "isRegistered": false
@@ -166,7 +166,7 @@ Then wait a moment and re-read `available_groups.json`.
 sqlite3 /workspace/project/store/messages.db "
   SELECT jid, name, last_message_time
   FROM chats
-  WHERE jid LIKE '%@g.us' AND jid != '__group_sync__'
+  WHERE is_group = 1
   ORDER BY last_message_time DESC
   LIMIT 10;
 "
@@ -178,7 +178,7 @@ Groups are registered in `/workspace/project/data/registered_groups.json`:
 
 ```json
 {
-  "1234567890-1234567890@g.us": {
+  "lark:oc_example123": {
     "name": "Family Chat",
     "folder": "family-chat",
     "trigger": "@CC",
@@ -188,7 +188,7 @@ Groups are registered in `/workspace/project/data/registered_groups.json`:
 ```
 
 Fields:
-- **Key**: The WhatsApp JID (unique identifier for the chat)
+- **Key**: The chat JID (unique identifier for the chat, e.g. `lark:oc_xxx`)
 - **name**: Display name for the group
 - **folder**: Folder name under `groups/` for this group's files and memory
 - **trigger**: The trigger word (usually same as global, but could differ)
@@ -221,7 +221,7 @@ Groups can have extra directories mounted. Add `containerConfig` to their entry:
 
 ```json
 {
-  "1234567890@g.us": {
+  "lark:oc_example789": {
     "name": "Dev Team",
     "folder": "dev-team",
     "trigger": "@CC",
@@ -263,6 +263,6 @@ You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts
 ## Scheduling for Other Groups
 
 When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `registered_groups.json`:
-- `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
+- `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "lark:oc_example456")`
 
 The task will run in that group's context with access to their files and memory.

@@ -4,7 +4,9 @@
 FROM node:22-slim
 
 # Install system dependencies for Chromium
-RUN apt-get update && apt-get install -y \
+# Clean up docs, icons, DRI drivers, and OpenType CJK fonts (keep TrueType only)
+# to reduce image size by ~160MB
+RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     fonts-liberation \
     fonts-noto-cjk \
@@ -25,20 +27,23 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     unzip \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+              /usr/share/doc/* \
+              /usr/share/icons/* \
+              /usr/lib/x86_64-linux-gnu/dri/*
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code
+# Install agent-browser and claude-code globally, clean npm cache
+RUN npm install -g agent-browser @anthropic-ai/claude-code && npm cache clean --force
 
 # Install Bun runtime (required by QMD) to shared path accessible by all users
 RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
 
 # Install QMD CLI (local search: BM25 + vector + LLM reranking)
-RUN npm install -g @tobilu/qmd
+RUN npm install -g @tobilu/qmd && npm cache clean --force
 
 # Create app directory
 WORKDIR /app

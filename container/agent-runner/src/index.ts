@@ -60,7 +60,7 @@ interface SDKUserMessage {
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 200;
+const IPC_POLL_MS = 50;
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -297,25 +297,30 @@ function shouldClose(): boolean {
   return false;
 }
 
+interface IpcMessage {
+  text: string;
+  model?: string;
+}
+
 /**
  * Drain all pending IPC input messages.
  * Returns messages found, or empty array.
  */
-function drainIpcInput(): string[] {
+function drainIpcInput(): IpcMessage[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();
 
-    const messages: string[] = [];
+    const messages: IpcMessage[] = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push(data.text);
+          messages.push({ text: data.text, model: data.model });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -331,9 +336,9 @@ function drainIpcInput(): string[] {
 
 /**
  * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
+ * Returns the combined message (with optional model from first message), or null if _close.
  */
-function waitForIpcMessage(): Promise<string | null> {
+function waitForIpcMessage(): Promise<IpcMessage | null> {
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
@@ -342,7 +347,10 @@ function waitForIpcMessage(): Promise<string | null> {
       }
       const messages = drainIpcInput();
       if (messages.length > 0) {
-        resolve(messages.join('\n'));
+        resolve({
+          text: messages.map(m => m.text).join('\n'),
+          model: messages[0].model,
+        });
         return;
       }
       setTimeout(poll, IPC_POLL_MS);
@@ -381,9 +389,9 @@ async function runQuery(
       return;
     }
     const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
+    for (const msg of messages) {
+      log(`Piping IPC message into active query (${msg.text.length} chars)`);
+      stream.push(msg.text);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
@@ -551,7 +559,24 @@ async function main(): Promise<void> {
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
+    prompt += '\n' + pending.map(m => m.text).join('\n');
+  }
+
+  // Warm mode: no prompt provided, wait for first IPC message
+  if (!prompt) {
+    log('Warm mode: waiting for first IPC message...');
+    const firstMessage = await waitForIpcMessage();
+    if (firstMessage === null) {
+      log('Close sentinel received in warm mode, exiting');
+      return;
+    }
+    log(`Warm mode activated: received first message (${firstMessage.text.length} chars)`);
+    prompt = firstMessage.text;
+    // Apply model override from warm-up activation message
+    if (firstMessage.model) {
+      containerInput.model = firstMessage.model;
+      log(`Warm mode: using model ${firstMessage.model}`);
+    }
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat
@@ -588,8 +613,11 @@ async function main(): Promise<void> {
         break;
       }
 
-      log(`Got new message (${nextMessage.length} chars), starting new query`);
-      prompt = nextMessage;
+      log(`Got new message (${nextMessage.text.length} chars), starting new query`);
+      prompt = nextMessage.text;
+      if (nextMessage.model) {
+        containerInput.model = nextMessage.model;
+      }
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

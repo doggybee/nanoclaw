@@ -89,6 +89,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: emoji reaction on a message.
   addReaction?(jid: string, messageId: string, emojiType: string): Promise<void>;
+  // Optional: pre-create a streaming card so the first chunk only needs a content update.
+  beginStreaming?(jid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void>;
   // Optional: end a streaming card session (Lark streaming cards).
   endStreaming?(jid: string): Promise<void>;
   // Optional: send an image file.

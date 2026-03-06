@@ -11,7 +11,9 @@ import {
 import { LarkChannel } from './channels/lark.js';
 import {
   ContainerOutput,
+  WarmContainerHandle,
   runContainerAgent,
+  spawnWarmContainer,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -59,6 +61,44 @@ let pendingReplyTo: Record<string, { messageId: string; senderId: string; sender
 let lark: LarkChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Pre-warmed containers: keyed by chatJid
+const warmContainers = new Map<string, WarmContainerHandle>();
+
+/**
+ * Spawn a warm container for a group so the next message skips cold start.
+ * Safe to call multiple times — skips if a warm container already exists.
+ */
+function warmUpGroup(chatJid: string): void {
+  if (warmContainers.has(chatJid)) return;
+  const group = registeredGroups[chatJid];
+  if (!group) return;
+
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  const sessionId = sessions[group.folder];
+
+  spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, sessionId)
+    .then((handle) => {
+      // Container may have been activated before spawn finished (race)
+      if (warmContainers.has(chatJid)) {
+        logger.debug({ chatJid }, 'Warm container superseded, closing');
+        handle.process.kill();
+        return;
+      }
+      warmContainers.set(chatJid, handle);
+      logger.info({ chatJid, group: group.name }, 'Warm container ready');
+
+      // Re-warm when this container exits
+      handle.exited.then(() => {
+        warmContainers.delete(chatJid);
+        // Delay re-warm slightly to avoid tight restart loops on errors
+        setTimeout(() => warmUpGroup(chatJid), 2000);
+      });
+    })
+    .catch((err) => {
+      logger.warn({ chatJid, err }, 'Failed to spawn warm container');
+    });
+}
 
 // Wake signal: resolves immediately to interrupt the polling sleep
 let wakeResolve: (() => void) | null = null;
@@ -259,6 +299,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   await channel.setTyping?.(chatJid, true);
+
+  // Pre-create streaming card in parallel with agent activation (fire-and-forget).
+  // Don't await — let card creation overlap with container warm-up / SDK init.
+  const replyTarget = pendingReplyTo[chatJid];
+  if (channel.beginStreaming) {
+    channel.beginStreaming(chatJid, replyTarget
+      ? { replyToMessageId: replyTarget.messageId, mentionUser: { id: replyTarget.senderId, name: replyTarget.senderName } }
+      : undefined,
+    ).catch((err) => {
+      logger.warn({ chatJid, err }, 'Failed to pre-create streaming card, will create on first chunk');
+    });
+  }
+
   let hadError = false;
   let outputSentToUser = false;
 
@@ -298,6 +351,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             await channel.sendMessage(chatJid, text, opts);
             outputSentToUser = true;
           }
+          // End streaming immediately on final result (don't wait for success status ~1s later)
+          channel.endStreaming?.(chatJid)?.catch((err) =>
+            logger.warn({ chatJid, err }, 'Failed to end streaming on final result'));
         }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -305,6 +361,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     if (result.status === 'success') {
+      // End streaming card immediately when agent finishes (don't wait for container exit)
+      channel.endStreaming?.(chatJid)?.catch((err) =>
+        logger.warn({ chatJid, err }, 'Failed to end streaming on success'));
       queue.notifyIdle(chatJid);
     }
 
@@ -386,6 +445,13 @@ async function runAgent(
       }
     : undefined;
 
+  // Use warm container if available (skips Docker cold start)
+  const warmHandle = warmContainers.get(chatJid);
+  if (warmHandle) {
+    warmContainers.delete(chatJid);
+    logger.info({ group: group.name }, 'Using warm container');
+  }
+
   try {
     const output = await runContainerAgent(
       group,
@@ -401,6 +467,7 @@ async function runAgent(
       (proc, containerName) =>
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
+      warmHandle,
     );
 
     if (output.newSessionId) {
@@ -670,6 +737,12 @@ async function main(): Promise<void> {
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Pre-warm containers for registered groups so the first message skips cold start
+  for (const chatJid of Object.keys(registeredGroups)) {
+    warmUpGroup(chatJid);
+  }
+
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
     process.exit(1);
