@@ -34,6 +34,35 @@ import { RegisteredGroup } from './types.js';
 const createdDirs = new Set<string>();
 const chownedDirs = new Set<string>();
 
+const CONTAINER_HOME = '/home/node';
+
+// RTK source files (checked once per process)
+const rtkSrcDir = path.join(process.cwd(), 'container', 'rtk');
+const rtkAvailable = fs.existsSync(rtkSrcDir);
+
+// Pre-compute desired settings.json content (includes RTK hook only if available)
+const desiredSettings: Record<string, unknown> = {
+  env: {
+    // Enable agent swarms (subagent orchestration)
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+    // Load CLAUDE.md from additional mounted directories
+    CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+    // Enable Claude's memory feature
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  },
+};
+if (rtkAvailable) {
+  desiredSettings.hooks = {
+    PreToolUse: [
+      {
+        matcher: 'Bash',
+        hooks: [{ type: 'command', command: `${CONTAINER_HOME}/.claude/hooks/rtk-rewrite.sh` }],
+      },
+    ],
+  };
+}
+const DESIRED_SETTINGS_STR = JSON.stringify(desiredSettings, null, 2) + '\n';
+
 /** Recursively chown a directory tree so the container's node user can write.
  *  Skips files/dirs that already have the correct ownership. */
 function chownRecursive(dir: string, uid: number, gid: number): void {
@@ -165,60 +194,26 @@ function buildVolumeMounts(
     '.claude',
   );
   cachedMkdir(groupSessionsDir);
+  // Write settings.json if content differs (uses snapshotCache to avoid disk reads)
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const desiredSettings = {
-    env: {
-      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-      CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-    },
-    hooks: {
-      PreToolUse: [
-        {
-          matcher: 'Bash',
-          hooks: [
-            {
-              type: 'command',
-              command: '/home/node/.claude/hooks/rtk-rewrite.sh',
-            },
-          ],
-        },
-      ],
-    },
-  };
-  const desiredSettingsStr = JSON.stringify(desiredSettings, null, 2) + '\n';
-  if (!fs.existsSync(settingsFile) || fs.readFileSync(settingsFile, 'utf8') !== desiredSettingsStr) {
-    fs.writeFileSync(settingsFile, desiredSettingsStr);
+  if (snapshotCache.get(settingsFile) !== DESIRED_SETTINGS_STR) {
+    let needsWrite = true;
+    try { needsWrite = fs.readFileSync(settingsFile, 'utf8') !== DESIRED_SETTINGS_STR; } catch { /* missing */ }
+    if (needsWrite) fs.writeFileSync(settingsFile, DESIRED_SETTINGS_STR);
+    snapshotCache.set(settingsFile, DESIRED_SETTINGS_STR);
   }
 
   // Sync RTK hook and RTK.md into group's .claude/ directory
-  const rtkSrcDir = path.join(process.cwd(), 'container', 'rtk');
-  if (fs.existsSync(rtkSrcDir)) {
-    // hooks/rtk-rewrite.sh
-    const hooksSrc = path.join(rtkSrcDir, 'rtk-rewrite.sh');
-    const hooksDst = path.join(groupSessionsDir, 'hooks');
-    if (fs.existsSync(hooksSrc)) {
-      cachedMkdir(hooksDst);
-      const dstFile = path.join(hooksDst, 'rtk-rewrite.sh');
-      if (!fs.existsSync(dstFile) || fs.statSync(hooksSrc).mtimeMs > fs.statSync(dstFile).mtimeMs) {
-        fs.cpSync(hooksSrc, dstFile);
-        fs.chmodSync(dstFile, 0o755);
-      }
-    }
-    // RTK.md
-    const rtkMdSrc = path.join(rtkSrcDir, 'RTK.md');
-    const rtkMdDst = path.join(groupSessionsDir, 'RTK.md');
-    if (fs.existsSync(rtkMdSrc) &&
-        (!fs.existsSync(rtkMdDst) || fs.statSync(rtkMdSrc).mtimeMs > fs.statSync(rtkMdDst).mtimeMs)) {
-      fs.cpSync(rtkMdSrc, rtkMdDst);
-    }
+  if (rtkAvailable) {
+    cachedMkdir(path.join(groupSessionsDir, 'hooks'));
+    copyIfNewer(path.join(rtkSrcDir, 'rtk-rewrite.sh'), path.join(groupSessionsDir, 'hooks', 'rtk-rewrite.sh'), { chmod: 0o755 });
+    copyIfNewer(path.join(rtkSrcDir, 'RTK.md'), path.join(groupSessionsDir, 'RTK.md'));
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
-  // Only copies when source files are newer to avoid redundant I/O on every spawn.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
+  try {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
@@ -226,21 +221,15 @@ function buildVolumeMounts(
       if (!fs.existsSync(dstDir)) {
         fs.cpSync(srcDir, dstDir, { recursive: true });
       } else {
-        // Only copy individual files that are newer
         for (const file of fs.readdirSync(srcDir)) {
-          const srcFile = path.join(srcDir, file);
-          const dstFile = path.join(dstDir, file);
-          if (!fs.existsSync(dstFile) ||
-              fs.statSync(srcFile).mtimeMs > fs.statSync(dstFile).mtimeMs) {
-            fs.cpSync(srcFile, dstFile, { recursive: true });
-          }
+          copyIfNewer(path.join(srcDir, file), path.join(dstDir, file));
         }
       }
     }
-  }
+  } catch { /* skillsSrc missing, skip */ }
   mounts.push({
     hostPath: groupSessionsDir,
-    containerPath: '/home/node/.claude',
+    containerPath: `${CONTAINER_HOME}/.claude`,
     readonly: false,
   });
 
@@ -249,7 +238,7 @@ function buildVolumeMounts(
   cachedMkdir(qmdCacheDir);
   mounts.push({
     hostPath: qmdCacheDir,
-    containerPath: '/home/node/.cache/qmd',
+    containerPath: `${CONTAINER_HOME}/.cache/qmd`,
     readonly: false,
   });
 
@@ -343,7 +332,7 @@ function buildContainerArgs(
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
-    args.push('-e', 'HOME=/home/node');
+    args.push('-e', `HOME=${CONTAINER_HOME}`);
   }
 
   for (const mount of mounts) {
@@ -922,6 +911,21 @@ export async function runContainerAgent(
 
 // Cache last-written content per file to skip redundant disk writes
 const snapshotCache = new Map<string, string>();
+
+/** Copy src to dst only if src is newer (by mtime). Returns true if copied. */
+function copyIfNewer(src: string, dst: string, opts?: { chmod?: number }): boolean {
+  try {
+    const srcStat = fs.statSync(src);
+    let dstMtime = 0;
+    try { dstMtime = fs.statSync(dst).mtimeMs; } catch { /* dst missing */ }
+    if (srcStat.mtimeMs > dstMtime) {
+      fs.cpSync(src, dst, { recursive: true });
+      if (opts?.chmod) fs.chmodSync(dst, opts.chmod);
+      return true;
+    }
+  } catch { /* src missing, skip */ }
+  return false;
+}
 
 export function writeTasksSnapshot(
   groupFolder: string,
