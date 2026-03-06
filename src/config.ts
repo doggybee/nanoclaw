@@ -9,6 +9,10 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'MAX_CONTAINERS_PER_GROUP',
+  'WARM_POOL_SIZE',
+  'CONTAINER_MEMORY',
+  'CONTAINER_CPUS',
 ]);
 
 export const ASSISTANT_NAME =
@@ -49,8 +53,20 @@ export const IPC_POLL_INTERVAL = 50;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
-  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
+  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '3', 10) || 3,
 );
+export const MAX_CONTAINERS_PER_GROUP = Math.max(
+  1,
+  parseInt(process.env.MAX_CONTAINERS_PER_GROUP || envConfig.MAX_CONTAINERS_PER_GROUP || '2', 10) || 2,
+);
+export const WARM_POOL_SIZE = Math.max(
+  0,
+  parseInt(process.env.WARM_POOL_SIZE || envConfig.WARM_POOL_SIZE || '1', 10) || 0,
+);
+export const CONTAINER_MEMORY =
+  process.env.CONTAINER_MEMORY || envConfig.CONTAINER_MEMORY || '1g';
+export const CONTAINER_CPUS =
+  process.env.CONTAINER_CPUS || envConfig.CONTAINER_CPUS || '0.5';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

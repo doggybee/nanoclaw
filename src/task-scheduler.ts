@@ -21,7 +21,7 @@ import {
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, makeSlotKey } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
@@ -165,11 +165,12 @@ async function runTask(
   const TASK_CLOSE_DELAY_MS = 10000;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
 
+  const taskSlotKey = makeSlotKey(task.chat_jid, '__task__');
   const scheduleClose = () => {
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
       logger.debug({ taskId: task.id }, 'Closing task container after result');
-      deps.queue.closeStdin(task.chat_jid);
+      deps.queue.closeStdin(taskSlotKey);
     }, TASK_CLOSE_DELAY_MS);
   };
 
@@ -195,7 +196,7 @@ async function runTask(
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
-          deps.queue.notifyIdle(task.chat_jid);
+          deps.queue.notifyIdle(taskSlotKey);
         }
         if (streamedOutput.status === 'error') {
           error = streamedOutput.error || 'Unknown error';

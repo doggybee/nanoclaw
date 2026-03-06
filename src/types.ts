@@ -81,7 +81,7 @@ export interface TaskRunLog {
 export interface Channel {
   name: string;
   connect(): Promise<void>;
-  sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void>;
+  sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string }): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
@@ -90,9 +90,10 @@ export interface Channel {
   // Optional: emoji reaction on a message.
   addReaction?(jid: string, messageId: string, emojiType: string): Promise<void>;
   // Optional: pre-create a streaming card so the first chunk only needs a content update.
-  beginStreaming?(jid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void>;
+  // keyOrJid can be a slotKey (for per-user isolation) or a plain jid.
+  beginStreaming?(keyOrJid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void>;
   // Optional: end a streaming card session (Lark streaming cards).
-  endStreaming?(jid: string): Promise<void>;
+  endStreaming?(keyOrJid: string): Promise<void>;
   // Optional: send an image file.
   sendImage?(jid: string, imagePath: string, replyToMessageId?: string): Promise<void>;
   // Optional: send a file.

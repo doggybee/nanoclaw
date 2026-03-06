@@ -162,7 +162,12 @@ async function processIpcMessage(
 
     case 'get_chat_history': {
       if (!data.requestId) return;
-      const responsePath = path.join(ipcBaseDir, sourceGroup, 'responses', `${data.requestId}.json`);
+      // Write response to the slot's responses dir if slotId is present,
+      // otherwise fall back to group-level responses dir.
+      const responseBase = data.slotId
+        ? path.join(ipcBaseDir, sourceGroup, 'slots', data.slotId, 'responses')
+        : path.join(ipcBaseDir, sourceGroup, 'responses');
+      const responsePath = path.join(responseBase, `${data.requestId}.json`);
       if (!deps.getChatHistory) {
         logger.warn({ chatJid, sourceGroup }, 'getChatHistory not available on channel');
         writeIpcResponse(responsePath, { status: 'error', error: 'getChatHistory not available on this channel' });
@@ -240,6 +245,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
 
       for (const sourceGroup of groupFolders) {
         const isMain = sourceGroup === MAIN_GROUP_FOLDER;
+
+        // Scan legacy (non-slot) directories
         const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
         const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
 
@@ -249,6 +256,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
         await processDir(tasksDir, sourceGroup, (data) =>
           processTaskIpc(data, sourceGroup, isMain, deps),
         );
+
+        // Scan per-slot directories: {groupFolder}/slots/*/messages/ and tasks/
+        const slotsDir = path.join(ipcBaseDir, sourceGroup, 'slots');
+        let slotIds: string[];
+        try {
+          slotIds = fs.readdirSync(slotsDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory())
+            .map((d) => d.name);
+        } catch {
+          slotIds = []; // slots/ doesn't exist yet
+        }
+        for (const slotId of slotIds) {
+          const slotMessagesDir = path.join(slotsDir, slotId, 'messages');
+          const slotTasksDir = path.join(slotsDir, slotId, 'tasks');
+
+          await processDir(slotMessagesDir, sourceGroup, (data) =>
+            processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir),
+          );
+          await processDir(slotTasksDir, sourceGroup, (data) =>
+            processTaskIpc(data, sourceGroup, isMain, deps),
+          );
+        }
       }
     } finally {
       processing = false;

@@ -634,7 +634,7 @@ export class LarkChannel implements Channel {
     }
   }
 
-  async sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void> {
+  async sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string }): Promise<void> {
     if (!this.connected) {
       if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
         const dropped = this.outgoingQueue.shift();
@@ -649,7 +649,7 @@ export class LarkChannel implements Channel {
     }
 
     try {
-      await this._sendStreaming(jid, text, opts?.replyToMessageId, opts?.mentionUser);
+      await this._sendStreaming(jid, text, opts?.replyToMessageId, opts?.mentionUser, opts?.slotKey);
     } catch (err) {
       logger.warn({ jid, err }, 'Streaming card send failed, falling back to post');
       try {
@@ -679,8 +679,10 @@ export class LarkChannel implements Channel {
     text: string,
     replyToMessageId?: string,
     mentionUser?: { id: string; name: string },
+    slotKey?: string,
   ): Promise<void> {
-    const existing = this.streamingCards.get(jid);
+    const cardKey = slotKey || jid;
+    const existing = this.streamingCards.get(cardKey);
 
     if (existing) {
       const nextSeq = existing.sequence + 1;
@@ -695,7 +697,7 @@ export class LarkChannel implements Channel {
         data: { content: fullText, sequence: nextSeq },
       });
       existing.sequence = nextSeq;
-      logger.info({ jid, cardId: existing.cardId, length: fullText.length }, 'Streaming card text updated');
+      logger.info({ jid, cardKey, cardId: existing.cardId, length: fullText.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
@@ -725,7 +727,7 @@ export class LarkChannel implements Channel {
       if (!cardId) throw new Error('Failed to create card entity');
 
       const fullText = mentionPrefix + text;
-      this.streamingCards.set(jid, { cardId, sequence: 1 });
+      this.streamingCards.set(cardKey, { cardId, sequence: 1 });
 
       // Parallelize: send card message + push initial text concurrently.
       // The card entity already exists, so both operations are independent.
@@ -738,7 +740,7 @@ export class LarkChannel implements Channel {
         }),
       ]);
 
-      logger.info({ jid, cardId, length: fullText.length }, 'Streaming card created and sent');
+      logger.info({ jid, cardKey, cardId, length: fullText.length }, 'Streaming card created and sent');
     }
   }
 
@@ -749,10 +751,12 @@ export class LarkChannel implements Channel {
    * sendToChat) while the agent is still initializing.
    */
   async beginStreaming(
-    jid: string,
+    keyOrJid: string,
     opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } },
   ): Promise<void> {
-    if (this.streamingCards.has(jid)) return; // already has a card
+    if (this.streamingCards.has(keyOrJid)) return; // already has a card
+    // Extract the real jid from a slotKey (chatJid::senderId) or use as-is
+    const jid = keyOrJid.includes('::') ? keyOrJid.split('::')[0] : keyOrJid;
 
     const cardJson = {
       schema: '2.0',
@@ -779,23 +783,23 @@ export class LarkChannel implements Channel {
     const cardId = createResult?.data?.card_id;
     if (!cardId) throw new Error('Failed to pre-create streaming card');
 
-    this.streamingCards.set(jid, { cardId, sequence: 0, hasLoadingElement: true });
+    this.streamingCards.set(keyOrJid, { cardId, sequence: 0, hasLoadingElement: true });
 
     const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
     await this.sendToChat(jid, content, 'interactive', opts?.replyToMessageId);
 
-    logger.info({ jid, cardId }, 'Streaming card pre-created');
+    logger.info({ keyOrJid, cardId }, 'Streaming card pre-created');
   }
 
   /**
    * End the streaming session for a chat: disable streaming mode and clean up.
    */
-  async endStreaming(jid: string): Promise<void> {
-    const card = this.streamingCards.get(jid);
+  async endStreaming(keyOrJid: string): Promise<void> {
+    const card = this.streamingCards.get(keyOrJid);
     if (!card) return;
 
     // Delete from map immediately to prevent concurrent calls from double-firing
-    this.streamingCards.delete(jid);
+    this.streamingCards.delete(keyOrJid);
 
     try {
       card.sequence++;
@@ -831,9 +835,9 @@ export class LarkChannel implements Channel {
           },
         });
       }
-      logger.info({ jid, cardId: card.cardId }, 'Streaming ended');
+      logger.info({ keyOrJid, cardId: card.cardId }, 'Streaming ended');
     } catch (err) {
-      logger.warn({ jid, err }, 'Failed to end streaming');
+      logger.warn({ keyOrJid, err }, 'Failed to end streaming');
     }
   }
 

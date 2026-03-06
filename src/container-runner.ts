@@ -7,8 +7,10 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  CONTAINER_CPUS,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
+  CONTAINER_MEMORY,
   CONTAINER_TIMEOUT,
   DATA_DIR,
   GROUPS_DIR,
@@ -78,6 +80,8 @@ export interface ContainerInput {
   secrets?: Record<string, string>;
   /** Override model for this run (from model router). */
   model?: string;
+  /** Slot ID for per-user IPC isolation. */
+  slotId?: string;
 }
 
 export interface ContainerOutput {
@@ -97,6 +101,7 @@ interface VolumeMount {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  slotId?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -223,16 +228,30 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
+  // Per-slot IPC namespace: each user slot gets its own IPC directory
+  // to prevent concurrent containers from conflicting on input/output files.
+  // The container sees /workspace/ipc/ with messages/, tasks/, input/, responses/ subdirs.
   const groupIpcDir = resolveGroupIpcPath(group.folder);
-  cachedMkdir(path.join(groupIpcDir, 'messages'));
-  cachedMkdir(path.join(groupIpcDir, 'tasks'));
-  cachedMkdir(path.join(groupIpcDir, 'input'));
+  const slotIpcDir = slotId
+    ? path.join(groupIpcDir, 'slots', slotId)
+    : groupIpcDir;
+  cachedMkdir(path.join(slotIpcDir, 'messages'));
+  cachedMkdir(path.join(slotIpcDir, 'tasks'));
+  cachedMkdir(path.join(slotIpcDir, 'input'));
+  cachedMkdir(path.join(slotIpcDir, 'responses'));
   mounts.push({
-    hostPath: groupIpcDir,
+    hostPath: slotIpcDir,
     containerPath: '/workspace/ipc',
     readonly: false,
+  });
+  // Also mount group-level IPC for shared files (tasks snapshot, groups snapshot)
+  // that are written at group level, not per-slot.
+  // Mount read-only at a secondary path so container can read but not interfere.
+  cachedMkdir(groupIpcDir);
+  mounts.push({
+    hostPath: groupIpcDir,
+    containerPath: '/workspace/ipc-group',
+    readonly: true,
   });
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
@@ -281,7 +300,7 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
 ): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--name', containerName, '--memory', '2g', '--cpus', '1'];
+  const args: string[] = ['run', '-i', '--rm', '--name', containerName, '--memory', CONTAINER_MEMORY, '--cpus', CONTAINER_CPUS];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -340,11 +359,12 @@ export async function spawnWarmContainer(
   isMain: boolean,
   assistantName: string,
   sessionId?: string,
+  slotId?: string,
 ): Promise<WarmContainerHandle> {
   const groupDir = resolveGroupFolderPath(group.folder);
   cachedMkdir(groupDir);
 
-  const mounts = buildVolumeMounts(group, isMain);
+  const mounts = buildVolumeMounts(group, isMain, slotId);
   const secrets = await readSecrets();
 
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
@@ -473,7 +493,11 @@ export async function runContainerAgent(
     if (onOutput) warmHandle.setOnOutput(onOutput);
 
     // Pipe the prompt via IPC (same mechanism as follow-up messages)
-    const inputDir = path.join(resolveGroupIpcPath(group.folder), 'input');
+    // Use per-slot IPC path if slotId is provided
+    const groupIpcDir = resolveGroupIpcPath(group.folder);
+    const inputDir = input.slotId
+      ? path.join(groupIpcDir, 'slots', input.slotId, 'input')
+      : path.join(groupIpcDir, 'input');
     fs.mkdirSync(inputDir, { recursive: true });
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
     const filepath = path.join(inputDir, filename);
@@ -495,7 +519,7 @@ export async function runContainerAgent(
 
   // Run buildVolumeMounts and readSecrets in parallel — they're independent.
   const [mounts, secrets] = await Promise.all([
-    Promise.resolve(buildVolumeMounts(group, input.isMain)),
+    Promise.resolve(buildVolumeMounts(group, input.isMain, input.slotId)),
     readSecrets(),
   ]);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');

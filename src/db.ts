@@ -71,8 +71,10 @@ function createSchema(database: Database.Database): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
+      group_folder TEXT NOT NULL,
+      sender_id TEXT NOT NULL DEFAULT '',
+      session_id TEXT NOT NULL,
+      PRIMARY KEY (group_folder, sender_id)
     );
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
@@ -117,6 +119,26 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* columns already exist */
+  }
+
+  // Migrate sessions table to composite primary key (group_folder, sender_id)
+  // for per-user session isolation within groups
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN sender_id TEXT NOT NULL DEFAULT ''`);
+    // SQLite doesn't support ALTER PRIMARY KEY, so recreate the table
+    database.exec(`
+      CREATE TABLE sessions_new (
+        group_folder TEXT NOT NULL,
+        sender_id TEXT NOT NULL DEFAULT '',
+        session_id TEXT NOT NULL,
+        PRIMARY KEY (group_folder, sender_id)
+      );
+      INSERT INTO sessions_new SELECT group_folder, sender_id, session_id FROM sessions;
+      DROP TABLE sessions;
+      ALTER TABLE sessions_new RENAME TO sessions;
+    `);
+  } catch {
+    /* column already exists or table already migrated */
   }
 }
 
@@ -483,26 +505,27 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export function getSession(groupFolder: string, senderId = ''): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
+    .prepare('SELECT session_id FROM sessions WHERE group_folder = ? AND sender_id = ?')
+    .get(groupFolder, senderId) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(groupFolder: string, sessionId: string, senderId = ''): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (group_folder, sender_id, session_id) VALUES (?, ?, ?)',
+  ).run(groupFolder, senderId, sessionId);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
+    .prepare('SELECT group_folder, sender_id, session_id FROM sessions')
+    .all() as Array<{ group_folder: string; sender_id: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+    const key = row.sender_id ? `${row.group_folder}:${row.sender_id}` : row.group_folder;
+    result[key] = row.session_id;
   }
   return result;
 }
@@ -638,7 +661,7 @@ function migrateJsonState(): void {
   > | null;
   if (sessions) {
     for (const [folder, sessionId] of Object.entries(sessions)) {
-      setSession(folder, sessionId);
+      setSession(folder, sessionId, '');
     }
   }
 

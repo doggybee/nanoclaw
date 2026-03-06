@@ -5,9 +5,9 @@ import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
-  MAX_CONCURRENT_CONTAINERS,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
+  WARM_POOL_SIZE,
 } from './config.js';
 import { LarkChannel } from './channels/lark.js';
 import {
@@ -37,7 +37,7 @@ import {
   storeChatMetadata,
   storeMessage,
 } from './db.js';
-import { GroupQueue } from './group-queue.js';
+import { GroupQueue, makeSlotKey } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { selectModel } from './model-router.js';
@@ -52,10 +52,11 @@ export { escapeXml, formatMessages } from './router.js';
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
+// Per-slot (chatJid::senderId) timestamps for cursor tracking
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-// Per-group reply target: shared between processGroupMessages callback and
+// Per-slot reply target: shared between processUserSlot callback and
 // startMessageLoop piping path so piped messages also get reply-to.
 let pendingReplyTo: Record<string, { messageId: string; senderId: string; senderName: string } | undefined> = {};
 
@@ -63,19 +64,46 @@ let lark: LarkChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-// Pre-warmed containers: keyed by chatJid
-const warmContainers = new Map<string, WarmContainerHandle>();
-// Track consecutive warm-up failures for exponential backoff
-const warmFailures = new Map<string, number>();
+// --- Shared Warm Pool (Step 7) ---
+
+interface WarmPoolEntry {
+  handle: WarmContainerHandle;
+  chatJid: string;
+  groupFolder: string;
+  createdAt: number;
+}
+
+const warmPool: WarmPoolEntry[] = [];
+const warmFailures = new Map<string, number>(); // chatJid -> consecutive failures
 const MAX_WARM_FAILURES = 5;
 
-/**
- * Spawn a warm container for a group so the next message skips cold start.
- * Safe to call multiple times — skips if a warm container already exists.
- * Uses exponential backoff on failures to avoid tight restart loops.
- */
-function warmUpGroup(chatJid: string): void {
-  if (warmContainers.has(chatJid)) return;
+/** Claim a warm container from the pool for the given chatJid. */
+function claimWarm(chatJid: string): WarmContainerHandle | undefined {
+  const idx = warmPool.findIndex((e) => e.chatJid === chatJid);
+  if (idx === -1) return undefined;
+  const entry = warmPool.splice(idx, 1)[0];
+  // Replenish the pool after claiming
+  setTimeout(() => replenishWarmPool(), 2000);
+  return entry.handle;
+}
+
+/** Replenish the warm pool up to WARM_POOL_SIZE. */
+function replenishWarmPool(): void {
+  if (WARM_POOL_SIZE <= 0) return;
+  while (warmPool.length < WARM_POOL_SIZE) {
+    // Pick the most recently active registered group not already in the pool
+    const poolJids = new Set(warmPool.map((e) => e.chatJid));
+    const candidates = Object.keys(registeredGroups).filter((jid) => !poolJids.has(jid));
+    if (candidates.length === 0) break;
+
+    // Use the first candidate (groups are loaded from DB ordered by registration)
+    const chatJid = candidates[0];
+    warmUpForPool(chatJid);
+    break; // One at a time to avoid burst
+  }
+}
+
+function warmUpForPool(chatJid: string): void {
   const group = registeredGroups[chatJid];
   if (!group) return;
 
@@ -86,31 +114,34 @@ function warmUpGroup(chatJid: string): void {
   }
 
   const isMain = group.folder === MAIN_GROUP_FOLDER;
+  // Use group-level session for warm container (no specific user yet)
   const sessionId = sessions[group.folder];
+  const warmSlotId = `_warm_${Date.now()}`;
 
-  spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, sessionId)
+  spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, sessionId, warmSlotId)
     .then((handle) => {
-      // Container may have been activated before spawn finished (race)
-      if (warmContainers.has(chatJid)) {
-        logger.debug({ chatJid }, 'Warm container superseded, closing');
-        handle.process.kill();
-        return;
-      }
-      warmContainers.set(chatJid, handle);
-      warmFailures.delete(chatJid); // reset on success
-      logger.info({ chatJid, group: group.name }, 'Warm container ready');
+      warmPool.push({
+        handle,
+        chatJid,
+        groupFolder: group.folder,
+        createdAt: Date.now(),
+      });
+      warmFailures.delete(chatJid);
+      logger.info({ chatJid, group: group.name, poolSize: warmPool.length }, 'Warm container added to pool');
 
-      // Re-warm when this container exits
+      // When this warm container exits, remove from pool and replenish
       handle.exited.then((output) => {
-        warmContainers.delete(chatJid);
+        const idx = warmPool.findIndex((e) => e.handle === handle);
+        if (idx !== -1) warmPool.splice(idx, 1);
+
         if (output.status === 'error' && !output.result) {
           const count = (warmFailures.get(chatJid) || 0) + 1;
           warmFailures.set(chatJid, count);
           const delay = Math.min(2000 * 2 ** count, 60_000);
           logger.warn({ chatJid, failures: count, delay }, 'Warm container failed, backing off');
-          setTimeout(() => warmUpGroup(chatJid), delay);
+          setTimeout(() => replenishWarmPool(), delay);
         } else {
-          setTimeout(() => warmUpGroup(chatJid), 2000);
+          setTimeout(() => replenishWarmPool(), 2000);
         }
       });
     })
@@ -243,11 +274,16 @@ function findReplyTarget(
   return undefined;
 }
 
+/** Session key for a user slot. */
+function sessionKey(groupFolder: string, senderId: string): string {
+  return senderId ? `${groupFolder}:${senderId}` : groupFolder;
+}
+
 /**
- * Process all pending messages for a group.
- * Called by the GroupQueue when it's this group's turn.
+ * Process all pending messages for a user slot in a group.
+ * Called by the GroupQueue when it's this slot's turn.
  */
-async function processGroupMessages(chatJid: string): Promise<boolean> {
+async function processUserSlot(chatJid: string, senderId: string): Promise<boolean> {
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
@@ -257,9 +293,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return true;
   }
 
-  const isMainGroup = group.folder === MAIN_GROUP_FOLDER;
+  const slotKey = makeSlotKey(chatJid, senderId);
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  // Use per-slot cursor for timestamp tracking
+  const sinceTimestamp = lastAgentTimestamp[slotKey] || lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
@@ -268,121 +305,110 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
+  // Filter to only this sender's messages
+  const senderMessages = missedMessages.filter((m) => m.sender === senderId);
+  if (senderMessages.length === 0) return true;
+
   // Check if trigger is required and present
   if (group.requiresTrigger !== false) {
-    const hasTrigger = missedMessages.some((m) =>
+    const hasTrigger = senderMessages.some((m) =>
       TRIGGER_PATTERN.test(m.content.trim()),
     );
     if (!hasTrigger) return true;
   }
 
   // For trigger-required groups, only send messages that contain the trigger.
-  // The agent can use get_chat_history to fetch surrounding context if needed.
   const relevantMessages = group.requiresTrigger !== false
-    ? missedMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
-    : missedMessages;
+    ? senderMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+    : senderMessages;
 
   const prompt = formatMessages(relevantMessages);
 
-  // Select model based on message complexity (when router is enabled)
+  // Select model based on message complexity
   const model = selectModel(relevantMessages);
 
-  // Advance cursor so the piping path in startMessageLoop won't re-fetch
-  // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
-    missedMessages[missedMessages.length - 1].timestamp;
+  // Advance cursor for this slot
+  const previousCursor = lastAgentTimestamp[slotKey] || '';
+  lastAgentTimestamp[slotKey] =
+    senderMessages[senderMessages.length - 1].timestamp;
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
-    'Processing messages',
+    { group: group.name, senderId, messageCount: senderMessages.length },
+    'Processing messages for user slot',
   );
 
-  // Track idle timer for closing stdin when agent is idle
+  // Track idle timer
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
-
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      logger.debug(
-        { group: group.name },
-        'Idle timeout, closing container stdin',
-      );
-      queue.closeStdin(chatJid);
+      logger.debug({ group: group.name, slotKey }, 'Idle timeout, closing container stdin');
+      queue.closeStdin(slotKey);
     }, IDLE_TIMEOUT);
   };
 
-  // Set reply target in shared state so both initial and piped outputs use it.
-  // If onCardAction already set a reply target (real card message_id), keep it.
-  if (!pendingReplyTo[chatJid]) {
-    pendingReplyTo[chatJid] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
+  // Set reply target
+  if (!pendingReplyTo[slotKey]) {
+    pendingReplyTo[slotKey] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
   }
 
   await channel.setTyping?.(chatJid, true);
 
-  // Pre-create streaming card in parallel with agent activation (fire-and-forget).
-  // Don't await — let card creation overlap with container warm-up / SDK init.
-  const replyTarget = pendingReplyTo[chatJid];
+  // Pre-create streaming card (using slotKey for isolation)
+  const replyTarget = pendingReplyTo[slotKey];
   if (channel.beginStreaming) {
-    channel.beginStreaming(chatJid, replyTarget
+    channel.beginStreaming(slotKey, replyTarget
       ? { replyToMessageId: replyTarget.messageId, mentionUser: { id: replyTarget.senderId, name: replyTarget.senderName } }
       : undefined,
     ).catch((err) => {
-      logger.warn({ chatJid, err }, 'Failed to pre-create streaming card, will create on first chunk');
+      logger.warn({ slotKey, err }, 'Failed to pre-create streaming card, will create on first chunk');
     });
   }
 
   let hadError = false;
   let outputSentToUser = false;
-
   let lastStreamedText = '';
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
+  const output = await runAgent(group, prompt, chatJid, senderId, async (result) => {
     if (result.result) {
       const raw =
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 
       if (text) {
         if (result.isStreaming) {
-          // Real-time streaming chunk from assistant — push incrementally to card
-          logger.info({ group: group.name }, `Streaming chunk: ${text.slice(0, 100)}`);
+          logger.info({ group: group.name, senderId }, `Streaming chunk: ${text.slice(0, 100)}`);
           lastStreamedText = text;
-          const target = pendingReplyTo[chatJid];
-          pendingReplyTo[chatJid] = undefined;
-          const opts = target
-            ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
-            : undefined;
+          const target = pendingReplyTo[slotKey];
+          pendingReplyTo[slotKey] = undefined;
+          const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
+            ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
+            : { slotKey };
           await channel.sendMessage(chatJid, text, opts);
           outputSentToUser = true;
         } else {
-          // Final result — only send if different from what we already streamed
-          logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
+          logger.info({ group: group.name, senderId }, `Agent output: ${raw.slice(0, 200)}`);
           if (text !== lastStreamedText) {
-            const target = pendingReplyTo[chatJid];
-            pendingReplyTo[chatJid] = undefined;
-            const opts = target
-              ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName } }
-              : undefined;
+            const target = pendingReplyTo[slotKey];
+            pendingReplyTo[slotKey] = undefined;
+            const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
+              ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
+              : { slotKey };
             await channel.sendMessage(chatJid, text, opts);
             outputSentToUser = true;
           }
-          // End streaming immediately on final result (don't wait for success status ~1s later)
-          channel.endStreaming?.(chatJid)?.catch((err) =>
-            logger.warn({ chatJid, err }, 'Failed to end streaming on final result'));
+          channel.endStreaming?.(slotKey)?.catch((err) =>
+            logger.warn({ slotKey, err }, 'Failed to end streaming on final result'));
         }
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
     }
 
     if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
+      queue.notifyIdle(slotKey);
     }
 
     if (result.status === 'error') {
@@ -391,24 +417,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }, model);
 
   await channel.setTyping?.(chatJid, false);
-  await channel.endStreaming?.(chatJid);
+  await channel.endStreaming?.(slotKey);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
-    // If we already sent output to the user, don't roll back the cursor —
-    // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn(
-        { group: group.name },
+        { group: group.name, senderId },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
       return true;
     }
-    // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentTimestamp[slotKey] = previousCursor;
     saveState();
     logger.warn(
-      { group: group.name },
+      { group: group.name, senderId },
       'Agent error, rolled back message cursor for retry',
     );
     return false;
@@ -421,13 +444,16 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  senderId: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
   model?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
+  const sKey = sessionKey(group.folder, senderId);
+  const sessionId = sessions[sKey] || sessions[group.folder];
+  const slotKey = makeSlotKey(chatJid, senderId);
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // Update tasks snapshot
   const tasks = getAllTasks();
   writeTasksSnapshot(
     group.folder,
@@ -443,7 +469,7 @@ async function runAgent(
     })),
   );
 
-  // Update available groups snapshot (main group only can see all groups)
+  // Update available groups snapshot
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
     group.folder,
@@ -452,23 +478,24 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[sKey] = output.newSessionId;
+          setSession(group.folder, output.newSessionId, senderId);
         }
         await onOutput(output);
       }
     : undefined;
 
-  // Use warm container if available (skips Docker cold start)
-  const warmHandle = warmContainers.get(chatJid);
+  // Use warm container if available
+  const warmHandle = claimWarm(chatJid);
   if (warmHandle) {
-    warmContainers.delete(chatJid);
-    logger.info({ group: group.name }, 'Using warm container');
+    logger.info({ group: group.name, senderId }, 'Using warm container');
   }
+
+  const slotId = senderId;
 
   try {
     const output = await runContainerAgent(
@@ -481,16 +508,26 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
         model,
+        slotId,
       },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+      (proc, containerName) => {
+        queue.registerProcess(slotKey, proc, containerName, group.folder);
+        // Set the IPC path for the slot so sendMessage/closeStdin use the right directory
+        const ipcPath = path.join(
+          path.resolve(process.cwd(), 'data', 'ipc'),
+          group.folder,
+          'slots',
+          slotId,
+        );
+        queue.setSlotIpcPath(slotKey, ipcPath);
+      },
       wrappedOnOutput,
       warmHandle,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[sKey] = output.newSessionId;
+      setSession(group.folder, output.newSessionId, senderId);
     }
 
     if (output.status === 'error') {
@@ -533,7 +570,7 @@ async function startMessageLoop(): Promise<void> {
         lastTimestamp = newTimestamp;
         saveState();
 
-        // Deduplicate by group
+        // Group by chatJid
         const messagesByGroup = new Map<string, NewMessage[]>();
         for (const msg of messages) {
           const existing = messagesByGroup.get(msg.chat_jid);
@@ -556,46 +593,52 @@ async function startMessageLoop(): Promise<void> {
 
           const needsTrigger = group.requiresTrigger !== false;
 
-          // Only act on trigger messages when requiresTrigger is set.
-          // Non-trigger messages accumulate in DB and get pulled as
-          // context when a trigger eventually arrives.
-          if (needsTrigger) {
-            const hasTrigger = groupMessages.some((m) =>
-              TRIGGER_PATTERN.test(m.content.trim()),
-            );
-            if (!hasTrigger) continue;
-          }
-
-          // Only send trigger messages to the agent (consistent with processGroupMessages).
-          // The agent can use get_chat_history to pull surrounding context if needed.
+          // Filter to trigger messages only when required
           const triggerMessages = needsTrigger
             ? groupMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
             : groupMessages;
-          const formatted = formatMessages(triggerMessages);
 
-          if (queue.sendMessage(chatJid, formatted)) {
-            // End current streaming card so the next reply creates a new one
-            await channel.endStreaming?.(chatJid);
+          if (triggerMessages.length === 0) continue;
 
-            logger.debug(
-              { chatJid, count: triggerMessages.length },
-              'Piped messages to active container',
-            );
-            // Advance cursor past ALL messages (including non-trigger) to avoid re-processing
-            lastAgentTimestamp[chatJid] =
-              groupMessages[groupMessages.length - 1].timestamp;
-            saveState();
-            // Update reply target so the callback picks up the new trigger message
-            pendingReplyTo[chatJid] = findReplyTarget(groupMessages, needsTrigger);
-            // Show typing indicator while the container processes the piped message
-            channel
-              .setTyping?.(chatJid, true)
-              ?.catch((err) =>
-                logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+          // Sub-group by sender for per-user slot routing
+          const bySender = new Map<string, NewMessage[]>();
+          for (const msg of triggerMessages) {
+            const existing = bySender.get(msg.sender);
+            if (existing) {
+              existing.push(msg);
+            } else {
+              bySender.set(msg.sender, [msg]);
+            }
+          }
+
+          for (const [senderId, senderMsgs] of bySender) {
+            const slotKey = makeSlotKey(chatJid, senderId);
+            const formatted = formatMessages(senderMsgs);
+
+            if (queue.sendMessage(chatJid, senderId, formatted)) {
+              // End current streaming card so the next reply creates a new one
+              await channel.endStreaming?.(slotKey);
+
+              logger.debug(
+                { slotKey, count: senderMsgs.length },
+                'Piped messages to active container',
               );
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+              // Advance cursor for this slot
+              lastAgentTimestamp[slotKey] =
+                senderMsgs[senderMsgs.length - 1].timestamp;
+              saveState();
+              // Update reply target
+              pendingReplyTo[slotKey] = findReplyTarget(senderMsgs, needsTrigger);
+              // Show typing indicator
+              channel
+                .setTyping?.(chatJid, true)
+                ?.catch((err) =>
+                  logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
+                );
+            } else {
+              // No active container for this sender — enqueue
+              queue.enqueueMessageCheck(chatJid, senderId);
+            }
           }
         }
       }
@@ -608,18 +651,27 @@ async function startMessageLoop(): Promise<void> {
 
 /**
  * Startup recovery: check for unprocessed messages in registered groups.
- * Handles crash between advancing lastTimestamp and processing messages.
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
+    // Check group-level cursor for recovery
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
     const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
     if (pending.length > 0) {
-      logger.info(
-        { group: group.name, pendingCount: pending.length },
-        'Recovery: found unprocessed messages',
-      );
-      queue.enqueueMessageCheck(chatJid);
+      // Group by sender for per-user recovery
+      const senders = new Set(pending.map((m) => m.sender));
+      for (const senderId of senders) {
+        const senderPending = pending.filter((m) => m.sender === senderId);
+        const hasTrigger = group.requiresTrigger === false ||
+          senderPending.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+        if (hasTrigger) {
+          logger.info(
+            { group: group.name, senderId, pendingCount: senderPending.length },
+            'Recovery: found unprocessed messages for user',
+          );
+          queue.enqueueMessageCheck(chatJid, senderId);
+        }
+      }
     }
   }
 }
@@ -659,12 +711,9 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     onCardAction: (chatJid: string, action: { actionId: string; value?: Record<string, string>; userId: string; messageId?: string }) => {
-      // Inject card action as a synthetic message so the agent can process it
       const group = registeredGroups[chatJid];
       if (!group) return;
       const actionText = `@${ASSISTANT_NAME} [Card action: ${action.actionId}${action.value ? ` data=${JSON.stringify(action.value)}` : ''} by user ${action.userId}]`;
-      // Synthetic ID must be unique per click (same card can be clicked many times).
-      // Store the real Lark message_id in the content so findReplyTarget can use it.
       const syntheticId = `card-action-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       storeMessage({
         id: syntheticId,
@@ -676,10 +725,10 @@ async function main(): Promise<void> {
         is_from_me: false,
         is_bot_message: false,
       });
-      // Pre-set reply target to the real card message so the agent's reply
-      // references the card, not the synthetic message ID.
+      // Pre-set reply target for this user's slot
+      const slotKey = makeSlotKey(chatJid, action.userId);
       if (action.messageId) {
-        pendingReplyTo[chatJid] = { messageId: action.messageId, senderId: action.userId, senderName: action.userId };
+        pendingReplyTo[slotKey] = { messageId: action.messageId, senderId: action.userId, senderName: action.userId };
       }
       wakeMessageLoop();
     },
@@ -691,13 +740,15 @@ async function main(): Promise<void> {
   channels.push(lark);
   await lark.connect();
 
-  // Start subsystems (independently of connection handler)
+  // Start subsystems
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) =>
-      queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onProcess: (groupJid, proc, containerName, groupFolder) => {
+      const taskSlotKey = makeSlotKey(groupJid, '__task__');
+      queue.registerProcess(taskSlotKey, proc, containerName, groupFolder);
+    },
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
@@ -753,15 +804,11 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
   });
-  queue.setProcessMessagesFn(processGroupMessages);
+  queue.setProcessMessagesFn(processUserSlot);
   recoverPendingMessages();
 
-  // Pre-warm containers for registered groups so the first message skips cold start.
-  // Limit to MAX_CONCURRENT_CONTAINERS to avoid startup resource burst.
-  const groupJids = Object.keys(registeredGroups);
-  for (let i = 0; i < Math.min(groupJids.length, MAX_CONCURRENT_CONTAINERS); i++) {
-    warmUpGroup(groupJids[i]);
-  }
+  // Warm pool: pre-warm containers for registered groups
+  replenishWarmPool();
 
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');
