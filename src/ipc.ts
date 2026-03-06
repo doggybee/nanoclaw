@@ -5,7 +5,6 @@ import { CronExpressionParser } from 'cron-parser';
 
 import {
   DATA_DIR,
-  IPC_POLL_INTERVAL,
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
@@ -20,12 +19,16 @@ import { ChatHistoryMessage, RegisteredGroup } from './types.js';
  * Container mounts: /workspace/group → groups/{folder}
  */
 function resolveContainerPath(containerPath: string, groupFolder: string): string {
-  if (containerPath.startsWith('/workspace/group/')) {
-    const relative = containerPath.slice('/workspace/group/'.length);
-    return path.join(resolveGroupFolderPath(groupFolder), relative);
+  if (!containerPath.startsWith('/workspace/group/')) {
+    throw new Error(`Invalid container path: ${containerPath}`);
   }
-  // Fallback: return as-is (may be absolute host path already)
-  return containerPath;
+  const relative = containerPath.slice('/workspace/group/'.length);
+  const groupDir = resolveGroupFolderPath(groupFolder);
+  const resolved = path.resolve(groupDir, relative);
+  if (!resolved.startsWith(groupDir + path.sep) && resolved !== groupDir) {
+    throw new Error(`Path escapes group directory: ${containerPath}`);
+  }
+  return resolved;
 }
 
 export interface IpcDeps {
@@ -219,37 +222,60 @@ export function startIpcWatcher(deps: IpcDeps): void {
     }
   };
 
+  let processing = false;
   const processIpcFiles = async () => {
-    // Scan all group IPC directories (identity determined by directory)
-    let groupFolders: string[];
+    if (processing) return;
+    processing = true;
     try {
-      groupFolders = fs.readdirSync(ipcBaseDir, { withFileTypes: true })
-        .filter((d) => d.isDirectory() && d.name !== 'errors')
-        .map((d) => d.name);
-    } catch (err) {
-      logger.error({ err }, 'Error reading IPC base directory');
-      setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
-      return;
+      // Scan all group IPC directories (identity determined by directory)
+      let groupFolders: string[];
+      try {
+        groupFolders = fs.readdirSync(ipcBaseDir, { withFileTypes: true })
+          .filter((d) => d.isDirectory() && d.name !== 'errors')
+          .map((d) => d.name);
+      } catch (err) {
+        logger.error({ err }, 'Error reading IPC base directory');
+        return;
+      }
+
+      for (const sourceGroup of groupFolders) {
+        const isMain = sourceGroup === MAIN_GROUP_FOLDER;
+        const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
+        const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
+
+        await processDir(messagesDir, sourceGroup, (data) =>
+          processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir),
+        );
+        await processDir(tasksDir, sourceGroup, (data) =>
+          processTaskIpc(data, sourceGroup, isMain, deps),
+        );
+      }
+    } finally {
+      processing = false;
     }
-
-    for (const sourceGroup of groupFolders) {
-      const isMain = sourceGroup === MAIN_GROUP_FOLDER;
-      const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
-      const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
-
-      await processDir(messagesDir, sourceGroup, (data) =>
-        processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir),
-      );
-      await processDir(tasksDir, sourceGroup, (data) =>
-        processTaskIpc(data, sourceGroup, isMain, deps),
-      );
-    }
-
-    setTimeout(processIpcFiles, IPC_POLL_INTERVAL);
   };
 
+  // Use fs.watch for low-latency event-driven processing, with fallback polling.
+  try {
+    const watcher = fs.watch(ipcBaseDir, { recursive: true }, (eventType, filename) => {
+      if (filename && filename.endsWith('.json') && !filename.includes('responses')) {
+        processIpcFiles();
+      }
+    });
+    watcher.on('error', (err) => {
+      logger.warn({ err }, 'IPC fs.watch error, relying on fallback polling');
+    });
+  } catch (err) {
+    logger.warn({ err }, 'Failed to start IPC fs.watch, using polling only');
+  }
+
+  // Fallback poll every 5s to catch any events fs.watch might miss
+  const FALLBACK_POLL_INTERVAL = 5000;
+  setInterval(processIpcFiles, FALLBACK_POLL_INTERVAL);
+
+  // Initial scan
   processIpcFiles();
-  logger.info('IPC watcher started (per-group namespaces)');
+  logger.info('IPC watcher started (fs.watch + fallback polling)');
 }
 
 export async function processTaskIpc(

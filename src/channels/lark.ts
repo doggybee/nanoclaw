@@ -18,6 +18,9 @@ import {
 // Lark text messages: conservative split limit to stay within API payload size.
 const MAX_TEXT_LENGTH = 4000;
 
+// Max queued outgoing messages — prevents unbounded memory growth if Lark API is down.
+const MAX_OUTGOING_QUEUE = 1000;
+
 // Dedup window: ignore duplicate message_id within this TTL (ms)
 const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -633,6 +636,10 @@ export class LarkChannel implements Channel {
 
   async sendMessage(jid: string, text: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void> {
     if (!this.connected) {
+      if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
+        const dropped = this.outgoingQueue.shift();
+        logger.warn({ jid: dropped?.jid }, 'Outgoing queue full, dropping oldest message');
+      }
       this.outgoingQueue.push({ jid, text });
       logger.info(
         { jid, queueSize: this.outgoingQueue.length },
@@ -648,6 +655,10 @@ export class LarkChannel implements Channel {
       try {
         await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
       } catch (fallbackErr) {
+        if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
+          const dropped = this.outgoingQueue.shift();
+          logger.warn({ jid: dropped?.jid }, 'Outgoing queue full, dropping oldest message');
+        }
         this.outgoingQueue.push({ jid, text });
         logger.warn(
           { jid, err: fallbackErr, queueSize: this.outgoingQueue.length },
@@ -672,17 +683,18 @@ export class LarkChannel implements Channel {
     const existing = this.streamingCards.get(jid);
 
     if (existing) {
-      existing.sequence++;
+      const nextSeq = existing.sequence + 1;
 
-      const fullText = mentionUser && existing.sequence === 1
+      const fullText = mentionUser && nextSeq === 1
         ? `<at id=${mentionUser.id}></at> ${text}`
         : text;
 
       // Push content with typewriter effect (same path for first chunk and subsequent chunks).
       await this.client.cardkit.v1.cardElement.content({
         path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
-        data: { content: fullText, sequence: existing.sequence },
+        data: { content: fullText, sequence: nextSeq },
       });
+      existing.sequence = nextSeq;
       logger.info({ jid, cardId: existing.cardId, length: fullText.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
@@ -1178,12 +1190,19 @@ export class LarkChannel implements Channel {
    * Fetches chats the bot is a member of and stores their names in the DB.
    */
   async syncChatMetadata(): Promise<void> {
+    const SYNC_TIMEOUT_MS = 30_000;
     try {
       logger.info('Syncing chat metadata from Lark...');
       let pageToken: string | undefined;
       let count = 0;
+      const deadline = Date.now() + SYNC_TIMEOUT_MS;
 
       do {
+        if (Date.now() > deadline) {
+          logger.warn({ count }, 'Lark chat metadata sync timed out, partial results saved');
+          break;
+        }
+
         const result = await this.client.im.v1.chat.list({
           params: {
             page_size: 100,
