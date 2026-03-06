@@ -220,6 +220,42 @@ interface StreamingCard {
   hasLoadingElement?: boolean;
 }
 
+/** Build the streaming card config shared between beginStreaming and _sendStreaming. */
+function buildStreamingCardConfig() {
+  return {
+    streaming_mode: true,
+    summary: { content: '正在回答...' },
+    streaming_config: {
+      print_frequency_ms: { default: 50 },
+      print_step: { default: 2 },
+      print_strategy: 'fast' as const,
+    },
+  };
+}
+
+/** Build a status column_set element (loading indicator or disclaimer). */
+function buildStatusElement(text: string, elementId?: string) {
+  const el: Record<string, unknown> = {
+    tag: 'column_set',
+    margin: '0px',
+    flex_mode: 'none',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      padding: '0px',
+      elements: [{
+        tag: 'markdown',
+        content: `<font color="grey">${text}</font>`,
+        text_size: 'notation',
+        icon: { tag: 'standard_icon', token: 'robot_outlined', color: 'grey' },
+      }],
+    }],
+  };
+  if (elementId) el.element_id = elementId;
+  return el;
+}
+
 /** Strip the `lark:` prefix to get the raw Lark chat_id. */
 function extractChatId(jid: string): string {
   return jid.replace(/^lark:/, '');
@@ -656,15 +692,7 @@ export class LarkChannel implements Channel {
 
       const cardJson = {
         schema: '2.0',
-        config: {
-          streaming_mode: true,
-          summary: { content: '正在回答...' },
-          streaming_config: {
-            print_frequency_ms: { default: 50 },
-            print_step: { default: 2 },
-            print_strategy: 'fast',
-          },
-        },
+        config: buildStreamingCardConfig(),
         body: {
           elements: [{
             tag: 'markdown',
@@ -716,15 +744,7 @@ export class LarkChannel implements Channel {
 
     const cardJson = {
       schema: '2.0',
-      config: {
-        streaming_mode: true,
-        summary: { content: '正在回答...' },
-        streaming_config: {
-          print_frequency_ms: { default: 50 },
-          print_step: { default: 2 },
-          print_strategy: 'fast',
-        },
-      },
+      config: buildStreamingCardConfig(),
       body: {
         elements: [
           {
@@ -732,28 +752,7 @@ export class LarkChannel implements Channel {
             content: '',
             element_id: STREAMING_ELEMENT_ID,
           },
-          {
-            tag: 'column_set',
-            margin: '0px',
-            flex_mode: 'none',
-            columns: [{
-              tag: 'column',
-              width: 'weighted',
-              weight: 1,
-              padding: '0px',
-              elements: [{
-                tag: 'markdown',
-                content: '<font color="grey">努力回答中...</font>',
-                text_size: 'notation',
-                icon: {
-                  tag: 'standard_icon',
-                  token: 'robot_outlined',
-                  color: 'grey',
-                },
-              }],
-            }],
-            element_id: LOADING_ELEMENT_ID,
-          },
+          buildStatusElement('努力回答中...', LOADING_ELEMENT_ID),
         ],
       },
     };
@@ -791,23 +790,7 @@ export class LarkChannel implements Channel {
 
       if (card.hasLoadingElement) {
         // Replace loading column_set with final disclaimer + disable streaming in one batch
-        const disclaimerElement = {
-          tag: 'column_set',
-          margin: '0px',
-          flex_mode: 'none',
-          columns: [{
-            tag: 'column',
-            width: 'weighted',
-            weight: 1,
-            padding: '0px',
-            elements: [{
-              tag: 'markdown',
-              content: '<font color="grey">以上内容由AI生成，仅供参考</font>',
-              text_size: 'notation',
-              icon: { tag: 'standard_icon', token: 'robot_outlined', color: 'grey' },
-            }],
-          }],
-        };
+        const disclaimerElement = buildStatusElement('以上内容由AI生成，仅供参考');
         const actions = JSON.stringify([
           {
             action: 'update_element',

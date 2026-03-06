@@ -308,7 +308,6 @@ interface IpcMessage {
  */
 function drainIpcInput(): IpcMessage[] {
   try {
-    fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();

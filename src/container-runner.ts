@@ -344,10 +344,8 @@ export async function spawnWarmContainer(
   const groupDir = resolveGroupFolderPath(group.folder);
   cachedMkdir(groupDir);
 
-  const [mounts, secrets] = await Promise.all([
-    Promise.resolve(buildVolumeMounts(group, isMain)),
-    readSecrets(),
-  ]);
+  const mounts = buildVolumeMounts(group, isMain);
+  const secrets = await readSecrets();
 
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-warm-${safeName}-${Date.now()}`;

@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MAX_CONCURRENT_CONTAINERS,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
@@ -64,15 +65,25 @@ const queue = new GroupQueue();
 
 // Pre-warmed containers: keyed by chatJid
 const warmContainers = new Map<string, WarmContainerHandle>();
+// Track consecutive warm-up failures for exponential backoff
+const warmFailures = new Map<string, number>();
+const MAX_WARM_FAILURES = 5;
 
 /**
  * Spawn a warm container for a group so the next message skips cold start.
  * Safe to call multiple times — skips if a warm container already exists.
+ * Uses exponential backoff on failures to avoid tight restart loops.
  */
 function warmUpGroup(chatJid: string): void {
   if (warmContainers.has(chatJid)) return;
   const group = registeredGroups[chatJid];
   if (!group) return;
+
+  const failures = warmFailures.get(chatJid) || 0;
+  if (failures >= MAX_WARM_FAILURES) {
+    logger.warn({ chatJid, failures }, 'Warm container disabled after repeated failures');
+    return;
+  }
 
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
@@ -86,17 +97,27 @@ function warmUpGroup(chatJid: string): void {
         return;
       }
       warmContainers.set(chatJid, handle);
+      warmFailures.delete(chatJid); // reset on success
       logger.info({ chatJid, group: group.name }, 'Warm container ready');
 
       // Re-warm when this container exits
-      handle.exited.then(() => {
+      handle.exited.then((output) => {
         warmContainers.delete(chatJid);
-        // Delay re-warm slightly to avoid tight restart loops on errors
-        setTimeout(() => warmUpGroup(chatJid), 2000);
+        if (output.status === 'error' && !output.result) {
+          const count = (warmFailures.get(chatJid) || 0) + 1;
+          warmFailures.set(chatJid, count);
+          const delay = Math.min(2000 * 2 ** count, 60_000);
+          logger.warn({ chatJid, failures: count, delay }, 'Warm container failed, backing off');
+          setTimeout(() => warmUpGroup(chatJid), delay);
+        } else {
+          setTimeout(() => warmUpGroup(chatJid), 2000);
+        }
       });
     })
     .catch((err) => {
-      logger.warn({ chatJid, err }, 'Failed to spawn warm container');
+      const count = (warmFailures.get(chatJid) || 0) + 1;
+      warmFailures.set(chatJid, count);
+      logger.warn({ chatJid, err, failures: count }, 'Failed to spawn warm container');
     });
 }
 
@@ -361,9 +382,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
 
     if (result.status === 'success') {
-      // End streaming card immediately when agent finishes (don't wait for container exit)
-      channel.endStreaming?.(chatJid)?.catch((err) =>
-        logger.warn({ chatJid, err }, 'Failed to end streaming on success'));
       queue.notifyIdle(chatJid);
     }
 
@@ -738,9 +756,11 @@ async function main(): Promise<void> {
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
 
-  // Pre-warm containers for registered groups so the first message skips cold start
-  for (const chatJid of Object.keys(registeredGroups)) {
-    warmUpGroup(chatJid);
+  // Pre-warm containers for registered groups so the first message skips cold start.
+  // Limit to MAX_CONCURRENT_CONTAINERS to avoid startup resource burst.
+  const groupJids = Object.keys(registeredGroups);
+  for (let i = 0; i < Math.min(groupJids.length, MAX_CONCURRENT_CONTAINERS); i++) {
+    warmUpGroup(groupJids[i]);
   }
 
   startMessageLoop().catch((err) => {
