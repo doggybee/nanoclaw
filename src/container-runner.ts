@@ -166,27 +166,52 @@ function buildVolumeMounts(
   );
   cachedMkdir(groupSessionsDir);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
+  const desiredSettings = {
+    env: {
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+      CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    },
+    hooks: {
+      PreToolUse: [
         {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
+          matcher: 'Bash',
+          hooks: [
+            {
+              type: 'command',
+              command: '/home/node/.claude/hooks/rtk-rewrite.sh',
+            },
+          ],
         },
-        null,
-        2,
-      ) + '\n',
-    );
+      ],
+    },
+  };
+  const desiredSettingsStr = JSON.stringify(desiredSettings, null, 2) + '\n';
+  if (!fs.existsSync(settingsFile) || fs.readFileSync(settingsFile, 'utf8') !== desiredSettingsStr) {
+    fs.writeFileSync(settingsFile, desiredSettingsStr);
+  }
+
+  // Sync RTK hook and RTK.md into group's .claude/ directory
+  const rtkSrcDir = path.join(process.cwd(), 'container', 'rtk');
+  if (fs.existsSync(rtkSrcDir)) {
+    // hooks/rtk-rewrite.sh
+    const hooksSrc = path.join(rtkSrcDir, 'rtk-rewrite.sh');
+    const hooksDst = path.join(groupSessionsDir, 'hooks');
+    if (fs.existsSync(hooksSrc)) {
+      cachedMkdir(hooksDst);
+      const dstFile = path.join(hooksDst, 'rtk-rewrite.sh');
+      if (!fs.existsSync(dstFile) || fs.statSync(hooksSrc).mtimeMs > fs.statSync(dstFile).mtimeMs) {
+        fs.cpSync(hooksSrc, dstFile);
+        fs.chmodSync(dstFile, 0o755);
+      }
+    }
+    // RTK.md
+    const rtkMdSrc = path.join(rtkSrcDir, 'RTK.md');
+    const rtkMdDst = path.join(groupSessionsDir, 'RTK.md');
+    if (fs.existsSync(rtkMdSrc) &&
+        (!fs.existsSync(rtkMdDst) || fs.statSync(rtkMdSrc).mtimeMs > fs.statSync(rtkMdDst).mtimeMs)) {
+      fs.cpSync(rtkMdSrc, rtkMdDst);
+    }
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/

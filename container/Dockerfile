@@ -7,6 +7,7 @@ FROM node:22-slim
 # Clean up docs, icons, DRI drivers, and OpenType CJK fonts (keep TrueType only)
 # to reduce image size by ~160MB
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     chromium \
     fonts-liberation \
     fonts-noto-cjk \
@@ -26,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxshmfence1 \
     curl \
     git \
+    jq \
     unzip \
     && rm -rf /var/lib/apt/lists/* \
               /usr/share/doc/* \
@@ -38,6 +40,12 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
 # Install agent-browser and claude-code globally, clean npm cache
 RUN npm install -g agent-browser @anthropic-ai/claude-code && npm cache clean --force
+
+# Install RTK (token-saving CLI proxy) — single static binary
+RUN RTK_ARCH=$(uname -m | sed 's/aarch64/aarch64-unknown-linux-gnu/;s/x86_64/x86_64-unknown-linux-musl/') \
+    && curl -fsSL "https://github.com/rtk-ai/rtk/releases/latest/download/rtk-${RTK_ARCH}.tar.gz" \
+    | tar xz -C /usr/local/bin rtk \
+    && chmod +x /usr/local/bin/rtk
 
 # Install Bun runtime (required by QMD) to shared path accessible by all users
 RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
