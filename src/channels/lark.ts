@@ -4,7 +4,7 @@ import * as path from 'path';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
-import { updateChatName } from '../db.js';
+import { updateChatNamesBatch } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { parseSlotKey } from '../group-queue.js';
 import { logger } from '../logger.js';
@@ -445,8 +445,10 @@ export class LarkChannel implements Channel {
     // Flush any messages queued before connection
     await this.flushOutgoingQueue();
 
-    // Sync chat names on startup
-    await this.syncChatMetadata();
+    // Sync chat names in background (don't block startup)
+    this.syncChatMetadata().catch((err) =>
+      logger.error({ err }, 'Background chat metadata sync failed'),
+    );
   }
 
   private async handleIncomingMessage(data: any): Promise<void> {
@@ -1199,12 +1201,12 @@ export class LarkChannel implements Channel {
     try {
       logger.info('Syncing chat metadata from Lark...');
       let pageToken: string | undefined;
-      let count = 0;
+      const allChats: Array<{ jid: string; name: string }> = [];
       const deadline = Date.now() + SYNC_TIMEOUT_MS;
 
       do {
         if (Date.now() > deadline) {
-          logger.warn({ count }, 'Lark chat metadata sync timed out, partial results saved');
+          logger.warn({ count: allChats.length }, 'Lark chat metadata sync timed out, partial results saved');
           break;
         }
 
@@ -1218,15 +1220,17 @@ export class LarkChannel implements Channel {
         const items = result?.data?.items || [];
         for (const chat of items) {
           if (chat.chat_id && chat.name) {
-            updateChatName(`lark:${chat.chat_id}`, chat.name);
-            count++;
+            allChats.push({ jid: `lark:${chat.chat_id}`, name: chat.name });
           }
         }
 
         pageToken = result?.data?.page_token || undefined;
       } while (pageToken);
 
-      logger.info({ count }, 'Lark chat metadata synced');
+      if (allChats.length > 0) {
+        updateChatNamesBatch(allChats);
+      }
+      logger.info({ count: allChats.length }, 'Lark chat metadata synced');
     } catch (err) {
       logger.error({ err }, 'Failed to sync Lark chat metadata');
     }

@@ -214,6 +214,20 @@ export function updateChatName(chatJid: string, name: string): void {
   ).run(chatJid, name, new Date().toISOString());
 }
 
+/** Batch update chat names in a single transaction. */
+export function updateChatNamesBatch(chats: Array<{ jid: string; name: string }>): void {
+  const stmt = db.prepare(
+    `INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+     ON CONFLICT(jid) DO UPDATE SET name = excluded.name`,
+  );
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    for (const chat of chats) {
+      stmt.run(chat.jid, chat.name, now);
+    }
+  })();
+}
+
 export interface ChatInfo {
   jid: string;
   name: string;

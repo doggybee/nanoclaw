@@ -164,10 +164,18 @@ async function processIpcMessage(
       if (!data.requestId) return;
       // Write response to the slot's responses dir if slotId is present,
       // otherwise fall back to group-level responses dir.
+      const groupIpcDir = path.join(ipcBaseDir, sourceGroup);
       const responseBase = data.slotId
-        ? path.join(ipcBaseDir, sourceGroup, 'slots', data.slotId, 'responses')
-        : path.join(ipcBaseDir, sourceGroup, 'responses');
-      const responsePath = path.join(responseBase, `${data.requestId}.json`);
+        ? path.join(groupIpcDir, 'slots', data.slotId, 'responses')
+        : path.join(groupIpcDir, 'responses');
+      // Sanitize: ensure response path stays within the group's IPC directory
+      const sanitizedRequestId = String(data.requestId).replace(/[^a-zA-Z0-9_-]/g, '_');
+      const responsePath = path.resolve(responseBase, `${sanitizedRequestId}.json`);
+      const rel = path.relative(groupIpcDir, responsePath);
+      if (rel.startsWith('..') || path.isAbsolute(rel)) {
+        logger.warn({ sourceGroup, slotId: data.slotId, requestId: data.requestId }, 'IPC response path escapes group directory');
+        return;
+      }
       if (!deps.getChatHistory) {
         logger.warn({ chatJid, sourceGroup }, 'getChatHistory not available on channel');
         writeIpcResponse(responsePath, { status: 'error', error: 'getChatHistory not available on this channel' });

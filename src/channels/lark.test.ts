@@ -20,7 +20,7 @@ vi.mock('../logger.js', () => ({
 
 // Mock db
 vi.mock('../db.js', () => ({
-  updateChatName: vi.fn(),
+  updateChatNamesBatch: vi.fn(),
 }));
 
 // Mock http module — capture the request handler from createServer
@@ -139,7 +139,7 @@ vi.mock('../env.js', () => ({
 }));
 
 import { LarkChannel, LarkChannelOpts, markdownToPostContent, splitMarkdown } from './lark.js';
-import { updateChatName } from '../db.js';
+import { updateChatNamesBatch } from '../db.js';
 import { readEnvFile } from '../env.js';
 import * as LarkSdk from '@larksuiteoapi/node-sdk';
 
@@ -769,10 +769,13 @@ describe('LarkChannel', () => {
       });
 
       await channel.connect();
-      await channel.syncChatMetadata();
+      // Wait for background syncChatMetadata to finish
+      await new Promise((r) => setTimeout(r, 0));
 
-      expect(updateChatName).toHaveBeenCalledWith('lark:oc_001', 'General');
-      expect(updateChatName).toHaveBeenCalledWith('lark:oc_002', 'Random');
+      expect(updateChatNamesBatch).toHaveBeenCalledWith([
+        { jid: 'lark:oc_001', name: 'General' },
+        { jid: 'lark:oc_002', name: 'Random' },
+      ]);
     });
 
     it('skips chats without chat_id or name', async () => {
@@ -790,11 +793,12 @@ describe('LarkChannel', () => {
         },
       });
 
-      // connect() calls syncChatMetadata() internally
       await channel.connect();
+      await new Promise((r) => setTimeout(r, 0));
 
-      expect(updateChatName).toHaveBeenCalledWith('lark:oc_001', 'Valid');
-      expect(updateChatName).toHaveBeenCalledTimes(1);
+      expect(updateChatNamesBatch).toHaveBeenCalledWith([
+        { jid: 'lark:oc_001', name: 'Valid' },
+      ]);
     });
 
     it('handles API errors gracefully', async () => {
@@ -805,7 +809,8 @@ describe('LarkChannel', () => {
       mockClient.im.v1.chat.list.mockRejectedValue(new Error('API error'));
 
       await channel.connect();
-      // Should not throw
+      // Background sync should not throw
+      await new Promise((r) => setTimeout(r, 0));
       await expect(channel.syncChatMetadata()).resolves.toBeUndefined();
     });
 
@@ -827,12 +832,14 @@ describe('LarkChannel', () => {
           },
         });
 
-      // connect() calls syncChatMetadata() internally — consumes both pages
       await channel.connect();
+      await new Promise((r) => setTimeout(r, 0));
 
       expect(mockClient.im.v1.chat.list).toHaveBeenCalledTimes(2);
-      expect(updateChatName).toHaveBeenCalledWith('lark:oc_001', 'General');
-      expect(updateChatName).toHaveBeenCalledWith('lark:oc_002', 'Random');
+      expect(updateChatNamesBatch).toHaveBeenCalledWith([
+        { jid: 'lark:oc_001', name: 'General' },
+        { jid: 'lark:oc_002', name: 'Random' },
+      ]);
     });
   });
 

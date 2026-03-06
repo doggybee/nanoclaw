@@ -505,7 +505,7 @@ export async function runContainerAgent(
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
     const filepath = path.join(inputDir, filename);
     const tempPath = `${filepath}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: input.prompt, model: input.model }));
+    fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: input.prompt, model: input.model, sessionId: input.sessionId }));
     fs.renameSync(tempPath, filepath);
 
     logger.info(
@@ -895,6 +895,9 @@ export async function runContainerAgent(
   });
 }
 
+// Cache last-written content per file to skip redundant disk writes
+const snapshotCache = new Map<string, string>();
+
 export function writeTasksSnapshot(
   groupFolder: string,
   isMain: boolean,
@@ -910,7 +913,7 @@ export function writeTasksSnapshot(
 ): void {
   // Write filtered tasks to the group's IPC directory
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
-  fs.mkdirSync(groupIpcDir, { recursive: true });
+  cachedMkdir(groupIpcDir);
 
   // Main sees all tasks, others only see their own
   const filteredTasks = isMain
@@ -918,7 +921,10 @@ export function writeTasksSnapshot(
     : tasks.filter((t) => t.groupFolder === groupFolder);
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
-  fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+  const content = JSON.stringify(filteredTasks, null, 2);
+  if (snapshotCache.get(tasksFile) === content) return;
+  fs.writeFileSync(tasksFile, content);
+  snapshotCache.set(tasksFile, content);
 }
 
 export interface AvailableGroup {
@@ -940,12 +946,15 @@ export function writeGroupsSnapshot(
   registeredJids: Set<string>,
 ): void {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
-  fs.mkdirSync(groupIpcDir, { recursive: true });
+  cachedMkdir(groupIpcDir);
 
   // Main sees all groups; others see nothing (they can't activate groups)
   const visibleGroups = isMain ? groups : [];
 
   const groupsFile = path.join(groupIpcDir, 'available_groups.json');
+  // Cache by group data to avoid redundant disk writes (exclude lastSync from cache key)
+  const cacheKey = JSON.stringify(visibleGroups);
+  if (snapshotCache.get(groupsFile) === cacheKey) return;
   fs.writeFileSync(
     groupsFile,
     JSON.stringify(
@@ -957,4 +966,5 @@ export function writeGroupsSnapshot(
       2,
     ),
   );
+  snapshotCache.set(groupsFile, cacheKey);
 }

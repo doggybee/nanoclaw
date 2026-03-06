@@ -300,6 +300,7 @@ function shouldClose(): boolean {
 interface IpcMessage {
   text: string;
   model?: string;
+  sessionId?: string;
 }
 
 /**
@@ -319,7 +320,7 @@ function drainIpcInput(): IpcMessage[] {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push({ text: data.text, model: data.model });
+          messages.push({ text: data.text, model: data.model, sessionId: data.sessionId });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -571,10 +572,15 @@ async function main(): Promise<void> {
     }
     log(`Warm mode activated: received first message (${firstMessage.text.length} chars)`);
     prompt = firstMessage.text;
-    // Apply model override from warm-up activation message
+    // Apply overrides from warm-up activation message
     if (firstMessage.model) {
       containerInput.model = firstMessage.model;
       log(`Warm mode: using model ${firstMessage.model}`);
+    }
+    // Override session ID with the claiming user's session (not the group-level session from spawn)
+    if (firstMessage.sessionId) {
+      sessionId = firstMessage.sessionId;
+      log(`Warm mode: using session ${firstMessage.sessionId}`);
     }
   }
 

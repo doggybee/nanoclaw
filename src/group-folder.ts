@@ -46,7 +46,9 @@ export function resolveGroupIpcPath(folder: string): string {
 /** Resolve the IPC path for a specific slot within a group. */
 export function resolveSlotIpcPath(folder: string, slotId: string): string {
   const groupIpcDir = resolveGroupIpcPath(folder);
-  return path.join(groupIpcDir, 'slots', slotId);
+  const slotPath = path.resolve(groupIpcDir, 'slots', slotId);
+  ensureWithinBase(path.join(groupIpcDir, 'slots'), slotPath);
+  return slotPath;
 }
 
 // Reserved sender IDs — must never collide with real user IDs.

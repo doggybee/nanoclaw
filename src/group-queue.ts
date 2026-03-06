@@ -49,6 +49,7 @@ export class GroupQueue {
   private waitingSlots: SlotKey[] = [];
   private processMessagesFn: ((chatJid: string, senderId: string) => Promise<boolean>) | null =
     null;
+  private onMaxRetriesFn: ((chatJid: string, senderId: string) => void) | null = null;
   private shuttingDown = false;
 
   private getSlot(slotKey: SlotKey): SlotState {
@@ -77,6 +78,10 @@ export class GroupQueue {
 
   setProcessMessagesFn(fn: (chatJid: string, senderId: string) => Promise<boolean>): void {
     this.processMessagesFn = fn;
+  }
+
+  setOnMaxRetriesFn(fn: (chatJid: string, senderId: string) => void): void {
+    this.onMaxRetriesFn = fn;
   }
 
   enqueueMessageCheck(chatJid: string, senderId: string): void {
@@ -325,6 +330,9 @@ export class GroupQueue {
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
       );
       state.retryCount = 0;
+      if (this.onMaxRetriesFn) {
+        try { this.onMaxRetriesFn(state.chatJid, state.senderId); } catch { /* ignore */ }
+      }
       return;
     }
 
@@ -368,7 +376,12 @@ export class GroupQueue {
       return;
     }
 
-    // Nothing pending for this slot; check if other slots are waiting
+    // Nothing pending for this slot — clean up if fully idle and no retries pending
+    if (!state.active && state.pendingTasks.length === 0 && !state.pendingMessages && state.retryCount === 0) {
+      this.slots.delete(slotKey);
+    }
+
+    // Check if other slots are waiting
     this.drainWaiting();
   }
 

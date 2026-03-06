@@ -96,7 +96,12 @@ function replenishWarmPool(): void {
     const candidates = Object.keys(registeredGroups).filter((jid) => !poolJids.has(jid));
     if (candidates.length === 0) break;
 
-    // Use the first candidate (groups are loaded from DB ordered by registration)
+    // Prefer the group with the most recent agent activity
+    candidates.sort((a, b) => {
+      const tsA = lastAgentTimestamp[a] || '';
+      const tsB = lastAgentTimestamp[b] || '';
+      return tsB.localeCompare(tsA);
+    });
     const chatJid = candidates[0];
     warmUpForPool(chatJid);
     break; // One at a time to avoid burst
@@ -383,7 +388,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
           logger.info({ group: group.name, senderId }, `Streaming chunk: ${text.slice(0, 100)}`);
           lastStreamedText = text;
           const target = pendingReplyTo[slotKey];
-          pendingReplyTo[slotKey] = undefined;
+          delete pendingReplyTo[slotKey];
           const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
             ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
             : { slotKey };
@@ -393,7 +398,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
           logger.info({ group: group.name, senderId }, `Agent output: ${raw.slice(0, 200)}`);
           if (text !== lastStreamedText) {
             const target = pendingReplyTo[slotKey];
-            pendingReplyTo[slotKey] = undefined;
+            delete pendingReplyTo[slotKey];
             const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
               ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
               : { slotKey };
@@ -803,6 +808,12 @@ async function main(): Promise<void> {
       writeGroupsSnapshot(gf, im, ag, rj),
   });
   queue.setProcessMessagesFn(processUserSlot);
+  queue.setOnMaxRetriesFn((chatJid, senderId) => {
+    const channel = findChannel(channels, chatJid);
+    if (channel) {
+      channel.sendMessage(chatJid, '⚠️ Message processing failed after multiple retries. Please try again.', {}).catch(() => {});
+    }
+  });
   recoverPendingMessages();
 
   // Warm pool: pre-warm containers for registered groups
