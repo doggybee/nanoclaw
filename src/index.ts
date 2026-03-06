@@ -495,7 +495,9 @@ async function runAgent(
     logger.info({ group: group.name, senderId }, 'Using warm container');
   }
 
-  const slotId = senderId;
+  // For IPC paths: if using a warm container, follow-up messages must go to
+  // the warm container's mounted IPC path (fixed at spawn time), not the sender's.
+  const effectiveSlotId = warmHandle?.slotId || senderId;
 
   try {
     const output = await runContainerAgent(
@@ -508,16 +510,17 @@ async function runAgent(
         isMain,
         assistantName: ASSISTANT_NAME,
         model,
-        slotId,
+        slotId: senderId, // Used for cold-start containers only (warm ignores this)
       },
       (proc, containerName) => {
         queue.registerProcess(slotKey, proc, containerName, group.folder);
-        // Set the IPC path for the slot so sendMessage/closeStdin use the right directory
+        // Set the IPC path for the slot so sendMessage/closeStdin use the right directory.
+        // Must use effectiveSlotId (warm container's path) not senderId.
         const ipcPath = path.join(
           path.resolve(process.cwd(), 'data', 'ipc'),
           group.folder,
           'slots',
-          slotId,
+          effectiveSlotId,
         );
         queue.setSlotIpcPath(slotKey, ipcPath);
       },

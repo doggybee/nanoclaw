@@ -342,6 +342,8 @@ export interface WarmContainerHandle {
   containerName: string;
   process: ChildProcess;
   groupFolder: string;
+  /** The slot ID used for this container's IPC mount path. */
+  slotId?: string;
   /** Set the output callback. Must be called before piping the first message. */
   setOnOutput(cb: (output: ContainerOutput) => Promise<void>): void;
   /** Promise that resolves when the container exits. */
@@ -475,6 +477,7 @@ export async function spawnWarmContainer(
     containerName,
     process: container,
     groupFolder: group.folder,
+    slotId,
     setOnOutput(cb) { onOutput = cb; },
     exited,
   };
@@ -492,11 +495,12 @@ export async function runContainerAgent(
     onProcess(warmHandle.process, warmHandle.containerName);
     if (onOutput) warmHandle.setOnOutput(onOutput);
 
-    // Pipe the prompt via IPC (same mechanism as follow-up messages)
-    // Use per-slot IPC path if slotId is provided
+    // Pipe the prompt via IPC — must write to the warm container's mounted IPC path,
+    // not the sender's slot path, because the container's bind mount is fixed at spawn time.
     const groupIpcDir = resolveGroupIpcPath(group.folder);
-    const inputDir = input.slotId
-      ? path.join(groupIpcDir, 'slots', input.slotId, 'input')
+    const warmSlotId = warmHandle.slotId;
+    const inputDir = warmSlotId
+      ? path.join(groupIpcDir, 'slots', warmSlotId, 'input')
       : path.join(groupIpcDir, 'input');
     fs.mkdirSync(inputDir, { recursive: true });
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
