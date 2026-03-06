@@ -38,7 +38,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue, makeSlotKey } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveSlotIpcPath, TASK_SENDER_ID, WARM_SENDER_PREFIX } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { selectModel } from './model-router.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -116,7 +116,7 @@ function warmUpForPool(chatJid: string): void {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   // Use group-level session for warm container (no specific user yet)
   const sessionId = sessions[group.folder];
-  const warmSlotId = `_warm_${Date.now()}`;
+  const warmSlotId = `${WARM_SENDER_PREFIX}${Date.now()}`;
 
   spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, sessionId, warmSlotId)
     .then((handle) => {
@@ -516,12 +516,7 @@ async function runAgent(
         queue.registerProcess(slotKey, proc, containerName, group.folder);
         // Set the IPC path for the slot so sendMessage/closeStdin use the right directory.
         // Must use effectiveSlotId (warm container's path) not senderId.
-        const ipcPath = path.join(
-          path.resolve(process.cwd(), 'data', 'ipc'),
-          group.folder,
-          'slots',
-          effectiveSlotId,
-        );
+        const ipcPath = resolveSlotIpcPath(group.folder, effectiveSlotId);
         queue.setSlotIpcPath(slotKey, ipcPath);
       },
       wrappedOnOutput,
@@ -749,7 +744,7 @@ async function main(): Promise<void> {
     getSessions: () => sessions,
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => {
-      const taskSlotKey = makeSlotKey(groupJid, '__task__');
+      const taskSlotKey = makeSlotKey(groupJid, TASK_SENDER_ID);
       queue.registerProcess(taskSlotKey, proc, containerName, groupFolder);
     },
     sendMessage: async (jid, rawText) => {

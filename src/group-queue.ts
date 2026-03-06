@@ -2,7 +2,8 @@ import { ChildProcess } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS, MAX_CONTAINERS_PER_GROUP } from './config.js';
+import { MAX_CONCURRENT_CONTAINERS, MAX_CONTAINERS_PER_GROUP } from './config.js';
+import { resolveSlotIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -219,7 +220,7 @@ export class GroupQueue {
       return path.join(state.ipcPath, 'input');
     }
     // Fallback: per-slot directory under group IPC
-    return path.join(DATA_DIR, 'ipc', state.groupFolder!, 'slots', state.senderId, 'input');
+    return path.join(resolveSlotIpcPath(state.groupFolder!, state.senderId), 'input');
   }
 
   /** Set the IPC path for a slot (used when container is spawned). */
@@ -372,7 +373,10 @@ export class GroupQueue {
   }
 
   private drainWaiting(): void {
+    const len = this.waitingSlots.length;
+    let checked = 0;
     while (
+      checked < len &&
       this.waitingSlots.length > 0 &&
       this.activeCount < MAX_CONCURRENT_CONTAINERS
     ) {
@@ -385,6 +389,7 @@ export class GroupQueue {
       if (groupActive >= MAX_CONTAINERS_PER_GROUP) {
         // Put back at end of waiting list
         this.waitingSlots.push(nextSlotKey);
+        checked++;
         continue;
       }
 

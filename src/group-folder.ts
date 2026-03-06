@@ -42,3 +42,13 @@ export function resolveGroupIpcPath(folder: string): string {
   ensureWithinBase(ipcBaseDir, ipcPath);
   return ipcPath;
 }
+
+/** Resolve the IPC path for a specific slot within a group. */
+export function resolveSlotIpcPath(folder: string, slotId: string): string {
+  const groupIpcDir = resolveGroupIpcPath(folder);
+  return path.join(groupIpcDir, 'slots', slotId);
+}
+
+// Reserved sender IDs — must never collide with real user IDs.
+export const TASK_SENDER_ID = '__task__';
+export const WARM_SENDER_PREFIX = '_warm_';

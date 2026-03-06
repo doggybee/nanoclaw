@@ -19,7 +19,7 @@ import {
 } from './config.js';
 import { getClaudeOAuthToken } from './claude-credentials.js';
 import { readEnvFile } from './env.js';
-import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath, resolveSlotIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_RUNTIME_BIN,
@@ -228,12 +228,12 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-slot IPC namespace: each user slot gets its own IPC directory
+  // Per-slot IPC namespace (read-write): each user slot gets its own IPC directory
   // to prevent concurrent containers from conflicting on input/output files.
-  // The container sees /workspace/ipc/ with messages/, tasks/, input/, responses/ subdirs.
+  // Secondary read-only mount at /workspace/ipc-group contains shared group-level files.
   const groupIpcDir = resolveGroupIpcPath(group.folder);
   const slotIpcDir = slotId
-    ? path.join(groupIpcDir, 'slots', slotId)
+    ? resolveSlotIpcPath(group.folder, slotId)
     : groupIpcDir;
   cachedMkdir(path.join(slotIpcDir, 'messages'));
   cachedMkdir(path.join(slotIpcDir, 'tasks'));
@@ -497,11 +497,10 @@ export async function runContainerAgent(
 
     // Pipe the prompt via IPC — must write to the warm container's mounted IPC path,
     // not the sender's slot path, because the container's bind mount is fixed at spawn time.
-    const groupIpcDir = resolveGroupIpcPath(group.folder);
     const warmSlotId = warmHandle.slotId;
     const inputDir = warmSlotId
-      ? path.join(groupIpcDir, 'slots', warmSlotId, 'input')
-      : path.join(groupIpcDir, 'input');
+      ? path.join(resolveSlotIpcPath(group.folder, warmSlotId), 'input')
+      : path.join(resolveGroupIpcPath(group.folder), 'input');
     fs.mkdirSync(inputDir, { recursive: true });
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
     const filepath = path.join(inputDir, filename);

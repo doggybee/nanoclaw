@@ -6,6 +6,7 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
+import { parseSlotKey } from '../group-queue.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -756,7 +757,7 @@ export class LarkChannel implements Channel {
   ): Promise<void> {
     if (this.streamingCards.has(keyOrJid)) return; // already has a card
     // Extract the real jid from a slotKey (chatJid::senderId) or use as-is
-    const jid = keyOrJid.includes('::') ? keyOrJid.split('::')[0] : keyOrJid;
+    const jid = keyOrJid.includes('::') ? parseSlotKey(keyOrJid).chatJid : keyOrJid;
 
     const cardJson = {
       schema: '2.0',
