@@ -620,21 +620,28 @@ describe('LarkChannel', () => {
     });
 
     it('appends to existing streaming card on subsequent sends to same jid', async () => {
-      const opts = createTestOpts();
-      const channel = new LarkChannel(opts);
-      await channel.connect();
+      vi.useFakeTimers();
+      try {
+        const opts = createTestOpts();
+        const channel = new LarkChannel(opts);
+        await channel.connect();
 
-      const mockClient = currentClient();
-      // Reset counts after connect (refillCardPool pre-creates cards in background)
-      mockClient.cardkit.v1.card.create.mockClear();
-      await channel.sendMessage('lark:oc_test123', 'First');
-      await channel.sendMessage('lark:oc_test123', 'Second');
-      // Content pushed twice (initial + update)
-      expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(2);
-      expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenNthCalledWith(2, {
-        path: { card_id: 'card_test_001', element_id: 'streaming_content' },
-        data: { content: 'Second', sequence: 2 },
-      });
+        const mockClient = currentClient();
+        // Reset counts after connect (refillCardPool pre-creates cards in background)
+        mockClient.cardkit.v1.card.create.mockClear();
+        await channel.sendMessage('lark:oc_test123', 'First');
+        // Advance past throttle window (100ms)
+        vi.advanceTimersByTime(150);
+        await channel.sendMessage('lark:oc_test123', 'Second');
+        // Content pushed twice (initial + update after throttle)
+        expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(2);
+        expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenNthCalledWith(2, {
+          path: { card_id: 'card_test_001', element_id: 'streaming_content' },
+          data: { content: 'Second', sequence: 2 },
+        });
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('replies with streaming card when replyToMessageId is provided', async () => {
@@ -983,6 +990,109 @@ describe('splitMarkdown', () => {
 
   it('returns empty array content for empty string', () => {
     expect(splitMarkdown('', 100)).toEqual(['']);
+  });
+});
+
+// --- Message type converter tests ---
+
+describe('inbound message converters', () => {
+  let channel: LarkChannel;
+  let onMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const opts = createTestOpts();
+    onMessage = opts.onMessage as ReturnType<typeof vi.fn>;
+    channel = new LarkChannel(opts);
+    await channel.connect();
+  });
+
+  afterEach(async () => {
+    await channel.disconnect();
+  });
+
+  const sendEvent = async (msgType: string, content: string) => {
+    const handler = (LarkSdk as any).__getMessageHandler();
+    await handler({
+      sender: { sender_id: { open_id: 'ou_user1' } },
+      message: {
+        message_id: `msg_test_${Date.now()}`,
+        chat_id: 'oc_test123',
+        chat_type: 'group',
+        message_type: msgType,
+        content,
+        create_time: String(Date.now()),
+        mentions: [
+          { key: '@_user_1', id: { open_id: 'ou_bot123' }, name: 'Jonesy' },
+        ],
+      },
+    });
+  };
+
+  it('parses system messages with template', async () => {
+    const content = JSON.stringify({
+      template: '{from_user} added {to_chatters} to the group',
+      from_user: ['Alice'],
+      to_chatters: ['Bob', 'Charlie'],
+    });
+    await sendEvent('system', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toBe('Alice added Bob, Charlie to the group');
+  });
+
+  it('falls back for system messages without template', async () => {
+    await sendEvent('system', '{}');
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toBe('[system message]');
+  });
+
+  it('converts folder messages', async () => {
+    const content = JSON.stringify({ file_key: 'fk_001', file_name: 'docs' });
+    await sendEvent('folder', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toContain('<folder key="fk_001" name="docs"/>');
+  });
+
+  it('converts hongbao messages', async () => {
+    const content = JSON.stringify({ text: 'Happy New Year' });
+    await sendEvent('hongbao', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toContain('<hongbao text="Happy New Year"/>');
+  });
+
+  it('converts calendar messages', async () => {
+    const content = JSON.stringify({
+      summary: 'Team Meeting',
+      start_time: '1709712000000',
+      end_time: '1709715600000',
+    });
+    await sendEvent('calendar', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toContain('<calendar_invite>');
+    expect(msg.content).toContain('📅 Team Meeting');
+  });
+
+  it('converts video_chat messages', async () => {
+    const content = JSON.stringify({ topic: 'Standup', start_time: '1709712000000' });
+    await sendEvent('video_chat', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toContain('<meeting>');
+    expect(msg.content).toContain('📹 Standup');
+  });
+
+  it('converts vote messages', async () => {
+    const content = JSON.stringify({ topic: 'Lunch?', options: ['Pizza', 'Sushi'] });
+    await sendEvent('vote', content);
+    expect(onMessage).toHaveBeenCalled();
+    const msg = onMessage.mock.calls[0][1];
+    expect(msg.content).toContain('<vote>');
+    expect(msg.content).toContain('• Pizza');
+    expect(msg.content).toContain('• Sushi');
   });
 });
 

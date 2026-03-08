@@ -32,6 +32,8 @@ const SUPPORTED_MESSAGE_TYPES = new Set([
   'audio', 'video', 'media', 'sticker',
   'merge_forward', 'location', 'todo',
   'share_chat', 'share_user', 'system',
+  'folder', 'hongbao', 'share_calendar_event',
+  'calendar', 'general_calendar', 'video_chat', 'vote',
 ]);
 
 /**
@@ -234,17 +236,41 @@ function extractLarkApiCode(err: any): number | undefined {
 }
 
 /**
+ * Format a user-friendly permission error for code 99991672.
+ * Matches official feishu-openclaw-plugin's formatPermissionError().
+ */
+function formatPermissionError(code: number, msg: string): string | null {
+  if (code !== 99991672) return null;
+  // Extract auth URL from error message
+  const urlMatch = msg.match(/https:\/\/[^\s]+\/app\/[^\s]+/);
+  const authUrl = urlMatch?.[0] ?? '';
+  // Extract scopes from [scope1,scope2,...] pattern
+  const scopeMatch = msg.match(/\[([^\]]+)\]/);
+  const scopes = scopeMatch?.[1] ?? 'unknown';
+  return `权限不足：应用缺少 [${scopes}] 权限。\n请管理员点击以下链接申请并开通权限：\n${authUrl}`;
+}
+
+/**
  * Extract a meaningful error message from a Lark SDK / Axios error.
  * Matches official feishu-openclaw-plugin's formatLarkError().
+ * For permission errors (99991672) formats a user-friendly string with scopes + auth URL.
  */
 function formatLarkError(err: unknown): string {
   if (!err || typeof err !== 'object') return String(err);
   const e = err as any;
   // Path 1: Lark SDK merges Feishu fields onto the thrown error
-  if (typeof e.code === 'number' && e.msg) return e.msg;
+  if (typeof e.code === 'number' && e.msg) {
+    const permMsg = formatPermissionError(e.code, e.msg);
+    if (permMsg) return permMsg;
+    return e.msg;
+  }
   // Path 2: Axios error — dig into response.data
   const data = e.response?.data;
-  if (data && typeof data.code === 'number' && data.msg) return data.msg;
+  if (data && typeof data.code === 'number' && data.msg) {
+    const permMsg = formatPermissionError(data.code, data.msg);
+    if (permMsg) return permMsg;
+    return data.msg;
+  }
   // Fallback
   return e.message ?? String(err);
 }
@@ -515,6 +541,10 @@ export interface LarkChannelOpts {
 const STREAMING_ELEMENT_ID = 'streaming_content';
 const LOADING_ELEMENT_ID = 'loading_icon';
 
+// Minimum interval between CardKit streaming updates (ms).
+// Matches official plugin's CARDKIT_THROTTLE_MS.
+const STREAMING_THROTTLE_MS = 100;
+
 interface StreamingCard {
   cardId: string;
   sequence: number;
@@ -522,6 +552,10 @@ interface StreamingCard {
   lastContent?: string;
   /** Timestamp when streaming started (message receipt time). */
   startedAt: number;
+  /** Timestamp of last CardKit update — used for throttling. */
+  lastUpdateMs: number;
+  /** Pending throttled update timer. */
+  pendingTimer?: ReturnType<typeof setTimeout>;
 }
 
 /**
@@ -583,10 +617,38 @@ function buildThinkingCardJson() {
  */
 function buildCompleteCard(
   fullText: string,
-  elapsedMs?: number,
-  isError?: boolean,
+  opts?: {
+    elapsedMs?: number;
+    isError?: boolean;
+    reasoningText?: string;
+    reasoningElapsedMs?: number;
+  },
 ): Record<string, unknown> {
   const elements: Record<string, unknown>[] = [];
+
+  // Collapsible reasoning panel (before main content) — matches official plugin
+  if (opts?.reasoningText) {
+    const durationLabel = opts.reasoningElapsedMs
+      ? formatReasoningDuration(opts.reasoningElapsedMs)
+      : 'Thought';
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      header: {
+        title: { tag: 'markdown', content: `💭 ${durationLabel}` },
+        vertical_align: 'center',
+        icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+        icon_position: 'follow_text',
+        icon_expanded_angle: -180,
+      },
+      border: { color: 'grey', corner_radius: '5px' },
+      vertical_spacing: '8px',
+      padding: '8px 8px 8px 8px',
+      elements: [
+        { tag: 'markdown', content: opts.reasoningText, text_size: 'notation' },
+      ],
+    });
+  }
 
   // Main content with markdown optimization
   elements.push({
@@ -596,18 +658,16 @@ function buildCompleteCard(
 
   // Footer: status + elapsed (matches official format)
   const parts: string[] = [];
-  // Always show status + elapsed (official defaults them to hidden,
-  // but user explicitly requested them via footer config)
-  if (isError) {
+  if (opts?.isError) {
     parts.push('出错');
   } else {
     parts.push('已完成');
   }
-  if (elapsedMs != null) {
-    parts.push(`耗时 ${formatElapsed(elapsedMs)}`);
+  if (opts?.elapsedMs != null) {
+    parts.push(`耗时 ${formatElapsed(opts.elapsedMs)}`);
   }
   if (parts.length > 0) {
-    const footerContent = isError
+    const footerContent = opts?.isError
       ? `<font color='red'>${parts.join(' · ')}</font>`
       : parts.join(' · ');
     elements.push({ tag: 'markdown', content: footerContent, text_size: 'notation' });
@@ -632,6 +692,32 @@ function formatElapsed(ms: number): string {
   return seconds < 60
     ? `${seconds.toFixed(1)}s`
     : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+}
+
+/** Format reasoning duration. Matches official plugin's `formatReasoningDuration`. */
+function formatReasoningDuration(ms: number): string {
+  const seconds = ms / 1000;
+  const duration = seconds < 60
+    ? `${seconds.toFixed(1)}s`
+    : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+  return `Thought for ${duration}`;
+}
+
+/**
+ * Convert a millisecond timestamp to "YYYY-MM-DD HH:mm" in UTC+8 (Beijing time).
+ * Matches official feishu-openclaw-plugin's millisToDatetime().
+ */
+function millisToDatetime(ms: number | string): string {
+  const num = Number(ms);
+  if (!Number.isFinite(num)) return String(ms);
+  const utc8Offset = 8 * 60 * 60 * 1000;
+  const d = new Date(num + utc8Offset);
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const hour = String(d.getUTCHours()).padStart(2, '0');
+  const minute = String(d.getUTCMinutes()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hour}:${minute}`;
 }
 
 /** Strip the `lark:` prefix to get the raw Lark chat_id. */
@@ -1040,7 +1126,7 @@ export class LarkChannel implements Channel {
           ? (parsed.summary.content as any[][]).map((p: any[]) => p.map((e: any) => e.text || '').join('')).join('\n').trim()
           : '';
         const fullTitle = [title, body].filter(Boolean).join('\n');
-        const dueTime = parsed.due_time ? `\nDue: ${new Date(Number(parsed.due_time)).toISOString()}` : '';
+        const dueTime = parsed.due_time ? `\nDue: ${millisToDatetime(parsed.due_time)}` : '';
         content = `<todo>\n${fullTitle || '[todo]'}${dueTime}\n</todo>`;
       } catch { content = '[todo]'; }
     } else if (messageType === 'share_chat') {
@@ -1056,9 +1142,89 @@ export class LarkChannel implements Channel {
     } else if (messageType === 'interactive') {
       content = convertInteractiveCard(message.content);
     } else if (messageType === 'system') {
-      content = '[system message]';
+      // Template-based system message parsing — matches official convertSystem
+      try {
+        const parsed = JSON.parse(message.content);
+        if (parsed.template) {
+          let sys = parsed.template as string;
+          if (parsed.from_user?.length) {
+            sys = sys.replace('{from_user}', (parsed.from_user as string[]).filter(Boolean).join(', '));
+          }
+          if (parsed.to_chatters?.length) {
+            sys = sys.replace('{to_chatters}', (parsed.to_chatters as string[]).filter(Boolean).join(', '));
+          }
+          if (parsed.divider_text?.text) {
+            sys = sys.replace('{divider_text}', parsed.divider_text.text);
+          }
+          // Clean up unreplaced placeholders
+          sys = sys.replace(/\{[^}]+\}/g, '');
+          content = sys.trim() || '[system message]';
+        } else {
+          content = '[system message]';
+        }
+      } catch {
+        content = '[system message]';
+      }
     } else if (messageType === 'merge_forward') {
-      content = '<forwarded_messages/>';
+      // Expand forwarded messages if possible via Lark API
+      content = await this.expandMergeForward(message.message_id);
+    } else if (messageType === 'folder') {
+      // Matches official convertFolder
+      try {
+        const parsed = JSON.parse(message.content);
+        const fileKey = parsed.file_key;
+        if (fileKey) {
+          const nameAttr = parsed.file_name ? ` name="${parsed.file_name}"` : '';
+          content = `<folder key="${fileKey}"${nameAttr}/>`;
+        } else {
+          content = '[folder]';
+        }
+      } catch { content = '[folder]'; }
+    } else if (messageType === 'hongbao') {
+      // Matches official convertHongbao
+      try {
+        const parsed = JSON.parse(message.content);
+        const textAttr = parsed.text ? ` text="${parsed.text}"` : '';
+        content = `<hongbao${textAttr}/>`;
+      } catch { content = '<hongbao/>'; }
+    } else if (messageType === 'share_calendar_event' || messageType === 'calendar' || messageType === 'general_calendar') {
+      // Matches official convertShareCalendarEvent / convertCalendar / convertGeneralCalendar
+      try {
+        const parsed = JSON.parse(message.content);
+        const calParts: string[] = [];
+        if (parsed.summary) calParts.push(`📅 ${parsed.summary}`);
+        const start = parsed.start_time ? millisToDatetime(parsed.start_time) : '';
+        const end = parsed.end_time ? millisToDatetime(parsed.end_time) : '';
+        if (start && end) calParts.push(`🕙 ${start} ~ ${end}`);
+        else if (start) calParts.push(`🕙 ${start}`);
+        const inner = calParts.join('\n') || '[calendar event]';
+        const tag = messageType === 'share_calendar_event' ? 'calendar_share'
+          : messageType === 'calendar' ? 'calendar_invite'
+          : 'calendar';
+        content = `<${tag}>${inner}</${tag}>`;
+      } catch { content = '[calendar event]'; }
+    } else if (messageType === 'video_chat') {
+      // Matches official convertVideoChat
+      try {
+        const parsed = JSON.parse(message.content);
+        const vcParts: string[] = [];
+        if (parsed.topic) vcParts.push(`📹 ${parsed.topic}`);
+        if (parsed.start_time) vcParts.push(`🕙 ${millisToDatetime(parsed.start_time)}`);
+        const inner = vcParts.join('\n') || '[video chat]';
+        content = `<meeting>${inner}</meeting>`;
+      } catch { content = '[video chat]'; }
+    } else if (messageType === 'vote') {
+      // Matches official convertVote
+      try {
+        const parsed = JSON.parse(message.content);
+        const voteParts: string[] = [];
+        if (parsed.topic) voteParts.push(parsed.topic);
+        if (Array.isArray(parsed.options)) {
+          for (const opt of parsed.options) voteParts.push(`• ${opt}`);
+        }
+        const inner = voteParts.join('\n') || '[vote]';
+        content = `<vote>\n${inner}\n</vote>`;
+      } catch { content = '[vote]'; }
     }
 
     if (!content && embeddedImageKeys.length === 0) return;
@@ -1208,16 +1374,43 @@ export class LarkChannel implements Channel {
     }
 
     if (existing) {
-      const nextSeq = existing.sequence + 1;
+      // Always update bookkeeping immediately
+      existing.lastContent = text;
 
+      // Throttle: skip if too soon after last update, schedule deferred flush
+      const now = Date.now();
+      const elapsed = now - existing.lastUpdateMs;
+      if (elapsed < STREAMING_THROTTLE_MS) {
+        // Clear any existing pending timer, schedule a new one
+        if (existing.pendingTimer) clearTimeout(existing.pendingTimer);
+        const cardRef = existing;
+        cardRef.pendingTimer = setTimeout(() => {
+          cardRef.pendingTimer = undefined;
+          const seq = cardRef.sequence + 1;
+          cardRef.sequence = seq;
+          cardRef.lastUpdateMs = Date.now();
+          this.client.cardkit.v1.cardElement.content({
+            path: { card_id: cardRef.cardId, element_id: STREAMING_ELEMENT_ID },
+            data: { content: optimizeMarkdownStyle(cardRef.lastContent || ''), sequence: seq },
+          }).catch((err: unknown) => {
+            logger.warn({ err, cardId: cardRef.cardId, seq }, 'Streaming card update failed (deferred)');
+          });
+        }, STREAMING_THROTTLE_MS - elapsed);
+        return;
+      }
+
+      const nextSeq = existing.sequence + 1;
       // Don't embed <at> in streaming content — CardKit replaces the entire
       // element on each push, so the mention would flash then disappear on
       // the next update. The card is already sent as a reply, which is enough.
       const optimized = optimizeMarkdownStyle(text);
-      // Update bookkeeping before the API call so the next streaming tick
-      // sees the correct sequence number even if the request is still in flight.
       existing.sequence = nextSeq;
-      existing.lastContent = text;
+      existing.lastUpdateMs = now;
+      // Clear any pending deferred flush since we're flushing now
+      if (existing.pendingTimer) {
+        clearTimeout(existing.pendingTimer);
+        existing.pendingTimer = undefined;
+      }
       // Fire-and-forget: don't await the Lark API call — it adds ~200-400ms
       // of latency per streaming tick, delaying visible text significantly.
       this.client.cardkit.v1.cardElement.content({
@@ -1226,7 +1419,7 @@ export class LarkChannel implements Channel {
       }).catch((err: unknown) => {
         logger.warn({ err, cardId: existing!.cardId, seq: nextSeq }, 'Streaming card update failed');
       });
-      logger.info({ jid, cardKey, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
+      logger.debug({ jid, cardKey, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
@@ -1239,7 +1432,7 @@ export class LarkChannel implements Channel {
       const fullText = mentionPrefix + text;
       // Use stored start time (from beginStreaming) if available, otherwise now
       const startedAt = streamingStartTimes.get(cardKey) || Date.now();
-      this.streamingCards.set(cardKey, { cardId, sequence: 1, startedAt });
+      this.streamingCards.set(cardKey, { cardId, sequence: 1, startedAt, lastUpdateMs: Date.now() });
 
       // Parallelize: send card message + push initial text concurrently.
       // The card entity already exists, so both operations are independent.
@@ -1290,7 +1483,7 @@ export class LarkChannel implements Channel {
         if (!cardId) throw new Error('Failed to pre-create streaming card');
       }
 
-      this.streamingCards.set(keyOrJid, { cardId, sequence: 0, startedAt });
+      this.streamingCards.set(keyOrJid, { cardId, sequence: 0, startedAt, lastUpdateMs: 0 });
 
       const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
       await this.sendToChat(jid, content, 'interactive', opts?.replyToMessageId);
@@ -1310,18 +1503,28 @@ export class LarkChannel implements Channel {
    * End the streaming session: close streaming mode, replace with a
    * "complete" card (wide_screen_mode, footer with elapsed time).
    * Matches the official Feishu plugin's card lifecycle.
+   * @param opts.isError — if true, renders error card state (red footer)
+   * @param opts.reasoningText — collapsible reasoning/thinking panel text
+   * @param opts.reasoningElapsedMs — how long the model spent thinking
    */
-  async endStreaming(keyOrJid: string): Promise<void> {
+  async endStreaming(
+    keyOrJid: string,
+    opts?: { isError?: boolean; reasoningText?: string; reasoningElapsedMs?: number },
+  ): Promise<void> {
     const card = this.streamingCards.get(keyOrJid);
     if (!card) return;
 
     // Delete from map immediately to prevent concurrent calls from double-firing
     this.streamingCards.delete(keyOrJid);
     streamingStartTimes.delete(keyOrJid);
+    // Clear any pending throttled update
+    if (card.pendingTimer) {
+      clearTimeout(card.pendingTimer);
+      card.pendingTimer = undefined;
+    }
 
     try {
       // Step 1: Close streaming mode (required before card.update)
-      // Payload must be { streaming_mode: false }, NOT nested under config
       card.sequence++;
       await this.client.cardkit.v1.card.settings({
         path: { card_id: card.cardId },
@@ -1333,7 +1536,17 @@ export class LarkChannel implements Channel {
 
       // Step 2: Replace with complete card (matches official buildCompleteCard + toCardKit2)
       const elapsedMs = Date.now() - card.startedAt;
-      const completeCard = buildCompleteCard(card.lastContent || '', elapsedMs);
+      const displayText = opts?.isError
+        ? (card.lastContent
+          ? `${card.lastContent}\n\n---\n**Error**: An error occurred while generating the response.`
+          : '**Error**: An error occurred while generating the response.')
+        : (card.lastContent || '');
+      const completeCard = buildCompleteCard(displayText, {
+        elapsedMs,
+        isError: opts?.isError,
+        reasoningText: opts?.reasoningText,
+        reasoningElapsedMs: opts?.reasoningElapsedMs,
+      });
 
       card.sequence++;
       await this.client.cardkit.v1.card.update({
@@ -1344,7 +1557,7 @@ export class LarkChannel implements Channel {
         },
       });
 
-      logger.info({ keyOrJid, cardId: card.cardId, elapsedMs }, 'Streaming ended');
+      logger.info({ keyOrJid, cardId: card.cardId, elapsedMs, isError: opts?.isError }, 'Streaming ended');
     } catch (err) {
       logger.warn({ keyOrJid, err }, 'Failed to end streaming');
     }
@@ -1409,6 +1622,10 @@ export class LarkChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
+    // Clear pending throttle timers before clearing the map
+    for (const card of this.streamingCards.values()) {
+      if (card.pendingTimer) clearTimeout(card.pendingTimer);
+    }
     this.streamingCards.clear();
     streamingStartTimes.clear();
     if (this.dedupTimer) {
@@ -1674,6 +1891,72 @@ export class LarkChannel implements Channel {
           : '',
       };
     });
+  }
+
+  /**
+   * Expand a merge_forward message by fetching sub-messages via Lark API.
+   * Matches official convertMergeForward — builds tree from flat items array.
+   */
+  private async expandMergeForward(messageId: string): Promise<string> {
+    if (!messageId) return '<forwarded_messages/>';
+    try {
+      // Fetch sub-messages from merge_forward container
+      const resp = await (this.client as any).im.v1.message.list({
+        params: {
+          container_id_type: 'merge_forward',
+          container_id: messageId,
+          page_size: 50,
+          sort_type: 'ByCreateTimeAsc',
+        },
+      });
+      const items = resp?.data?.items;
+      if (!items || items.length === 0) return '<forwarded_messages/>';
+
+      const parts: string[] = [];
+      for (const item of items) {
+        try {
+          const msgType = item.msg_type ?? 'text';
+          const senderId = item.sender?.id ?? 'unknown';
+          const createTime = item.create_time
+            ? millisToDatetime(parseInt(String(item.create_time), 10))
+            : 'unknown';
+          const rawContent = item.body?.content ?? '{}';
+
+          let subContent = '';
+          if (msgType === 'text') {
+            const p = JSON.parse(rawContent);
+            subContent = p.text ?? '';
+          } else if (msgType === 'post') {
+            const p = JSON.parse(rawContent);
+            subContent = p.title ?? '';
+          } else if (msgType === 'image') {
+            subContent = '[image]';
+          } else if (msgType === 'file') {
+            const p = JSON.parse(rawContent);
+            subContent = `[file: ${p.file_name ?? 'unknown'}]`;
+          } else if (msgType === 'merge_forward') {
+            subContent = '<forwarded_messages/>'; // Don't recurse to avoid API call storms
+          } else {
+            try {
+              const p = JSON.parse(rawContent);
+              subContent = p.text ?? `[${msgType}]`;
+            } catch {
+              subContent = `[${msgType}]`;
+            }
+          }
+
+          const indented = subContent.split('\n').map(l => `    ${l}`).join('\n');
+          parts.push(`[${createTime}] ${senderId} (${item.message_id ?? ''}):\n${indented}`);
+        } catch {
+          // Skip malformed sub-messages
+        }
+      }
+      if (parts.length === 0) return '<forwarded_messages/>';
+      return `<forwarded_messages>\n${parts.join('\n')}\n</forwarded_messages>`;
+    } catch (err) {
+      logger.debug({ messageId, err }, 'merge_forward: fetch failed, returning placeholder');
+      return '<forwarded_messages/>';
+    }
   }
 
   /** Download embedded images and return updated content with file references. */

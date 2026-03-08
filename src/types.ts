@@ -93,7 +93,7 @@ export interface Channel {
   // keyOrJid can be a slotKey (for per-user isolation) or a plain jid.
   beginStreaming?(keyOrJid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; startedAt?: number }): Promise<void>;
   // Optional: end a streaming card session (Lark streaming cards).
-  endStreaming?(keyOrJid: string): Promise<void>;
+  endStreaming?(keyOrJid: string, opts?: { isError?: boolean; reasoningText?: string; reasoningElapsedMs?: number }): Promise<void>;
   // Optional: send an image file.
   sendImage?(jid: string, imagePath: string, replyToMessageId?: string): Promise<void>;
   // Optional: send a file.

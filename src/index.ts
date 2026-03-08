@@ -512,10 +512,11 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
   }, model);
 
   await channel.setTyping?.(chatJid, false);
-  await channel.endStreaming?.(slotKey);
+  const isErrorState = output === 'error' || hadError;
+  await channel.endStreaming?.(slotKey, isErrorState ? { isError: true } : undefined);
   if (idleTimer) clearTimeout(idleTimer);
 
-  if (output === 'error' || hadError) {
+  if (isErrorState) {
     if (outputSentToUser) {
       logger.warn(
         { group: group.name, senderId },
