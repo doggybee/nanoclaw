@@ -532,6 +532,12 @@ export function setSession(groupFolder: string, sessionId: string, senderId = ''
   ).run(groupFolder, senderId, sessionId);
 }
 
+export function deleteSession(groupFolder: string, senderId = ''): void {
+  db.prepare(
+    'DELETE FROM sessions WHERE group_folder = ? AND sender_id = ?',
+  ).run(groupFolder, senderId);
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, sender_id, session_id FROM sessions')

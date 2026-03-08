@@ -91,7 +91,7 @@ export interface Channel {
   addReaction?(jid: string, messageId: string, emojiType: string): Promise<void>;
   // Optional: pre-create a streaming card so the first chunk only needs a content update.
   // keyOrJid can be a slotKey (for per-user isolation) or a plain jid.
-  beginStreaming?(keyOrJid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } }): Promise<void>;
+  beginStreaming?(keyOrJid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; startedAt?: number }): Promise<void>;
   // Optional: end a streaming card session (Lark streaming cards).
   endStreaming?(keyOrJid: string): Promise<void>;
   // Optional: send an image file.
@@ -106,6 +106,14 @@ export interface Channel {
   getChatHistory?(jid: string, count: number, beforeTimestamp?: string): Promise<ChatHistoryMessage[]>;
   // Optional: send an interactive card (buttons, selects, etc.)
   sendCard?(jid: string, cardJson: object, replyToMessageId?: string): Promise<void>;
+  // Optional: update (PATCH) an existing card message content.
+  updateCard?(jid: string, messageId: string, cardJson: object): Promise<void>;
+  // Optional: remove a reaction from a message by reaction ID.
+  removeReaction?(jid: string, messageId: string, reactionId: string): Promise<void>;
+  // Optional: list reactions on a message (optionally filtered by emoji type).
+  listReactions?(jid: string, messageId: string, emojiType?: string): Promise<Array<{ reactionId: string; emojiType: string; operatorType: string; operatorId: string }>>;
+  // Optional: forward a message to another chat.
+  forwardMessage?(messageId: string, targetJid: string): Promise<void>;
 }
 
 export interface ChatHistoryMessage {

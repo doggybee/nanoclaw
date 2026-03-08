@@ -197,6 +197,308 @@ export function splitMarkdown(text: string, maxLen: number): string[] {
   return chunks;
 }
 
+/**
+ * Optimize markdown for Lark card rendering.
+ * Ported from official @larksuiteoapi/feishu-openclaw-plugin.
+ *
+ * - Heading downgrade: H1 → H4, H2-H6 → H5 (only when H1-H3 exist)
+ * - Table spacing: adds <br> before/after tables for card v2
+ * - Code block spacing: adds <br> before/after code blocks
+ * - Consecutive headings: adds <br> between them
+ * - Compresses excess blank lines
+ */
+export function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
+  try {
+    // 1. Extract code blocks, protect with placeholders
+    const MARK = '___CB_';
+    const codeBlocks: string[] = [];
+    let r = text.replace(/```[\s\S]*?```/g, (m) => `${MARK}${codeBlocks.push(m) - 1}___`);
+
+    // 2. Heading downgrade (only if document has H1-H3)
+    // Order matters: H2-H6→H5 first, then H1→H4
+    const hasH1toH3 = /^#{1,3} /m.test(text);
+    if (hasH1toH3) {
+      r = r.replace(/^#{2,6} (.+)$/gm, '##### $1');
+      r = r.replace(/^# (.+)$/gm, '#### $1');
+    }
+
+    if (cardVersion >= 2) {
+      // 3. Consecutive headings: add <br> between them
+      r = r.replace(/^(#{4,5} .+)\n{1,2}(#{4,5} )/gm, '$1\n<br>\n$2');
+
+      // 4. Table spacing
+      r = r.replace(/^([^|\n].*)\n(\|.+\|)/gm, '$1\n\n$2');
+      r = r.replace(/\n\n((?:\|.+\|[^\S\n]*\n?)+)/g, '\n\n<br>\n\n$1');
+      r = r.replace(/((?:^\|.+\|[^\S\n]*\n?)+)/gm, '$1\n<br>\n');
+      r = r.replace(/^((?!#{4,5} )(?!\*\*).+)\n\n(<br>)\n\n(\|)/gm, '$1\n$2\n$3');
+      r = r.replace(/^(\*\*.+)\n\n(<br>)\n\n(\|)/gm, '$1\n$2\n\n$3');
+      r = r.replace(/(\|[^\n]*\n)\n(<br>\n)((?!#{4,5} )(?!\*\*))/gm, '$1$2$3');
+
+      // 5. Restore code blocks with <br> spacing
+      codeBlocks.forEach((block, i) => {
+        r = r.replace(`${MARK}${i}___`, `\n<br>\n${block}\n<br>\n`);
+      });
+    } else {
+      codeBlocks.forEach((block, i) => {
+        r = r.replace(`${MARK}${i}___`, block);
+      });
+    }
+
+    // 6. Compress excess blank lines
+    r = r.replace(/\n{3,}/g, '\n\n');
+    return r;
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * Convert markdown tables to bullet-list format for Lark rendering.
+ * Lark's card markdown doesn't render tables well in some contexts.
+ * Converts each row into a bullet item with "column: value" pairs.
+ */
+function convertMarkdownTables(text: string): string {
+  const lines = text.split('\n');
+  const result: string[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    // Detect table: header row | col1 | col2 |
+    if (lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
+      const headerLine = lines[i].trim();
+      // Check next line is separator |---|---|
+      if (i + 1 < lines.length && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
+        const headers = headerLine.split('|').filter(h => h.trim()).map(h => h.trim());
+        i += 2; // skip header + separator
+
+        // Process data rows
+        while (i < lines.length && lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
+          const cells = lines[i].trim().split('|').filter(c => c.trim()).map(c => c.trim());
+          const parts: string[] = [];
+          for (let j = 0; j < Math.min(headers.length, cells.length); j++) {
+            parts.push(`${headers[j]}: ${cells[j]}`);
+          }
+          result.push(`- ${parts.join(', ')}`);
+          i++;
+        }
+        continue;
+      }
+    }
+    result.push(lines[i]);
+    i++;
+  }
+
+  return result.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Message unavailable guard
+// ---------------------------------------------------------------------------
+// Lark API error codes for recalled/deleted messages
+const TERMINAL_MESSAGE_CODES = new Set([230011, 231003]);
+const UNAVAILABLE_CACHE_TTL_MS = 30 * 60 * 1000;
+const unavailableMessages = new Map<string, number>();
+
+function extractLarkApiCode(err: any): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  const code = err.code ?? err.data?.code ?? err.response?.data?.code;
+  if (typeof code === 'number' && Number.isFinite(code)) return code;
+  if (typeof code === 'string') {
+    const n = Number(code);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+async function withMessageGuard<T>(messageId: string | undefined, fn: () => Promise<T>): Promise<T> {
+  if (!messageId) return fn();
+
+  // Check if already marked unavailable
+  const markedAt = unavailableMessages.get(messageId);
+  if (markedAt && Date.now() - markedAt < UNAVAILABLE_CACHE_TTL_MS) {
+    throw new Error(`Message ${messageId} is unavailable (recalled/deleted)`);
+  }
+
+  try {
+    return await fn();
+  } catch (err) {
+    const code = extractLarkApiCode(err);
+    if (code && TERMINAL_MESSAGE_CODES.has(code)) {
+      unavailableMessages.set(messageId, Date.now());
+      // Prune old entries
+      if (unavailableMessages.size > 512) {
+        const now = Date.now();
+        for (const [id, ts] of unavailableMessages) {
+          if (now - ts > UNAVAILABLE_CACHE_TTL_MS) unavailableMessages.delete(id);
+        }
+      }
+      throw new Error(`Message ${messageId} unavailable (code=${code})`);
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive card → text converter (inbound)
+// ---------------------------------------------------------------------------
+function convertInteractiveCard(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw);
+
+    // New format: json_card field
+    if (typeof parsed.json_card === 'string') {
+      const card = JSON.parse(parsed.json_card);
+      return convertCardToText(card);
+    }
+
+    // Legacy format: direct card JSON
+    return convertCardToText(parsed);
+  } catch {
+    return '[interactive card]';
+  }
+}
+
+function convertCardToText(card: any): string {
+  const parts: string[] = [];
+
+  // Extract title from header
+  const header = card.header;
+  if (header) {
+    const title = header.title;
+    if (title) {
+      const titleText = typeof title === 'string' ? title
+        : title.content || title.i18nContent?.zh_cn || title.i18nContent?.en_us || '';
+      if (titleText) parts.push(`**${titleText}**`);
+    }
+  }
+
+  // Extract body elements
+  const elements = card.body?.elements ?? card.elements ?? [];
+  extractCardTexts(elements, parts);
+
+  if (parts.length === 0) return '[interactive card]';
+  return `<card${header?.title ? ` title="${extractText(header.title)}"` : ''}>\n${parts.join('\n')}\n</card>`;
+}
+
+function extractText(elem: any): string {
+  if (!elem) return '';
+  if (typeof elem === 'string') return elem;
+  return elem.content || elem.i18nContent?.zh_cn || elem.i18nContent?.en_us || elem.text || '';
+}
+
+function extractCardTexts(elements: any[], out: string[]): void {
+  if (!Array.isArray(elements)) return;
+  for (const el of elements) {
+    if (typeof el !== 'object' || el === null) continue;
+    const tag = el.tag ?? '';
+    const prop = el.property ?? el;
+
+    if (tag === 'markdown' || tag === 'lark_md') {
+      const content = prop.content ?? el.content;
+      if (typeof content === 'string') out.push(content);
+    } else if (tag === 'plain_text' || tag === 'text') {
+      const content = prop.content ?? el.content ?? el.text?.content;
+      if (typeof content === 'string') out.push(content);
+    } else if (tag === 'div') {
+      const text = prop.text ?? el.text;
+      if (text && typeof text === 'object') {
+        const t = extractText(text);
+        if (t) out.push(t);
+      }
+      // fields
+      const fields = prop.fields ?? el.fields;
+      if (Array.isArray(fields)) {
+        for (const field of fields) {
+          const ft = field?.text;
+          if (ft) {
+            const t = extractText(ft);
+            if (t) out.push(t);
+          }
+        }
+      }
+    } else if (tag === 'note') {
+      const noteElements = prop.elements ?? el.elements;
+      if (Array.isArray(noteElements)) {
+        const texts: string[] = [];
+        for (const ne of noteElements) {
+          const t = extractText(ne);
+          if (t) texts.push(t);
+        }
+        if (texts.length > 0) out.push(texts.join(' '));
+      }
+    } else if (tag === 'hr') {
+      out.push('---');
+    } else if (tag === 'button') {
+      const btnText = extractText(prop.text ?? el.text);
+      if (btnText) out.push(`[${btnText}]`);
+    } else if (tag === 'actions' || tag === 'action') {
+      const actions = prop.actions ?? el.actions;
+      if (Array.isArray(actions)) extractCardTexts(actions, out);
+    } else if (tag === 'column_set') {
+      const columns = prop.columns ?? el.columns;
+      if (Array.isArray(columns)) {
+        for (const col of columns) {
+          const colElements = col?.elements ?? col?.property?.elements;
+          if (Array.isArray(colElements)) extractCardTexts(colElements, out);
+        }
+      }
+    } else if (tag === 'column') {
+      const colElements = prop.elements ?? el.elements;
+      if (Array.isArray(colElements)) extractCardTexts(colElements, out);
+    } else if (tag === 'img' || tag === 'image') {
+      const alt = extractText(prop.alt ?? el.alt) || '图片';
+      out.push(`[${alt}]`);
+    } else if (tag === 'table') {
+      const columns = prop.columns ?? el.columns;
+      const rows = prop.rows ?? el.rows ?? [];
+      if (Array.isArray(columns) && columns.length > 0) {
+        const colNames = columns.map((c: any) => c.displayName || c.name || '');
+        const colKeys = columns.map((c: any) => c.name || '');
+        const lines: string[] = [];
+        lines.push('| ' + colNames.join(' | ') + ' |');
+        lines.push('|' + colNames.map(() => '------|').join(''));
+        for (const row of rows) {
+          if (typeof row !== 'object' || row === null) continue;
+          const cells = colKeys.map((key: string) => {
+            const cell = (row as any)[key];
+            if (!cell) return '';
+            const data = cell.data;
+            if (typeof data === 'string') return data;
+            if (typeof data === 'number') return String(data);
+            return '';
+          });
+          lines.push('| ' + cells.join(' | ') + ' |');
+        }
+        out.push(lines.join('\n'));
+      }
+    } else if (tag === 'form') {
+      const formElements = prop.elements ?? el.elements;
+      if (Array.isArray(formElements)) extractCardTexts(formElements, out);
+    } else if (tag === 'collapsible_panel') {
+      const title = extractText(prop.header?.title ?? el.header?.title) || '详情';
+      out.push(`▼ ${title}`);
+      const panelElements = prop.elements ?? el.elements;
+      if (Array.isArray(panelElements)) extractCardTexts(panelElements, out);
+    } else if (tag === 'select_static' || tag === 'multi_select_static') {
+      const options = prop.options ?? el.options ?? [];
+      const optTexts = options.map((o: any) => extractText(o?.text) || o?.value || '').filter(Boolean);
+      if (optTexts.length > 0) out.push(`{${optTexts.join(' / ')}}`);
+    } else if (tag === 'checker') {
+      const checked = prop.checked === true;
+      const text = extractText(prop.text ?? el.text);
+      out.push(`${checked ? '[x]' : '[ ]'} ${text}`);
+    } else if (tag === 'input') {
+      const label = extractText(prop.label ?? el.label);
+      const placeholder = extractText(prop.placeholder ?? el.placeholder);
+      out.push(label ? `${label}: _____` : placeholder ? `${placeholder}_____` : '_____');
+    } else {
+      // Try to extract text from nested elements
+      const nested = prop.elements ?? el.elements;
+      if (Array.isArray(nested)) extractCardTexts(nested, out);
+    }
+  }
+}
+
 export type OnCardAction = (chatJid: string, action: {
   actionId: string;
   value?: Record<string, string>;
@@ -211,53 +513,129 @@ export interface LarkChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
-// Streaming card element ID
-const STREAMING_ELEMENT_ID = 'streaming_md';
-
-// Loading element shown at bottom of streaming card before first content arrives
-const LOADING_ELEMENT_ID = 'streaming_loading';
+// ---------------------------------------------------------------------------
+// Streaming card constants — match official Feishu plugin exactly
+// ---------------------------------------------------------------------------
+const STREAMING_ELEMENT_ID = 'streaming_content';
+const LOADING_ELEMENT_ID = 'loading_icon';
 
 interface StreamingCard {
   cardId: string;
   sequence: number;
-  /** True when card was pre-created with a loading element that needs removing on first content. */
-  hasLoadingElement?: boolean;
+  /** Last pushed content — used to build the final "complete" card. */
+  lastContent?: string;
+  /** Timestamp when streaming started (message receipt time). */
+  startedAt: number;
 }
 
-/** Build the streaming card config shared between beginStreaming and _sendStreaming. */
-function buildStreamingCardConfig() {
+/**
+ * Per-key start times, recorded when beginStreaming is called.
+ * Survives card creation failures so the fallback path in _sendStreaming
+ * still uses the correct start time (not the time of first text arrival).
+ */
+const streamingStartTimes = new Map<string, number>();
+
+/**
+ * The thinking card JSON sent as the initial streaming card.
+ * Identical to the official plugin's `thinkingCardJson`.
+ *
+ * Performance opt: we add `streaming_config` for faster client-side animation.
+ * The official plugin omits this (uses CardKit defaults: step=1, freq=50ms).
+ */
+function buildThinkingCardJson() {
   return {
-    streaming_mode: true,
-    summary: { content: '正在回答...' },
-    streaming_config: {
-      print_frequency_ms: { default: 50 },
-      print_step: { default: 2 },
-      print_strategy: 'fast' as const,
+    schema: '2.0',
+    config: {
+      streaming_mode: true,
+      summary: { content: '思考中...' },
+      // Performance optimization — faster client-side typewriter
+      streaming_config: {
+        print_frequency_ms: { default: 20 },
+        print_step: { default: 10 },
+        print_strategy: 'fast' as const,
+      },
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: '',
+          text_align: 'left',
+          text_size: 'normal_v2',
+          margin: '0px 0px 0px 0px',
+          element_id: STREAMING_ELEMENT_ID,
+        },
+        {
+          tag: 'markdown',
+          content: '努力回答中...',
+          icon: {
+            tag: 'standard_icon',
+            token: 'robot_outlined',
+            color: 'blue',
+          },
+          text_size: 'notation',
+          element_id: LOADING_ELEMENT_ID,
+        },
+      ],
     },
   };
 }
 
-/** Build a status column_set element (loading indicator or disclaimer). */
-function buildStatusElement(text: string, elementId?: string) {
-  const el: Record<string, unknown> = {
-    tag: 'column_set',
-    margin: '0px',
-    flex_mode: 'none',
-    columns: [{
-      tag: 'column',
-      width: 'weighted',
-      weight: 1,
-      padding: '0px',
-      elements: [{
-        tag: 'markdown',
-        content: `<font color="grey">${text}</font>`,
-        text_size: 'notation',
-        icon: { tag: 'standard_icon', token: 'robot_outlined', color: 'grey' },
-      }],
-    }],
+/**
+ * Build the "complete" card that replaces the streaming card when done.
+ * Matches the official plugin's `buildCompleteCard` + `toCardKit2`.
+ */
+function buildCompleteCard(
+  fullText: string,
+  elapsedMs?: number,
+  isError?: boolean,
+): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = [];
+
+  // Main content with markdown optimization
+  elements.push({
+    tag: 'markdown',
+    content: optimizeMarkdownStyle(fullText),
+  });
+
+  // Footer: status + elapsed (matches official format)
+  const parts: string[] = [];
+  // Always show status + elapsed (official defaults them to hidden,
+  // but user explicitly requested them via footer config)
+  if (isError) {
+    parts.push('出错');
+  } else {
+    parts.push('已完成');
+  }
+  if (elapsedMs != null) {
+    parts.push(`耗时 ${formatElapsed(elapsedMs)}`);
+  }
+  if (parts.length > 0) {
+    const footerContent = isError
+      ? `<font color='red'>${parts.join(' · ')}</font>`
+      : parts.join(' · ');
+    elements.push({ tag: 'markdown', content: footerContent, text_size: 'notation' });
+  }
+
+  // Feed preview summary — stripped markdown
+  const summaryText = fullText.replace(/[*_`#>\[\]()~]/g, '').trim();
+  const summary = summaryText
+    ? { content: summaryText.slice(0, 120) }
+    : undefined;
+
+  return {
+    schema: '2.0',
+    config: { wide_screen_mode: true, update_multi: true, summary },
+    body: { elements },
   };
-  if (elementId) el.element_id = elementId;
-  return el;
+}
+
+/** Format elapsed time. Matches official plugin's `formatElapsed`. */
+function formatElapsed(ms: number): string {
+  const seconds = ms / 1000;
+  return seconds < 60
+    ? `${seconds.toFixed(1)}s`
+    : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
 }
 
 /** Strip the `lark:` prefix to get the raw Lark chat_id. */
@@ -277,6 +655,13 @@ export class LarkChannel implements Channel {
   private seenMessages = new Map<string, number>();
   private dedupTimer: ReturnType<typeof setInterval> | undefined;
   private streamingCards = new Map<string, StreamingCard>();
+
+  /** Promises for in-progress card creation (prevents race between beginStreaming and _sendStreaming). */
+  private cardCreationPromises = new Map<string, Promise<void>>();
+  /** Pre-created CardKit card IDs ready for immediate use — skips card.create latency. */
+  private cardPool: string[] = [];
+  private cardPoolRefilling = false;
+  private readonly CARD_POOL_SIZE = 2;
 
   private appId: string;
   private appSecret: string;
@@ -307,6 +692,31 @@ export class LarkChannel implements Channel {
     this.dedupTimer = setInterval(() => this.cleanupDedup(), DEDUP_CLEANUP_INTERVAL_MS);
   }
 
+  /** Pre-create CardKit card entities so beginStreaming only needs sendToChat (saves ~1.5s). */
+  private async refillCardPool(): Promise<void> {
+    if (this.cardPoolRefilling) return;
+    this.cardPoolRefilling = true;
+    try {
+      while (this.cardPool.length < this.CARD_POOL_SIZE) {
+        const result = await this.client.cardkit.v1.card.create({
+          data: { type: 'card_json', data: JSON.stringify(buildThinkingCardJson()) },
+        });
+        const cardId = result?.data?.card_id;
+        if (cardId) {
+          this.cardPool.push(cardId);
+          logger.debug({ cardId, poolSize: this.cardPool.length }, 'Card pool: pre-created');
+        } else {
+          logger.warn('Card pool: card.create returned empty card_id, stopping refill');
+          break;
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Card pool: refill failed');
+    } finally {
+      this.cardPoolRefilling = false;
+    }
+  }
+
   /**
    * Send a message to a chat, handling reply-or-create branching.
    * All outbound methods funnel through this to eliminate duplication.
@@ -318,10 +728,12 @@ export class LarkChannel implements Channel {
     replyToMessageId?: string,
   ): Promise<void> {
     if (replyToMessageId) {
-      await this.client.im.v1.message.reply({
-        path: { message_id: replyToMessageId },
-        data: { content, msg_type: msgType },
-      });
+      await withMessageGuard(replyToMessageId, () =>
+        this.client.im.v1.message.reply({
+          path: { message_id: replyToMessageId },
+          data: { content, msg_type: msgType },
+        }),
+      );
     } else {
       await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -449,6 +861,11 @@ export class LarkChannel implements Channel {
     this.syncChatMetadata().catch((err) =>
       logger.error({ err }, 'Background chat metadata sync failed'),
     );
+
+    // Pre-create card pool in background (saves ~1.5s on first streaming card)
+    this.refillCardPool().catch((err) =>
+      logger.warn({ err }, 'Card pool initial fill failed'),
+    );
   }
 
   private async handleIncomingMessage(data: any): Promise<void> {
@@ -462,9 +879,15 @@ export class LarkChannel implements Channel {
     if (messageId && this.seenMessages.has(messageId)) return;
     if (messageId) this.seenMessages.set(messageId, Date.now());
 
-    const messageType = message.message_type; // 'text', 'image', 'file', 'post'
-    // Only process text, image, file, and post (rich text with images) messages
-    if (!['text', 'image', 'file', 'post'].includes(messageType)) return;
+    const messageType = message.message_type;
+    // Supported inbound message types (matches official plugin converter list)
+    const SUPPORTED_TYPES = new Set([
+      'text', 'image', 'file', 'post', 'interactive',
+      'audio', 'video', 'media', 'sticker',
+      'merge_forward', 'location', 'todo',
+      'share_chat', 'share_user', 'system',
+    ]);
+    if (!SUPPORTED_TYPES.has(messageType)) return;
 
     const chatId = message.chat_id;
     if (!chatId) return;
@@ -545,6 +968,63 @@ export class LarkChannel implements Channel {
       } catch {
         return;
       }
+    } else if (messageType === 'audio') {
+      try {
+        const parsed = JSON.parse(message.content);
+        const fileKey = parsed.file_key;
+        const duration = parsed.duration;
+        const durationStr = duration != null ? ` duration="${Math.ceil(Number(duration) / 1000)}s"` : '';
+        content = fileKey ? `<audio key="${fileKey}"${durationStr}/>` : '[audio]';
+      } catch { content = '[audio]'; }
+    } else if (messageType === 'video' || messageType === 'media') {
+      try {
+        const parsed = JSON.parse(message.content);
+        const fileKey = parsed.file_key;
+        content = fileKey ? `<video key="${fileKey}"/>` : '[video]';
+      } catch { content = '[video]'; }
+    } else if (messageType === 'sticker') {
+      try {
+        const parsed = JSON.parse(message.content);
+        const fileKey = parsed.file_key;
+        content = fileKey ? `<sticker key="${fileKey}"/>` : '[sticker]';
+      } catch { content = '[sticker]'; }
+    } else if (messageType === 'location') {
+      try {
+        const parsed = JSON.parse(message.content);
+        const name = parsed.name ?? '';
+        const lat = parsed.latitude ?? '';
+        const lng = parsed.longitude ?? '';
+        const nameAttr = name ? ` name="${name}"` : '';
+        const coordsAttr = lat && lng ? ` coords="lat:${lat},lng:${lng}"` : '';
+        content = `<location${nameAttr}${coordsAttr}/>`;
+      } catch { content = '[location]'; }
+    } else if (messageType === 'todo') {
+      try {
+        const parsed = JSON.parse(message.content);
+        const title = parsed.summary?.title ?? '';
+        const body = parsed.summary?.content
+          ? (parsed.summary.content as any[][]).map((p: any[]) => p.map((e: any) => e.text || '').join('')).join('\n').trim()
+          : '';
+        const fullTitle = [title, body].filter(Boolean).join('\n');
+        const dueTime = parsed.due_time ? `\nDue: ${new Date(Number(parsed.due_time)).toISOString()}` : '';
+        content = `<todo>\n${fullTitle || '[todo]'}${dueTime}\n</todo>`;
+      } catch { content = '[todo]'; }
+    } else if (messageType === 'share_chat') {
+      try {
+        const parsed = JSON.parse(message.content);
+        content = `<group_card id="${parsed.chat_id ?? ''}"/>`;
+      } catch { content = '[shared group]'; }
+    } else if (messageType === 'share_user') {
+      try {
+        const parsed = JSON.parse(message.content);
+        content = `<contact_card id="${parsed.user_id ?? ''}"/>`;
+      } catch { content = '[shared contact]'; }
+    } else if (messageType === 'interactive') {
+      content = convertInteractiveCard(message.content);
+    } else if (messageType === 'system') {
+      content = '[system message]';
+    } else if (messageType === 'merge_forward') {
+      content = '<forwarded_messages/>';
     }
 
     if (!content && embeddedImageKeys.length === 0) return;
@@ -685,44 +1165,51 @@ export class LarkChannel implements Channel {
     slotKey?: string,
   ): Promise<void> {
     const cardKey = slotKey || jid;
-    const existing = this.streamingCards.get(cardKey);
+
+    // Check if card already registered (pool path sets streamingCards BEFORE sendToChat).
+    // If so, push content immediately — no need to wait for sendToChat to finish.
+    let existing = this.streamingCards.get(cardKey);
+
+    if (!existing) {
+      // Card not yet registered — might be in non-pool creation path.
+      // Wait for beginStreaming to finish to avoid creating a duplicate card.
+      const creationPromise = this.cardCreationPromises.get(cardKey);
+      if (creationPromise) {
+        try { await creationPromise; } catch { /* beginStreaming failed, fall through to create */ }
+      }
+      existing = this.streamingCards.get(cardKey);
+    }
 
     if (existing) {
       const nextSeq = existing.sequence + 1;
 
-      const fullText = mentionUser && nextSeq === 1
-        ? `<at id=${mentionUser.id}></at> ${text}`
-        : text;
-
-      // Push content with typewriter effect (same path for first chunk and subsequent chunks).
-      await this.client.cardkit.v1.cardElement.content({
-        path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
-        data: { content: fullText, sequence: nextSeq },
-      });
+      // Don't embed <at> in streaming content — CardKit replaces the entire
+      // element on each push, so the mention would flash then disappear on
+      // the next update. The card is already sent as a reply, which is enough.
+      const optimized = optimizeMarkdownStyle(text);
+      // Update bookkeeping before the API call so the next streaming tick
+      // sees the correct sequence number even if the request is still in flight.
       existing.sequence = nextSeq;
-      logger.info({ jid, cardKey, cardId: existing.cardId, length: fullText.length }, 'Streaming card text updated');
+      existing.lastContent = text;
+      // Fire-and-forget: don't await the Lark API call — it adds ~200-400ms
+      // of latency per streaming tick, delaying visible text significantly.
+      this.client.cardkit.v1.cardElement.content({
+        path: { card_id: existing.cardId, element_id: STREAMING_ELEMENT_ID },
+        data: { content: optimized, sequence: nextSeq },
+      }).catch((err: unknown) => {
+        logger.warn({ err, cardId: existing!.cardId, seq: nextSeq }, 'Streaming card update failed');
+      });
+      logger.info({ jid, cardKey, cardId: existing.cardId, length: text.length }, 'Streaming card text updated');
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
         ? `<at id=${mentionUser.id}></at> `
         : '';
 
-      const cardJson = {
-        schema: '2.0',
-        config: buildStreamingCardConfig(),
-        body: {
-          elements: [{
-            tag: 'markdown',
-            content: '',
-            element_id: STREAMING_ELEMENT_ID,
-          }],
-        },
-      };
-
       const createResult = await this.client.cardkit.v1.card.create({
         data: {
           type: 'card_json',
-          data: JSON.stringify(cardJson),
+          data: JSON.stringify(buildThinkingCardJson()),
         },
       });
 
@@ -730,7 +1217,9 @@ export class LarkChannel implements Channel {
       if (!cardId) throw new Error('Failed to create card entity');
 
       const fullText = mentionPrefix + text;
-      this.streamingCards.set(cardKey, { cardId, sequence: 1 });
+      // Use stored start time (from beginStreaming) if available, otherwise now
+      const startedAt = streamingStartTimes.get(cardKey) || Date.now();
+      this.streamingCards.set(cardKey, { cardId, sequence: 1, startedAt });
 
       // Parallelize: send card message + push initial text concurrently.
       // The card entity already exists, so both operations are independent.
@@ -739,7 +1228,7 @@ export class LarkChannel implements Channel {
         this.sendToChat(jid, content, 'interactive', replyToMessageId),
         this.client.cardkit.v1.cardElement.content({
           path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
-          data: { content: fullText, sequence: 1 },
+          data: { content: optimizeMarkdownStyle(fullText), sequence: 1 },
         }),
       ]);
 
@@ -749,53 +1238,61 @@ export class LarkChannel implements Channel {
 
   /**
    * Pre-create a streaming card and send it to the chat.
-   * The card shows a placeholder until the first real chunk arrives via sendMessage.
-   * This saves ~3s on first-chunk latency by doing the two API calls (card.create +
-   * sendToChat) while the agent is still initializing.
+   * Uses pre-created card pool when available (skips card.create, saves ~1.5s).
+   * Stores a creation promise so _sendStreaming can await it (prevents race conditions).
    */
   async beginStreaming(
     keyOrJid: string,
-    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } },
+    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; startedAt?: number },
   ): Promise<void> {
-    if (this.streamingCards.has(keyOrJid)) return; // already has a card
-    // Extract the real jid from a slotKey (chatJid::senderId) or use as-is
+    if (this.streamingCards.has(keyOrJid)) return;
+    if (this.cardCreationPromises.has(keyOrJid)) return; // creation already in progress
+
+    // Record start time immediately (before async card creation).
+    // Survives card creation failures so _sendStreaming fallback uses correct time.
+    const startedAt = opts?.startedAt || Date.now();
+    if (!streamingStartTimes.has(keyOrJid)) {
+      streamingStartTimes.set(keyOrJid, startedAt);
+    }
+
     const jid = keyOrJid.includes('::') ? parseSlotKey(keyOrJid).chatJid : keyOrJid;
 
-    const cardJson = {
-      schema: '2.0',
-      config: buildStreamingCardConfig(),
-      body: {
-        elements: [
-          {
-            tag: 'markdown',
-            content: '',
-            element_id: STREAMING_ELEMENT_ID,
-          },
-          buildStatusElement('努力回答中...', LOADING_ELEMENT_ID),
-        ],
-      },
-    };
+    const promise = (async () => {
+      // Try card pool first (pre-created, skips card.create ~1.5s)
+      let cardId = this.cardPool.shift() ?? null;
+      if (cardId) {
+        logger.debug({ cardId, poolRemaining: this.cardPool.length }, 'Using pre-created card from pool');
+        // Refill pool in background
+        this.refillCardPool().catch(() => {});
+      } else {
+        // Pool empty — create on the fly (fallback)
+        const createResult = await this.client.cardkit.v1.card.create({
+          data: { type: 'card_json', data: JSON.stringify(buildThinkingCardJson()) },
+        });
+        cardId = createResult?.data?.card_id ?? null;
+        if (!cardId) throw new Error('Failed to pre-create streaming card');
+      }
 
-    const createResult = await this.client.cardkit.v1.card.create({
-      data: {
-        type: 'card_json',
-        data: JSON.stringify(cardJson),
-      },
-    });
+      this.streamingCards.set(keyOrJid, { cardId, sequence: 0, startedAt });
 
-    const cardId = createResult?.data?.card_id;
-    if (!cardId) throw new Error('Failed to pre-create streaming card');
+      const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+      await this.sendToChat(jid, content, 'interactive', opts?.replyToMessageId);
 
-    this.streamingCards.set(keyOrJid, { cardId, sequence: 0, hasLoadingElement: true });
+      logger.info({ keyOrJid, cardId }, 'Streaming card pre-created');
+    })();
 
-    const content = JSON.stringify({ type: 'card', data: { card_id: cardId } });
-    await this.sendToChat(jid, content, 'interactive', opts?.replyToMessageId);
-
-    logger.info({ keyOrJid, cardId }, 'Streaming card pre-created');
+    this.cardCreationPromises.set(keyOrJid, promise);
+    try {
+      await promise;
+    } finally {
+      this.cardCreationPromises.delete(keyOrJid);
+    }
   }
 
   /**
-   * End the streaming session for a chat: disable streaming mode and clean up.
+   * End the streaming session: close streaming mode, replace with a
+   * "complete" card (wide_screen_mode, footer with elapsed time).
+   * Matches the official Feishu plugin's card lifecycle.
    */
   async endStreaming(keyOrJid: string): Promise<void> {
     const card = this.streamingCards.get(keyOrJid);
@@ -803,42 +1300,34 @@ export class LarkChannel implements Channel {
 
     // Delete from map immediately to prevent concurrent calls from double-firing
     this.streamingCards.delete(keyOrJid);
+    streamingStartTimes.delete(keyOrJid);
 
     try {
+      // Step 1: Close streaming mode (required before card.update)
+      // Payload must be { streaming_mode: false }, NOT nested under config
       card.sequence++;
+      await this.client.cardkit.v1.card.settings({
+        path: { card_id: card.cardId },
+        data: {
+          settings: JSON.stringify({ streaming_mode: false }),
+          sequence: card.sequence,
+        },
+      });
 
-      if (card.hasLoadingElement) {
-        // Replace loading column_set with final disclaimer + disable streaming in one batch
-        const disclaimerElement = buildStatusElement('以上内容由AI生成，仅供参考');
-        const actions = JSON.stringify([
-          {
-            action: 'update_element',
-            params: {
-              element_id: LOADING_ELEMENT_ID,
-              element: JSON.stringify(disclaimerElement),
-            },
-          },
-          {
-            action: 'partial_update_setting',
-            params: {
-              settings: JSON.stringify({ config: { streaming_mode: false } }),
-            },
-          },
-        ]);
-        await this.client.cardkit.v1.card.batchUpdate({
-          path: { card_id: card.cardId },
-          data: { actions, sequence: card.sequence },
-        });
-      } else {
-        await this.client.cardkit.v1.card.settings({
-          path: { card_id: card.cardId },
-          data: {
-            settings: JSON.stringify({ config: { streaming_mode: false } }),
-            sequence: card.sequence,
-          },
-        });
-      }
-      logger.info({ keyOrJid, cardId: card.cardId }, 'Streaming ended');
+      // Step 2: Replace with complete card (matches official buildCompleteCard + toCardKit2)
+      const elapsedMs = Date.now() - card.startedAt;
+      const completeCard = buildCompleteCard(card.lastContent || '', elapsedMs);
+
+      card.sequence++;
+      await this.client.cardkit.v1.card.update({
+        path: { card_id: card.cardId },
+        data: {
+          card: { type: 'card_json', data: JSON.stringify(completeCard) },
+          sequence: card.sequence,
+        },
+      });
+
+      logger.info({ keyOrJid, cardId: card.cardId, elapsedMs }, 'Streaming ended');
     } catch (err) {
       logger.warn({ keyOrJid, err }, 'Failed to end streaming');
     }
@@ -878,6 +1367,7 @@ export class LarkChannel implements Channel {
   async disconnect(): Promise<void> {
     this.connected = false;
     this.streamingCards.clear();
+    streamingStartTimes.clear();
     if (this.dedupTimer) {
       clearInterval(this.dedupTimer);
       this.dedupTimer = undefined;
@@ -916,12 +1406,70 @@ export class LarkChannel implements Channel {
   }
 
   async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
-    await this.client.request({
-      method: 'POST',
-      url: `/open-apis/im/v1/messages/${messageId}/reactions`,
-      data: { reaction_type: { emoji_type: emojiType } },
-    });
+    await withMessageGuard(messageId, () =>
+      this.client.im.messageReaction.create({
+        path: { message_id: messageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      }),
+    );
     logger.info({ messageId, emojiType }, 'Lark reaction added');
+  }
+
+  async removeReaction(_jid: string, messageId: string, reactionId: string): Promise<void> {
+    await this.client.im.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    });
+    logger.info({ messageId, reactionId }, 'Lark reaction removed');
+  }
+
+  async listReactions(_jid: string, messageId: string, emojiType?: string): Promise<Array<{ reactionId: string; emojiType: string; operatorType: string; operatorId: string }>> {
+    const reactions: Array<{ reactionId: string; emojiType: string; operatorType: string; operatorId: string }> = [];
+    let pageToken: string | undefined;
+    let hasMore = true;
+
+    while (hasMore) {
+      const params: Record<string, any> = { page_size: 50 };
+      if (emojiType) params.reaction_type = emojiType;
+      if (pageToken) params.page_token = pageToken;
+
+      const response = await this.client.im.messageReaction.list({
+        path: { message_id: messageId },
+        params,
+      });
+
+      const items = response?.data?.items;
+      if (items && items.length > 0) {
+        for (const item of items) {
+          reactions.push({
+            reactionId: item.reaction_id ?? '',
+            emojiType: item.reaction_type?.emoji_type ?? '',
+            operatorType: item.operator?.operator_type === 'app' ? 'app' : 'user',
+            operatorId: item.operator?.operator_id ?? '',
+          });
+        }
+      }
+      pageToken = response?.data?.page_token ?? undefined;
+      hasMore = response?.data?.has_more === true && !!pageToken;
+    }
+    return reactions;
+  }
+
+  async updateCard(_jid: string, messageId: string, cardJson: object): Promise<void> {
+    await this.client.im.v1.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(cardJson) },
+    });
+    logger.info({ messageId }, 'Lark card updated via PATCH');
+  }
+
+  async forwardMessage(messageId: string, targetJid: string): Promise<void> {
+    const chatId = extractChatId(targetJid);
+    await this.client.im.v1.message.forward({
+      path: { message_id: messageId },
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId },
+    });
+    logger.info({ messageId, targetJid }, 'Lark message forwarded');
   }
 
   /**
@@ -954,9 +1502,12 @@ export class LarkChannel implements Channel {
     const ext = path.extname(fileName).toLowerCase();
     type LarkFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
     const fileTypeMap: Record<string, LarkFileType> = {
-      '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc',
-      '.xls': 'xls', '.xlsx': 'xls', '.ppt': 'ppt', '.pptx': 'ppt',
-      '.mp4': 'mp4',
+      '.opus': 'opus', '.ogg': 'opus',
+      '.mp4': 'mp4', '.mov': 'mp4', '.avi': 'mp4', '.mkv': 'mp4', '.webm': 'mp4',
+      '.pdf': 'pdf',
+      '.doc': 'doc', '.docx': 'doc',
+      '.xls': 'xls', '.xlsx': 'xls', '.csv': 'xls',
+      '.ppt': 'ppt', '.pptx': 'ppt',
     };
     const fileType: LarkFileType = fileTypeMap[ext] || 'stream';
 

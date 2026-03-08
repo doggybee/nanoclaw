@@ -376,6 +376,7 @@ export async function spawnWarmContainer(
   assistantName: string,
   sessionId?: string,
   slotId?: string,
+  model?: string,
 ): Promise<WarmContainerHandle> {
   const groupDir = resolveGroupFolderPath(group.folder);
   cachedMkdir(groupDir);
@@ -404,6 +405,7 @@ export async function spawnWarmContainer(
     isMain,
     assistantName,
     secrets,
+    model,
   };
   container.stdin.write(JSON.stringify(warmInput));
   container.stdin.end();
@@ -414,6 +416,11 @@ export async function spawnWarmContainer(
   let parseBuffer = '';
   let newSessionId: string | undefined;
   let hadStreamingOutput = false;
+
+  // Coalescing: streaming chunks are full-text replacements, so intermediate
+  // ones can be skipped. Only the latest matters at any point in time.
+  let latestStreaming: ContainerOutput | null = null;
+  let streamingSendLoop: Promise<void> | null = null;
 
   // Timeout management
   const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
@@ -448,7 +455,25 @@ export async function spawnWarmContainer(
         hadStreamingOutput = true;
         resetTimeout();
         if (onOutput) {
-          outputChain = outputChain.then(() => onOutput!(parsed));
+          if (parsed.isStreaming) {
+            latestStreaming = parsed;
+            if (!streamingSendLoop) {
+              streamingSendLoop = (async () => {
+                while (latestStreaming) {
+                  const toSend = latestStreaming;
+                  latestStreaming = null;
+                  await onOutput!(toSend);
+                }
+                streamingSendLoop = null;
+              })();
+            }
+          } else {
+            // Non-streaming output (result, session-update) must wait for
+            // streaming to finish, then deliver in order.
+            outputChain = outputChain
+              .then(() => streamingSendLoop || Promise.resolve())
+              .then(() => onOutput!(parsed));
+          }
         }
       } catch (err) {
         logger.warn({ group: group.name, error: err }, 'Failed to parse warm container output');
@@ -466,7 +491,7 @@ export async function spawnWarmContainer(
   const exited = new Promise<ContainerOutput>((resolve) => {
     container.on('close', (code) => {
       clearTimeout(timeout);
-      outputChain.then(() => {
+      outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
         if (timedOut && hadStreamingOutput) {
           resolve({ status: 'success', result: null, newSessionId });
         } else if (timedOut) {
@@ -593,6 +618,11 @@ export async function runContainerAgent(
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
+    // Coalescing: streaming chunks are full-text replacements, so intermediate
+    // ones can be skipped. Only the latest matters at any point in time.
+    let latestStreaming: ContainerOutput | null = null;
+    let streamingSendLoop: Promise<void> | null = null;
+
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
@@ -632,9 +662,25 @@ export async function runContainerAgent(
             hadStreamingOutput = true;
             // Activity detected — reset the hard timeout
             resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            // Coalescing: streaming chunks skip intermediate updates,
+            // non-streaming output (result, session-update) preserves order.
+            if (parsed.isStreaming) {
+              latestStreaming = parsed;
+              if (!streamingSendLoop) {
+                streamingSendLoop = (async () => {
+                  while (latestStreaming) {
+                    const toSend = latestStreaming;
+                    latestStreaming = null;
+                    await onOutput(toSend);
+                  }
+                  streamingSendLoop = null;
+                })();
+              }
+            } else {
+              outputChain = outputChain
+                .then(() => streamingSendLoop || Promise.resolve())
+                .then(() => onOutput(parsed));
+            }
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -727,7 +773,7 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => {
+          outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
             resolve({
               status: 'success',
               result: null,
@@ -829,9 +875,9 @@ export async function runContainerAgent(
         return;
       }
 
-      // Streaming mode: wait for output chain to settle, return completion marker
+      // Streaming mode: wait for output chain and any in-flight streaming to settle
       if (onOutput) {
-        outputChain.then(() => {
+        outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',

@@ -58,9 +58,154 @@ interface SDKUserMessage {
   session_id: string;
 }
 
+/**
+ * Time-based streaming throttle.
+ * First token emits immediately. After that, emits at most once per interval.
+ * Always sends full accumulated text (for card content replacement).
+ */
+class StreamThrottle {
+  private fullText = '';
+  /** Accumulated text from all previous assistant turns (persists across reset). */
+  private allTurnsPrefix = '';
+  private dirty = false;
+  private lastEmitTime = 0;
+  private pending: ReturnType<typeof setTimeout> | null = null;
+  private emitFn: ((text: string) => void) | null = null;
+  private readonly intervalMs: number;
+  // After a long gap (tool call / thinking), batch briefly so the first
+  // visible update contains meaningful text rather than 1-2 characters.
+  private readonly longGapMs = 2000;
+  private readonly batchAfterGapMs = 50;
+
+  constructor(intervalMs = 100) {
+    this.intervalMs = intervalMs;
+  }
+
+  /** Set the callback for emitting text. */
+  onEmit(fn: (text: string) => void): void {
+    this.emitFn = fn;
+  }
+
+  /** Feed a text delta. May emit immediately or schedule a deferred emit. */
+  push(delta: string): void {
+    this.fullText += delta;
+    this.dirty = true;
+
+    const now = Date.now();
+    const elapsed = now - this.lastEmitTime;
+    if (elapsed >= this.intervalMs) {
+      if (this.lastEmitTime > 0 && elapsed > this.longGapMs) {
+        // Long gap — defer to batch enough chars for a meaningful update
+        if (!this.pending) {
+          this.pending = setTimeout(() => {
+            this.pending = null;
+            if (this.dirty) this.emitNow();
+          }, this.batchAfterGapMs);
+        }
+      } else {
+        this.emitNow();
+      }
+    } else if (!this.pending) {
+      const delay = this.intervalMs - elapsed;
+      this.pending = setTimeout(() => {
+        this.pending = null;
+        if (this.dirty) this.emitNow();
+      }, delay);
+    }
+  }
+
+  /** Flush: emit remaining text immediately and cancel any pending timer. */
+  flush(): void {
+    if (this.pending) {
+      clearTimeout(this.pending);
+      this.pending = null;
+    }
+    if (this.dirty) this.emitNow();
+  }
+
+  /** Reset for a new assistant turn — preserves accumulated text across turns. */
+  reset(): void {
+    if (this.pending) {
+      clearTimeout(this.pending);
+      this.pending = null;
+    }
+    // Save current turn's text so next turn's output includes all previous turns
+    if (this.fullText) {
+      this.allTurnsPrefix += (this.allTurnsPrefix ? '\n\n' : '') + this.fullText;
+    }
+    this.fullText = '';
+    this.dirty = false;
+    this.lastEmitTime = 0;
+  }
+
+  /** Whether the current turn has accumulated text (via stream_events). */
+  get hasContent(): boolean {
+    return this.fullText.length > 0;
+  }
+
+  /** Text accumulated from all previous turns (for prepending to direct writes). */
+  get previousTurnsText(): string {
+    return this.allTurnsPrefix;
+  }
+
+  private emitNow(): void {
+    this.dirty = false;
+    this.lastEmitTime = Date.now();
+    // Emit combined text: all previous turns + current turn
+    const combined = this.allTurnsPrefix
+      ? this.allTurnsPrefix + '\n\n' + this.fullText
+      : this.fullText;
+    this.emitFn?.(combined);
+  }
+}
+
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
-const IPC_POLL_MS = 50;
+const IPC_POLL_MS = 50; // fallback only — used when inotify unavailable
+
+// ---------------------------------------------------------------------------
+// IPC watcher — event-driven via inotify (fs.watch), polling fallback
+// ---------------------------------------------------------------------------
+let ipcWatcher: fs.FSWatcher | null = null;
+const ipcWaitResolvers = new Set<() => void>();
+
+function startIpcWatch(): void {
+  fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
+  try {
+    ipcWatcher = fs.watch(IPC_INPUT_DIR, () => {
+      for (const resolve of ipcWaitResolvers) resolve();
+      ipcWaitResolvers.clear();
+    });
+    ipcWatcher.on('error', () => {
+      // inotify failed at runtime — stop watcher, callers fall back to polling
+      ipcWatcher?.close();
+      ipcWatcher = null;
+    });
+    log('IPC: using inotify (fs.watch)');
+  } catch {
+    log('IPC: inotify unavailable, using polling fallback');
+  }
+}
+
+/** Wait for a filesystem event on the IPC directory, or fall back to polling. */
+function waitForIpcEvent(): Promise<void> {
+  if (!ipcWatcher) {
+    return new Promise(r => setTimeout(r, IPC_POLL_MS));
+  }
+  return new Promise(r => {
+    ipcWaitResolvers.add(r);
+    // Safety net: check every 500ms in case inotify misses an event
+    const safety = setTimeout(() => {
+      ipcWaitResolvers.delete(r);
+      r();
+    }, 500);
+    // Override the resolve to also clear the safety timer
+    const originalR = r;
+    ipcWaitResolvers.delete(r);
+    const wrappedR = () => { clearTimeout(safety); originalR(); };
+    ipcWaitResolvers.add(wrappedR);
+  });
+}
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -334,29 +479,36 @@ function drainIpcInput(): IpcMessage[] {
   }
 }
 
+// Messages drained from IPC but not processed (e.g. arrived after result).
+// waitForIpcMessage() checks this first before reading new files.
+let pendingIpcMessages: IpcMessage[] = [];
+
 /**
  * Wait for a new IPC message or _close sentinel.
+ * Uses inotify (fs.watch) for near-instant detection, polling fallback.
  * Returns the combined message (with optional model from first message), or null if _close.
  */
-function waitForIpcMessage(): Promise<IpcMessage | null> {
-  return new Promise((resolve) => {
-    const poll = () => {
-      if (shouldClose()) {
-        resolve(null);
-        return;
-      }
-      const messages = drainIpcInput();
-      if (messages.length > 0) {
-        resolve({
-          text: messages.map(m => m.text).join('\n'),
-          model: messages[0].model,
-        });
-        return;
-      }
-      setTimeout(poll, IPC_POLL_MS);
-    };
-    poll();
-  });
+async function waitForIpcMessage(): Promise<IpcMessage | null> {
+  while (true) {
+    if (shouldClose()) return null;
+    // Check buffered messages first (left over from pollIpcDuringQuery)
+    if (pendingIpcMessages.length > 0) {
+      const msgs = pendingIpcMessages;
+      pendingIpcMessages = [];
+      return {
+        text: msgs.map(m => m.text).join('\n'),
+        model: msgs[0].model,
+      };
+    }
+    const messages = drainIpcInput();
+    if (messages.length > 0) {
+      return {
+        text: messages.map(m => m.text).join('\n'),
+        model: messages[0].model,
+      };
+    }
+    await waitForIpcEvent();
+  }
 }
 
 /**
@@ -374,33 +526,62 @@ async function runQuery(
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
-  stream.push(prompt);
+  // In warm mode (empty prompt), don't push anything yet — let IPC polling
+  // push the first message. The SDK initializes (MCP servers, session loading)
+  // while waiting for the stream to yield, so when the message arrives the
+  // API call starts immediately without the 4-6s init delay.
+  if (prompt) {
+    stream.push(prompt);
+  }
 
-  // Poll IPC for follow-up messages and _close sentinel during the query
+  // Watch IPC for follow-up messages and _close sentinel during the query.
+  // Uses inotify (fs.watch) for near-instant detection, polling fallback.
   let ipcPolling = true;
   let closedDuringQuery = false;
-  const pollIpcDuringQuery = () => {
-    if (!ipcPolling) return;
-    if (shouldClose()) {
-      log('Close sentinel detected during query, ending stream');
-      closedDuringQuery = true;
-      stream.end();
-      ipcPolling = false;
-      return;
+  // Set to true when the SDK emits a result — prevents pushing more IPC
+  // messages into the same query (which would accumulate all turns' text).
+  let queryResultReceived = false;
+  const pollIpcDuringQuery = async () => {
+    while (ipcPolling) {
+      if (shouldClose()) {
+        log('Close sentinel detected during query, ending stream');
+        closedDuringQuery = true;
+        stream.end();
+        ipcPolling = false;
+        return;
+      }
+      const messages = drainIpcInput();
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        const sinceQuery = Date.now() - queryStartTime;
+        log(`[timing] IPC message received at +${sinceQuery}ms (${msg.text.length} chars)`);
+        // Don't push follow-up messages into a query that already produced
+        // a result — buffer them for waitForIpcMessage() in the main loop.
+        if (queryResultReceived) {
+          log('Result already received, buffering IPC message for next query');
+          pendingIpcMessages.push(...messages.slice(i));
+          ipcPolling = false;
+          return;
+        }
+        stream.push(msg.text);
+      }
+      await waitForIpcEvent();
     }
-    const messages = drainIpcInput();
-    for (const msg of messages) {
-      log(`Piping IPC message into active query (${msg.text.length} chars)`);
-      stream.push(msg.text);
-    }
-    setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
-  setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
+  pollIpcDuringQuery().catch((err) => {
+    log(`IPC polling error: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  const queryStartTime = Date.now();
+  let firstTokenTime = 0;
+  const throttle = new StreamThrottle();
+  throttle.onEmit((text) => {
+    writeOutput({ status: 'success', result: text, newSessionId, isStreaming: true });
+  });
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -449,7 +630,7 @@ async function runQuery(
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
-      settingSources: ['project', 'user'],
+      settingSources: [],
       mcpServers: {
         nanoclaw: {
           command: 'node',
@@ -461,6 +642,8 @@ async function runQuery(
           },
         },
       },
+      includePartialMessages: true,
+      thinking: { type: 'disabled' as const },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
@@ -469,32 +652,54 @@ async function runQuery(
   })) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
-    log(`[msg #${messageCount}] type=${msgType}`);
+    if (message.type !== 'stream_event') {
+      log(`[msg #${messageCount}] type=${msgType} (+${Date.now() - queryStartTime}ms)`);
+    }
+
+    // Token-level streaming: emit text deltas with time-based throttle
+    if (message.type === 'stream_event') {
+      if (!firstTokenTime) {
+        firstTokenTime = Date.now();
+        log(`[timing] first stream_event at +${firstTokenTime - queryStartTime}ms from query start`);
+      }
+      const event = (message as { event: { type: string; delta?: { type?: string; text?: string } } }).event;
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) {
+        throttle.push(event.delta.text);
+      }
+      if (event.type === 'content_block_stop' || event.type === 'message_stop') {
+        throttle.flush();
+      }
+      continue;
+    }
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Stream assistant text blocks incrementally for real-time display
-      const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
-      if (content) {
-        const textParts = content
-          .filter((c) => c.type === 'text' && c.text)
-          .map((c) => c.text!);
-        const text = textParts.join('');
-        if (text) {
-          log(`[streaming] assistant text chunk (${text.length} chars)`);
-          writeOutput({
-            status: 'success',
-            result: text,
-            newSessionId,
-            isStreaming: true,
-          });
+      // Flush any pending streaming text before the turn ends
+      throttle.flush();
+      // If stream_event already sent the text, skip redundant output.
+      if (!throttle.hasContent) {
+        const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
+        if (content) {
+          const textParts = content
+            .filter((c) => c.type === 'text' && c.text)
+            .map((c) => c.text!);
+          const text = textParts.join('');
+          if (text) {
+            // Include accumulated text from previous turns
+            const prefix = throttle.previousTurnsText;
+            const combined = prefix ? prefix + '\n\n' + text : text;
+            log(`[streaming] assistant text chunk (${text.length} chars, combined ${combined.length} chars)`);
+            writeOutput({ status: 'success', result: combined, newSessionId, isStreaming: true });
+          }
         }
       }
+      // Reset throttle for next assistant turn (after tool use)
+      throttle.reset();
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
-      log(`Session initialized: ${newSessionId}`);
+      log(`[timing] SDK initialized at +${Date.now() - queryStartTime}ms, session: ${newSessionId}`);
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -504,11 +709,18 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
+      queryResultReceived = true; // Prevent IPC poll from feeding more messages into this query
+      stream.end(); // End the stream so the SDK finishes and the main loop can start a new query
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      // previousTurnsText already contains all streamed assistant turns
+      // (including the last one, saved by reset()). Don't concatenate with
+      // textResult or the last turn's text will appear twice.
+      const prefix = throttle.previousTurnsText;
+      const finalText = prefix || textResult || null;
+      log(`Result #${resultCount}: subtype=${message.subtype}${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
       writeOutput({
         status: 'success',
-        result: textResult || null,
+        result: finalText,
         newSessionId
       });
     }
@@ -548,6 +760,9 @@ async function main(): Promise<void> {
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
+  // Start IPC watcher (inotify-based, polling fallback)
+  startIpcWatch();
+
   // Clean up stale _close sentinel from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
@@ -562,26 +777,11 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.map(m => m.text).join('\n');
   }
 
-  // Warm mode: no prompt provided, wait for first IPC message
+  // Warm mode: no prompt provided — enter query loop immediately.
+  // The SDK pre-initializes (MCP servers, session, settings) while waiting
+  // for the first IPC message, eliminating the 4-6s startup delay.
   if (!prompt) {
-    log('Warm mode: waiting for first IPC message...');
-    const firstMessage = await waitForIpcMessage();
-    if (firstMessage === null) {
-      log('Close sentinel received in warm mode, exiting');
-      return;
-    }
-    log(`Warm mode activated: received first message (${firstMessage.text.length} chars)`);
-    prompt = firstMessage.text;
-    // Apply overrides from warm-up activation message
-    if (firstMessage.model) {
-      containerInput.model = firstMessage.model;
-      log(`Warm mode: using model ${firstMessage.model}`);
-    }
-    // Override session ID with the claiming user's session (not the group-level session from spawn)
-    if (firstMessage.sessionId) {
-      sessionId = firstMessage.sessionId;
-      log(`Warm mode: using session ${firstMessage.sessionId}`);
-    }
+    log('Warm mode: entering query loop with pre-initialized SDK');
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat

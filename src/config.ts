@@ -64,9 +64,9 @@ export const WARM_POOL_SIZE = Math.max(
   parseInt(process.env.WARM_POOL_SIZE || envConfig.WARM_POOL_SIZE || '1', 10) || 0,
 );
 export const CONTAINER_MEMORY =
-  process.env.CONTAINER_MEMORY || envConfig.CONTAINER_MEMORY || '1g';
+  process.env.CONTAINER_MEMORY || envConfig.CONTAINER_MEMORY || '2g';
 export const CONTAINER_CPUS =
-  process.env.CONTAINER_CPUS || envConfig.CONTAINER_CPUS || '0.5';
+  process.env.CONTAINER_CPUS || envConfig.CONTAINER_CPUS || '1';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -90,6 +90,15 @@ const routerEnv = readEnvFile(['MODEL_ROUTER', 'MODEL_FAST', 'MODEL_FULL']);
 export const MODEL_ROUTER = (process.env.MODEL_ROUTER || routerEnv.MODEL_ROUTER || 'off') as 'auto' | 'off';
 export const MODEL_FAST = process.env.MODEL_FAST || routerEnv.MODEL_FAST || '';
 export const MODEL_FULL = process.env.MODEL_FULL || routerEnv.MODEL_FULL || '';
+
+// Session rotation: start a new session when idle or context grows too large.
+// Group CLAUDE.md provides persistent memory across sessions.
+export const SESSION_IDLE_TIMEOUT = parseInt(
+  process.env.SESSION_IDLE_TIMEOUT || '14400000', 10,
+); // 4 hours default
+export const SESSION_MAX_BYTES = parseInt(
+  process.env.SESSION_MAX_BYTES || '2097152', 10,
+); // 2MB default
 
 // Lark configuration
 // LARK_APP_ID and LARK_APP_SECRET are read directly by LarkChannel

@@ -3,9 +3,13 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MODEL_FAST,
   POLL_INTERVAL,
+  SESSION_IDLE_TIMEOUT,
+  SESSION_MAX_BYTES,
   TRIGGER_PATTERN,
   WARM_POOL_SIZE,
 } from './config.js';
@@ -23,6 +27,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  deleteSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -59,6 +64,9 @@ let messageLoopRunning = false;
 // Per-slot reply target: shared between processUserSlot callback and
 // startMessageLoop piping path so piped messages also get reply-to.
 let pendingReplyTo: Record<string, { messageId: string; senderId: string; senderName: string } | undefined> = {};
+
+// Session activity tracking: last time a session was used (epoch ms)
+const sessionLastActivity: Record<string, number> = {};
 
 let lark: LarkChannel;
 const channels: Channel[] = [];
@@ -119,11 +127,11 @@ function warmUpForPool(chatJid: string): void {
   }
 
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  // Use group-level session for warm container (no specific user yet)
-  const sessionId = sessions[group.folder];
+  // No session for warm containers — fresh session means fast SDK init.
+  // Group CLAUDE.md provides cross-session memory.
   const warmSlotId = `${WARM_SENDER_PREFIX}${Date.now()}`;
 
-  spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, sessionId, warmSlotId)
+  spawnWarmContainer(group, chatJid, isMain, ASSISTANT_NAME, undefined, warmSlotId, MODEL_FAST || undefined)
     .then((handle) => {
       warmPool.push({
         handle,
@@ -191,6 +199,23 @@ function loadState(): void {
   }
   sessions = getAllSessions();
   registeredGroups = getAllRegisteredGroups();
+
+  // Seed session activity from JSONL modification times so restarts
+  // don't treat long-idle sessions as "just used".
+  for (const [sKey, sessionId] of Object.entries(sessions)) {
+    const groupFolder = sKey.includes(':') ? sKey.split(':')[0] : sKey;
+    const jsonlPath = path.join(
+      DATA_DIR, 'sessions', groupFolder, '.claude',
+      'projects', '-workspace-group', `${sessionId}.jsonl`,
+    );
+    try {
+      const stat = fs.statSync(jsonlPath);
+      sessionLastActivity[sKey] = stat.mtimeMs;
+    } catch {
+      // File missing — treat as no recent activity
+    }
+  }
+
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -285,6 +310,48 @@ function sessionKey(groupFolder: string, senderId: string): string {
 }
 
 /**
+ * Check if a session should be rotated (idle timeout or size limit).
+ * If so, clear the session ID so the SDK creates a fresh one.
+ * Group CLAUDE.md provides persistent memory across sessions.
+ */
+function maybeRotateSession(sKey: string, groupFolder: string, senderId: string): void {
+  const sessionId = sessions[sKey];
+  if (!sessionId) return;
+
+  const rotate = (reason: string, extra: Record<string, unknown> = {}) => {
+    logger.info({ sessionKey: sKey, sessionId, ...extra }, `Session rotated: ${reason}`);
+    delete sessions[sKey];
+    deleteSession(groupFolder, senderId);
+  };
+
+  // Check idle timeout
+  const lastActive = sessionLastActivity[sKey];
+  if (lastActive && SESSION_IDLE_TIMEOUT > 0) {
+    const idleMs = Date.now() - lastActive;
+    if (idleMs > SESSION_IDLE_TIMEOUT) {
+      rotate('idle timeout exceeded', { idleHours: (idleMs / 3600000).toFixed(1) });
+      return;
+    }
+  }
+
+  // Check file size
+  if (SESSION_MAX_BYTES > 0) {
+    const jsonlPath = path.join(
+      DATA_DIR, 'sessions', groupFolder, '.claude',
+      'projects', '-workspace-group', `${sessionId}.jsonl`,
+    );
+    try {
+      const stat = fs.statSync(jsonlPath);
+      if (stat.size > SESSION_MAX_BYTES) {
+        rotate('size limit exceeded', { sizeMB: (stat.size / 1048576).toFixed(1) });
+      }
+    } catch {
+      // File doesn't exist or can't be read — skip size check
+    }
+  }
+}
+
+/**
  * Process all pending messages for a user slot in a group.
  * Called by the GroupQueue when it's this slot's turn.
  */
@@ -332,6 +399,10 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
   // Select model based on message complexity
   const model = selectModel(relevantMessages);
 
+  // Rotate session if idle too long or context too large
+  const sKey = sessionKey(group.folder, senderId);
+  maybeRotateSession(sKey, group.folder, senderId);
+
   // Advance cursor for this slot
   const previousCursor = lastAgentTimestamp[slotKey] || '';
   lastAgentTimestamp[slotKey] =
@@ -361,11 +432,14 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
   await channel.setTyping?.(chatJid, true);
 
   // Pre-create streaming card (using slotKey for isolation)
+  // Use the earliest message timestamp as start time for accurate elapsed display
+  const messageReceivedAt = new Date(senderMessages[0].timestamp).getTime();
+  const streamingStartedAt = Number.isFinite(messageReceivedAt) ? messageReceivedAt : Date.now();
   const replyTarget = pendingReplyTo[slotKey];
   if (channel.beginStreaming) {
     channel.beginStreaming(slotKey, replyTarget
-      ? { replyToMessageId: replyTarget.messageId, mentionUser: { id: replyTarget.senderId, name: replyTarget.senderName } }
-      : undefined,
+      ? { replyToMessageId: replyTarget.messageId, mentionUser: { id: replyTarget.senderId, name: replyTarget.senderName }, startedAt: streamingStartedAt }
+      : { startedAt: streamingStartedAt },
     ).catch((err) => {
       logger.warn({ slotKey, err }, 'Failed to pre-create streaming card, will create on first chunk');
     });
@@ -431,6 +505,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
         { group: group.name, senderId },
         'Agent error after output was sent, skipping cursor rollback to prevent duplicates',
       );
+      sessionLastActivity[sKey] = Date.now();
       return true;
     }
     lastAgentTimestamp[slotKey] = previousCursor;
@@ -442,6 +517,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
     return false;
   }
 
+  sessionLastActivity[sKey] = Date.now();
   return true;
 }
 
@@ -455,7 +531,7 @@ async function runAgent(
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sKey = sessionKey(group.folder, senderId);
-  const sessionId = sessions[sKey] || sessions[group.folder];
+  const sessionId = sessions[sKey];
   const slotKey = makeSlotKey(chatJid, senderId);
 
   // Update tasks snapshot
@@ -632,6 +708,17 @@ async function startMessageLoop(): Promise<void> {
               saveState();
               // Update reply target
               pendingReplyTo[slotKey] = findReplyTarget(senderMsgs, needsTrigger);
+              // Pre-create streaming card for the piped message
+              // (same as processSlotMessages does for fresh containers)
+              const pipeReplyTarget = pendingReplyTo[slotKey];
+              if (channel.beginStreaming) {
+                channel.beginStreaming(slotKey, pipeReplyTarget
+                  ? { replyToMessageId: pipeReplyTarget.messageId, mentionUser: { id: pipeReplyTarget.senderId, name: pipeReplyTarget.senderName } }
+                  : undefined,
+                ).catch((err) => {
+                  logger.warn({ slotKey, err }, 'Failed to pre-create streaming card, will create on first chunk');
+                });
+              }
               // Show typing indicator
               channel
                 .setTyping?.(chatJid, true)
