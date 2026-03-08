@@ -18,6 +18,8 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { larkAvailable, larkClient } from './lark-client.js';
+import { ReplySession } from './lark/reply-session.js';
 
 interface ContainerInput {
   prompt: string;
@@ -30,6 +32,8 @@ interface ContainerInput {
   secrets?: Record<string, string>;
   /** Override model for this run (from model router). */
   model?: string;
+  /** User message ID for reply threading and typing indicator. */
+  replyToMessageId?: string;
 }
 
 interface ContainerOutput {
@@ -37,7 +41,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
-  isStreaming?: boolean;
+  outputDelivered?: boolean;
 }
 
 interface SessionEntry {
@@ -59,104 +63,43 @@ interface SDKUserMessage {
 }
 
 /**
- * Time-based streaming throttle.
- * First token emits immediately. After that, emits at most once per interval.
- * Always sends full accumulated text (for card content replacement).
+ * Simple text accumulator for cross-turn text assembly.
+ * No time-based throttling — ReplySession handles that internally.
  */
-class StreamThrottle {
-  private fullText = '';
-  /** Accumulated text from all previous assistant turns (persists across reset). */
-  private allTurnsPrefix = '';
-  private dirty = false;
-  private lastEmitTime = 0;
-  private pending: ReturnType<typeof setTimeout> | null = null;
-  private emitFn: ((text: string) => void) | null = null;
-  private readonly intervalMs: number;
-  // After a long gap (tool call / thinking), batch briefly so the first
-  // visible update contains meaningful text rather than 1-2 characters.
-  private readonly longGapMs = 2000;
-  private readonly batchAfterGapMs = 50;
+class TextAccumulator {
+  private currentTurn = '';
+  private allTurns = '';
 
-  constructor(intervalMs = 100) {
-    this.intervalMs = intervalMs;
+  push(delta: string): void { this.currentTurn += delta; }
+
+  /** Full text: all previous turns + current turn. */
+  get fullText(): string {
+    return this.allTurns
+      ? this.allTurns + '\n\n' + this.currentTurn
+      : this.currentTurn;
   }
 
-  /** Set the callback for emitting text. */
-  onEmit(fn: (text: string) => void): void {
-    this.emitFn = fn;
+  /** Final text (at query end). Returns null if no content. */
+  get finalText(): string | null {
+    const combined = this.allTurns
+      ? this.allTurns + (this.currentTurn ? '\n\n' + this.currentTurn : '')
+      : this.currentTurn;
+    return combined || null;
   }
 
-  /** Feed a text delta. May emit immediately or schedule a deferred emit. */
-  push(delta: string): void {
-    this.fullText += delta;
-    this.dirty = true;
-
-    const now = Date.now();
-    const elapsed = now - this.lastEmitTime;
-    if (elapsed >= this.intervalMs) {
-      if (this.lastEmitTime > 0 && elapsed > this.longGapMs) {
-        // Long gap — defer to batch enough chars for a meaningful update
-        if (!this.pending) {
-          this.pending = setTimeout(() => {
-            this.pending = null;
-            if (this.dirty) this.emitNow();
-          }, this.batchAfterGapMs);
-        }
-      } else {
-        this.emitNow();
-      }
-    } else if (!this.pending) {
-      const delay = this.intervalMs - elapsed;
-      this.pending = setTimeout(() => {
-        this.pending = null;
-        if (this.dirty) this.emitNow();
-      }, delay);
-    }
-  }
-
-  /** Flush: emit remaining text immediately and cancel any pending timer. */
-  flush(): void {
-    if (this.pending) {
-      clearTimeout(this.pending);
-      this.pending = null;
-    }
-    if (this.dirty) this.emitNow();
-  }
-
-  /** Reset for a new assistant turn — preserves accumulated text across turns. */
+  /** Called when an assistant turn ends — archives current turn text. */
   reset(): void {
-    if (this.pending) {
-      clearTimeout(this.pending);
-      this.pending = null;
+    if (this.currentTurn) {
+      this.allTurns += (this.allTurns ? '\n\n' : '') + this.currentTurn;
     }
-    // Save current turn's text so next turn's output includes all previous turns
-    if (this.fullText) {
-      this.allTurnsPrefix += (this.allTurnsPrefix ? '\n\n' : '') + this.fullText;
-    }
-    this.fullText = '';
-    this.dirty = false;
-    this.lastEmitTime = 0;
+    this.currentTurn = '';
   }
 
-  /** Whether the current turn has accumulated text (via stream_events). */
-  get hasContent(): boolean {
-    return this.fullText.length > 0;
-  }
+  get hasContent(): boolean { return this.currentTurn.length > 0; }
+}
 
-  /** Text accumulated from all previous turns (for prepending to direct writes). */
-  get previousTurnsText(): string {
-    return this.allTurnsPrefix;
-  }
-
-  private emitNow(): void {
-    this.dirty = false;
-    this.lastEmitTime = Date.now();
-    // Emit combined text: all previous turns + current turn
-    const combined = this.allTurnsPrefix
-      ? this.allTurnsPrefix + '\n\n' + this.fullText
-      : this.fullText;
-    this.emitFn?.(combined);
-  }
+function extractChatId(jid: string): string {
+  return jid.replace(/^lark:/, '');
 }
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -193,16 +136,12 @@ function waitForIpcEvent(): Promise<void> {
     return new Promise(r => setTimeout(r, IPC_POLL_MS));
   }
   return new Promise(r => {
-    ipcWaitResolvers.add(r);
-    // Safety net: check every 500ms in case inotify misses an event
-    const safety = setTimeout(() => {
-      ipcWaitResolvers.delete(r);
-      r();
-    }, 500);
-    // Override the resolve to also clear the safety timer
-    const originalR = r;
-    ipcWaitResolvers.delete(r);
-    const wrappedR = () => { clearTimeout(safety); originalR(); };
+    // Build wrapped resolver BEFORE adding to the set to avoid a race where
+    // fs.watch fires between add(r) and the swap to wrappedR, which would
+    // call the original r without clearing the safety timer.
+    let safety: ReturnType<typeof setTimeout>;
+    const wrappedR = () => { clearTimeout(safety); r(); };
+    safety = setTimeout(wrappedR, 500);
     ipcWaitResolvers.add(wrappedR);
   });
 }
@@ -446,6 +385,7 @@ interface IpcMessage {
   text: string;
   model?: string;
   sessionId?: string;
+  replyToMessageId?: string;
 }
 
 /**
@@ -465,7 +405,12 @@ function drainIpcInput(): IpcMessage[] {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push({ text: data.text, model: data.model, sessionId: data.sessionId });
+          messages.push({
+            text: data.text,
+            model: data.model,
+            sessionId: data.sessionId,
+            replyToMessageId: data.replyToMessageId,
+          });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -498,6 +443,7 @@ async function waitForIpcMessage(): Promise<IpcMessage | null> {
       return {
         text: msgs.map(m => m.text).join('\n'),
         model: msgs[0].model,
+        replyToMessageId: msgs[0].replyToMessageId,
       };
     }
     const messages = drainIpcInput();
@@ -505,6 +451,7 @@ async function waitForIpcMessage(): Promise<IpcMessage | null> {
       return {
         text: messages.map(m => m.text).join('\n'),
         model: messages[0].model,
+        replyToMessageId: messages[0].replyToMessageId,
       };
     }
     await waitForIpcEvent();
@@ -516,6 +463,11 @@ async function waitForIpcMessage(): Promise<IpcMessage | null> {
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
  * allowing agent teams subagents to run to completion.
  * Also pipes IPC messages into the stream during the query.
+ *
+ * Streaming output is handled by ReplySession (when larkAvailable):
+ * text deltas are pushed to TextAccumulator then forwarded to ReplySession
+ * which manages CardKit streaming cards directly via the Lark API.
+ * writeOutput is only called once at result time.
  */
 async function runQuery(
   prompt: string,
@@ -523,6 +475,7 @@ async function runQuery(
   mcpServerPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
+  replySession: ReplySession | null,
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
@@ -555,13 +508,23 @@ async function runQuery(
         const msg = messages[i];
         const sinceQuery = Date.now() - queryStartTime;
         log(`[timing] IPC message received at +${sinceQuery}ms (${msg.text.length} chars)`);
-        // Don't push follow-up messages into a query that already produced
-        // a result — buffer them for waitForIpcMessage() in the main loop.
         if (queryResultReceived) {
           log('Result already received, buffering IPC message for next query');
           pendingIpcMessages.push(...messages.slice(i));
           ipcPolling = false;
           return;
+        }
+        // Lazy ReplySession creation: first IPC message provides replyToMessageId.
+        // In warm mode, this runs in parallel with SDK init (MCP servers etc.).
+        if (!replySession && larkAvailable && msg.replyToMessageId) {
+          const chatId = extractChatId(containerInput.chatJid);
+          replySession = new ReplySession(larkClient, chatId, {
+            replyToMessageId: msg.replyToMessageId,
+            startedAt: Date.now(),
+          });
+          log(`ReplySession: lazy-created for chatId=${chatId} replyToMessageId=${msg.replyToMessageId}`);
+          replySession.ensureCardCreated().catch(() => {});
+          startStreamingTimer();
         }
         stream.push(msg.text);
       }
@@ -578,10 +541,29 @@ async function runQuery(
   let resultCount = 0;
   const queryStartTime = Date.now();
   let firstTokenTime = 0;
-  const throttle = new StreamThrottle();
-  throttle.onEmit((text) => {
-    writeOutput({ status: 'success', result: text, newSessionId, isStreaming: true });
-  });
+  let streamEventCount = 0;
+  const accumulator = new TextAccumulator();
+
+  // Timer-based streaming flush: instead of calling pushContent() on every
+  // stream_event (which floods the event loop with microtasks and delays API
+  // response callbacks), we check every 100ms if content changed and flush once.
+  let lastFlushedText = '';
+  let streamingTimer: ReturnType<typeof setInterval> | null = null;
+  const startStreamingTimer = () => {
+    if (streamingTimer || !replySession) return;
+    const session = replySession; // capture for closure
+    streamingTimer = setInterval(() => {
+      const text = accumulator.fullText;
+      if (text && text !== lastFlushedText) {
+        lastFlushedText = text;
+        session.pushContent(text);
+      }
+    }, 100);
+  };
+  // Start timer immediately if ReplySession was pre-created (non-warm mode)
+  if (replySession) {
+    startStreamingTimer();
+  }
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -639,6 +621,10 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            ...(process.env.LARK_APP_ID ? { LARK_APP_ID: process.env.LARK_APP_ID } : {}),
+            ...(process.env.LARK_APP_SECRET ? { LARK_APP_SECRET: process.env.LARK_APP_SECRET } : {}),
+            ...(process.env.LARK_DOMAIN ? { LARK_DOMAIN: process.env.LARK_DOMAIN } : {}),
+            ...(containerInput.isScheduledTask ? { NANOCLAW_IS_TASK: '1' } : {}),
           },
         },
       },
@@ -656,45 +642,26 @@ async function runQuery(
       log(`[msg #${messageCount}] type=${msgType} (+${Date.now() - queryStartTime}ms)`);
     }
 
-    // Token-level streaming: emit text deltas with time-based throttle
+    // Token-level streaming: push text deltas to accumulator, forward to ReplySession
     if (message.type === 'stream_event') {
+      streamEventCount++;
       if (!firstTokenTime) {
         firstTokenTime = Date.now();
         log(`[timing] first stream_event at +${firstTokenTime - queryStartTime}ms from query start`);
       }
       const event = (message as { event: { type: string; delta?: { type?: string; text?: string } } }).event;
       if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) {
-        throttle.push(event.delta.text);
-      }
-      if (event.type === 'content_block_stop' || event.type === 'message_stop') {
-        throttle.flush();
+        accumulator.push(event.delta.text);
+        // Streaming flush handled by streamingTimer (100ms interval) —
+        // not here, to avoid flooding the event loop with microtasks.
       }
       continue;
     }
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Flush any pending streaming text before the turn ends
-      throttle.flush();
-      // If stream_event already sent the text, skip redundant output.
-      if (!throttle.hasContent) {
-        const content = (message as { message?: { content?: Array<{ type: string; text?: string }> } }).message?.content;
-        if (content) {
-          const textParts = content
-            .filter((c) => c.type === 'text' && c.text)
-            .map((c) => c.text!);
-          const text = textParts.join('');
-          if (text) {
-            // Include accumulated text from previous turns
-            const prefix = throttle.previousTurnsText;
-            const combined = prefix ? prefix + '\n\n' + text : text;
-            log(`[streaming] assistant text chunk (${text.length} chars, combined ${combined.length} chars)`);
-            writeOutput({ status: 'success', result: combined, newSessionId, isStreaming: true });
-          }
-        }
-      }
-      // Reset throttle for next assistant turn (after tool use)
-      throttle.reset();
+      // Archive current turn text for cross-turn accumulation
+      accumulator.reset();
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -711,24 +678,77 @@ async function runQuery(
       resultCount++;
       queryResultReceived = true; // Prevent IPC poll from feeding more messages into this query
       stream.end(); // End the stream so the SDK finishes and the main loop can start a new query
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      // previousTurnsText already contains all streamed assistant turns
-      // (including the last one, saved by reset()). Don't concatenate with
-      // textResult or the last turn's text will appear twice.
-      const prefix = throttle.previousTurnsText;
-      const finalText = prefix || textResult || null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
-      writeOutput({
-        status: 'success',
-        result: finalText,
-        newSessionId
-      });
+
+      // Stop the streaming timer — flush final content synchronously below
+      if (streamingTimer) {
+        clearInterval(streamingTimer);
+        streamingTimer = null;
+      }
+
+      const finalText = accumulator.finalText;
+      const isError = message.subtype !== 'success';
+
+      // Finalize ReplySession (completes the streaming card)
+      if (replySession) {
+        // Push final content before finalizing (timer may not have caught the last delta)
+        if (finalText && finalText !== lastFlushedText) {
+          replySession.pushContent(finalText);
+        }
+        await replySession.finalize({ isError });
+        const delivered = replySession.outputDelivered;
+        log(`Result #${resultCount}: subtype=${message.subtype} outputDelivered=${delivered}${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
+        writeOutput({
+          status: isError ? 'error' : 'success',
+          result: delivered ? null : finalText,
+          newSessionId,
+          outputDelivered: delivered,
+          ...(isError ? { error: finalText || 'Agent returned error' } : {}),
+        });
+      } else {
+        // No ReplySession (scheduled task, or lark not available) — send text via host
+        log(`Result #${resultCount}: subtype=${message.subtype} (no ReplySession)${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
+        writeOutput({
+          status: isError ? 'error' : 'success',
+          result: finalText,
+          newSessionId,
+          outputDelivered: false,
+          ...(isError ? { error: finalText || 'Agent returned error' } : {}),
+        });
+      }
     }
   }
 
   ipcPolling = false;
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
+  if (streamingTimer) {
+    clearInterval(streamingTimer);
+    streamingTimer = null;
+  }
+  // Cleanup lazy-created ReplySession (warm mode creates it inside runQuery)
+  if (replySession) {
+    replySession.destroy();
+    log('ReplySession: destroyed (end of runQuery)');
+  }
+  log(`Query done. Messages: ${messageCount}, streamEvents: ${streamEventCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
+}
+
+/**
+ * Create a ReplySession if Lark is available.
+ * Container handles all message sending — host only tracks state.
+ */
+function createReplySession(containerInput: ContainerInput, replyToMessageId?: string): ReplySession | null {
+  if (!larkAvailable) {
+    log(`ReplySession: skipped (larkAvailable=${larkAvailable})`);
+    return null;
+  }
+
+  const chatId = extractChatId(containerInput.chatJid);
+  const session = new ReplySession(larkClient, chatId, {
+    replyToMessageId,
+    startedAt: Date.now(),
+  });
+  log(`ReplySession: created for chatId=${chatId} replyToMessageId=${replyToMessageId || 'none'}`);
+  return session;
 }
 
 async function main(): Promise<void> {
@@ -738,6 +758,7 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
     log(`Received input for group: ${containerInput.groupFolder}`);
+    log(`Lark available: ${larkAvailable}`);
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -784,13 +805,32 @@ async function main(): Promise<void> {
     log('Warm mode: entering query loop with pre-initialized SDK');
   }
 
-  // Query loop: run query → wait for IPC message → run new query → repeat
+  // Determine initial replyToMessageId (from ContainerInput or drained IPC messages)
+  let currentReplyToMessageId = containerInput.replyToMessageId
+    || (pending.length > 0 ? pending[0].replyToMessageId : undefined);
+
+  // Query loop: run query -> wait for IPC message -> run new query -> repeat
   let resumeAt: string | undefined;
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      // Warm mode: DON'T wait for IPC — call runQuery immediately with empty prompt.
+      // SDK initializes (MCP servers, session) in parallel with IPC waiting.
+      // ReplySession is created lazily inside runQuery when the first IPC message arrives.
+
+      // For non-warm mode (prompt available): create ReplySession eagerly
+      const replySession = prompt
+        ? createReplySession(containerInput, currentReplyToMessageId)
+        : null; // warm mode: lazy creation inside runQuery
+
+      if (replySession) {
+        replySession.ensureCardCreated().catch(() => {});
+      }
+
+      const queryResult = await runQuery(prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv, replySession, resumeAt);
+      // ReplySession cleanup is handled inside runQuery
+
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -820,6 +860,7 @@ async function main(): Promise<void> {
 
       log(`Got new message (${nextMessage.text.length} chars), starting new query`);
       prompt = nextMessage.text;
+      currentReplyToMessageId = nextMessage.replyToMessageId;
       if (nextMessage.model) {
         containerInput.model = nextMessage.model;
       }

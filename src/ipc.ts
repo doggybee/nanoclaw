@@ -10,55 +10,12 @@ import {
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
+import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { ChatHistoryMessage, RegisteredGroup } from './types.js';
-
-/**
- * Resolve a container-internal path to the corresponding host path.
- * Supported container mount prefixes:
- *   /workspace/group/  → groups/{folder}/
- *   /workspace/project/ → project root (read-only)
- */
-function resolveContainerPath(containerPath: string, groupFolder: string): string {
-  if (containerPath.startsWith('/workspace/group/')) {
-    const relative = containerPath.slice('/workspace/group/'.length);
-    const groupDir = resolveGroupFolderPath(groupFolder);
-    const resolved = path.resolve(groupDir, relative);
-    if (!resolved.startsWith(groupDir + path.sep) && resolved !== groupDir) {
-      throw new Error(`Path escapes group directory: ${containerPath}`);
-    }
-    return resolved;
-  }
-
-  if (containerPath.startsWith('/workspace/project/')) {
-    const relative = containerPath.slice('/workspace/project/'.length);
-    const projectRoot = process.cwd();
-    const resolved = path.resolve(projectRoot, relative);
-    if (!resolved.startsWith(projectRoot + path.sep) && resolved !== projectRoot) {
-      throw new Error(`Path escapes project directory: ${containerPath}`);
-    }
-    return resolved;
-  }
-
-  if (containerPath.startsWith('/tmp/') || containerPath.startsWith('/home/')) {
-    throw new Error(
-      `Container path "${containerPath}" is not host-accessible. ` +
-      `Files must be saved to /workspace/group/ (e.g. /workspace/group/tmp/) to be sendable.`,
-    );
-  }
-
-  throw new Error(`Unsupported container path: ${containerPath}`);
-}
+import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
-  addReaction?: (jid: string, messageId: string, emojiType: string) => Promise<void>;
-  sendImage?: (jid: string, imagePath: string) => Promise<void>;
-  sendFile?: (jid: string, filePath: string) => Promise<void>;
-  editMessage?: (jid: string, messageId: string, text: string) => Promise<void>;
-  getChatHistory?: (jid: string, count: number, beforeTimestamp?: string) => Promise<ChatHistoryMessage[]>;
-  sendCard?: (jid: string, cardJson: object, replyToMessageId?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -85,130 +42,39 @@ function isAuthorized(
   return !!target && target.folder === sourceGroup;
 }
 
-/** Write an IPC response file atomically. */
-function writeIpcResponse(responsePath: string, data: object): void {
-  const dir = path.dirname(responsePath);
-  fs.mkdirSync(dir, { recursive: true });
-  const tempPath = `${responsePath}.tmp`;
-  fs.writeFileSync(tempPath, JSON.stringify(data));
-  fs.renameSync(tempPath, responsePath);
-}
-
 /**
- * Process a single IPC message. Returns void; errors are thrown to caller.
+ * Process a single IPC message. Only handles send_message as fallback.
+ * All other Lark tools (add_reaction, edit_message, send_image, etc.) are
+ * handled directly by the container's MCP server via the Lark SDK.
  */
 async function processIpcMessage(
   data: any,
   sourceGroup: string,
   isMain: boolean,
   deps: IpcDeps,
-  ipcBaseDir: string,
-  slotId?: string,
+  _ipcBaseDir: string,
+  _slotId?: string,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
   const { type, chatJid } = data;
 
   if (!chatJid) return;
 
-  // --- Fire-and-forget message types (authorization required) ---
   if (!isAuthorized(isMain, sourceGroup, chatJid, registeredGroups)) {
     logger.warn({ type, chatJid, sourceGroup }, `Unauthorized IPC ${type} attempt blocked`);
     return;
   }
 
   switch (type) {
-    case 'add_reaction': {
-      if (!data.messageId || !data.emojiType) return;
-      if (!deps.addReaction) {
-        logger.warn({ chatJid, sourceGroup }, 'addReaction not available on channel');
-        return;
-      }
-      await deps.addReaction(chatJid, data.messageId, data.emojiType);
-      logger.info({ chatJid, messageId: data.messageId, emojiType: data.emojiType, sourceGroup }, 'IPC reaction added');
-      return;
-    }
-
-    case 'edit_message': {
-      if (!data.messageId || !data.text) return;
-      if (!deps.editMessage) {
-        logger.warn({ chatJid, sourceGroup }, 'editMessage not available on channel');
-        return;
-      }
-      await deps.editMessage(chatJid, data.messageId, data.text);
-      logger.info({ chatJid, messageId: data.messageId, sourceGroup }, 'IPC message edited');
-      return;
-    }
-
-    case 'send_image': {
-      if (!data.imagePath) return;
-      if (!deps.sendImage) {
-        logger.warn({ chatJid, sourceGroup }, 'sendImage not available on channel');
-        return;
-      }
-      const hostPath = resolveContainerPath(data.imagePath, sourceGroup);
-      await deps.sendImage(chatJid, hostPath);
-      logger.info({ chatJid, imagePath: hostPath, sourceGroup }, 'IPC image sent');
-      return;
-    }
-
-    case 'send_file': {
-      if (!data.filePath) return;
-      if (!deps.sendFile) {
-        logger.warn({ chatJid, sourceGroup }, 'sendFile not available on channel');
-        return;
-      }
-      const hostPath = resolveContainerPath(data.filePath, sourceGroup);
-      await deps.sendFile(chatJid, hostPath);
-      logger.info({ chatJid, filePath: hostPath, sourceGroup }, 'IPC file sent');
-      return;
-    }
-
-    case 'send_card': {
-      if (!data.cardJson) return;
-      if (!deps.sendCard) {
-        logger.warn({ chatJid, sourceGroup }, 'sendCard not available on channel');
-        return;
-      }
-      await deps.sendCard(chatJid, data.cardJson, data.replyToMessageId);
-      logger.info({ chatJid, sourceGroup }, 'IPC card sent');
-      return;
-    }
-
-    case 'get_chat_history': {
-      if (!data.requestId) return;
-      // Write response to the slot's responses dir if slotId is present,
-      // otherwise fall back to group-level responses dir.
-      const groupIpcDir = path.join(ipcBaseDir, sourceGroup);
-      const effectiveSlotId = slotId || data.slotId;
-      const responseBase = effectiveSlotId
-        ? path.join(groupIpcDir, 'slots', effectiveSlotId, 'responses')
-        : path.join(groupIpcDir, 'responses');
-      // Sanitize: ensure response path stays within the group's IPC directory
-      const sanitizedRequestId = String(data.requestId).replace(/[^a-zA-Z0-9_-]/g, '_');
-      const responsePath = path.resolve(responseBase, `${sanitizedRequestId}.json`);
-      const rel = path.relative(groupIpcDir, responsePath);
-      if (rel.startsWith('..') || path.isAbsolute(rel)) {
-        logger.warn({ sourceGroup, slotId: data.slotId, requestId: data.requestId }, 'IPC response path escapes group directory');
-        return;
-      }
-      if (!deps.getChatHistory) {
-        logger.warn({ chatJid, sourceGroup }, 'getChatHistory not available on channel');
-        writeIpcResponse(responsePath, { status: 'error', error: 'getChatHistory not available on this channel' });
-        return;
-      }
-      try {
-        const messages = await deps.getChatHistory(chatJid, data.count || 20, data.beforeTimestamp || undefined);
-        writeIpcResponse(responsePath, { status: 'ok', messages });
-        logger.info({ chatJid, count: messages.length, requestId: data.requestId, sourceGroup }, 'IPC chat history fetched');
-      } catch (err) {
-        writeIpcResponse(responsePath, { status: 'error', error: String(err) });
-        logger.error({ err, requestId: data.requestId, sourceGroup }, 'IPC chat history fetch failed');
-      }
+    case 'send_message': {
+      if (!data.text) return;
+      await deps.sendMessage(chatJid, data.text);
+      logger.info({ chatJid, sourceGroup, textLen: data.text.length }, 'IPC send_message (fallback)');
       return;
     }
 
     default:
-      // Unknown message type — silently ignore (may be a future type)
+      // Unknown or removed message type — silently ignore
       return;
   }
 }

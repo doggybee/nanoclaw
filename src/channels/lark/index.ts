@@ -1,9 +1,10 @@
 /**
  * Lark (Feishu) channel — webhook-based integration.
  *
- * Refactored to follow the official @larksuiteoapi/feishu-openclaw-plugin
- * architecture: modular CardKit operations, lazy card creation via
- * ensureCardCreated(), and per-slot ReplySession lifecycle management.
+ * Lightweight host-side channel: handles inbound message parsing, webhook
+ * events, and text fallback sending. All streaming cards, reactions, file
+ * sending, and other rich interactions are handled directly by the container
+ * agent via the Lark SDK.
  */
 import * as fs from 'fs';
 import * as http from 'http';
@@ -13,26 +14,19 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../../config.js';
 import { updateChatNamesBatch } from '../../db.js';
 import { readEnvFile } from '../../env.js';
-import { parseSlotKey } from '../../group-queue.js';
 import { logger } from '../../logger.js';
 import {
   Channel,
-  ChatHistoryMessage,
   OnInboundMessage,
   OnChatMetadata,
-  RegisteredGroup,
 } from '../../types.js';
 
-import { createCardEntity, sendCardByCardId, updateCardKitCard } from './cardkit.js';
-import { buildThinkingCardJson, buildCompleteCard, STREAMING_ELEMENT_ID } from './card-builder.js';
 import { optimizeMarkdownStyle } from './markdown-style.js';
 import {
   withMessageGuard,
   MessageUnavailableError,
   formatLarkError,
-  extractLarkApiCode,
 } from './message-guard.js';
-import { ReplySession } from './reply-session.js';
 
 // Re-export for external consumers
 export { LarkChannel };
@@ -44,7 +38,6 @@ const MAX_TEXT_LENGTH = 4000;
 const MAX_OUTGOING_QUEUE = 1000;
 const DEDUP_TTL_MS = 10 * 60 * 1000;
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
-const CARD_POOL_SIZE = 2;
 
 const SUPPORTED_MESSAGE_TYPES = new Set([
   'text', 'image', 'file', 'post', 'interactive',
@@ -69,7 +62,7 @@ export interface LarkChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   onCardAction?: OnCardAction;
-  registeredGroups: () => Record<string, RegisteredGroup>;
+  registeredGroups: () => Record<string, import('../../types.js').RegisteredGroup>;
 }
 
 // ---------------------------------------------------------------------------
@@ -231,13 +224,6 @@ class LarkChannel implements Channel {
   private seenMessages = new Map<string, number>();
   private dedupTimer: ReturnType<typeof setInterval> | undefined;
 
-  /** Per-slot reply sessions — manages streaming card lifecycle. */
-  private sessions = new Map<string, ReplySession>();
-
-  /** Pre-created CardKit card IDs — shared pool across sessions. */
-  private cardPool: string[] = [];
-  private cardPoolRefilling = false;
-
   private appId: string;
   private appSecret: string;
   private opts: LarkChannelOpts;
@@ -256,33 +242,6 @@ class LarkChannel implements Channel {
       domain: Lark.Domain.Lark,
     });
     this.dedupTimer = setInterval(() => this.cleanupDedup(), DEDUP_CLEANUP_INTERVAL_MS);
-  }
-
-  // ---- Card pool management ----
-
-  private async createThinkingCard(): Promise<string | null> {
-    return createCardEntity(this.client, buildThinkingCardJson());
-  }
-
-  private async refillCardPool(): Promise<void> {
-    if (this.cardPoolRefilling) return;
-    this.cardPoolRefilling = true;
-    try {
-      while (this.cardPool.length < CARD_POOL_SIZE) {
-        const cardId = await this.createThinkingCard();
-        if (cardId) {
-          this.cardPool.push(cardId);
-          logger.debug({ cardId, poolSize: this.cardPool.length }, 'Card pool: pre-created');
-        } else {
-          logger.warn('Card pool: card.create returned empty card_id, stopping refill');
-          break;
-        }
-      }
-    } catch (err) {
-      logger.warn({ err }, 'Card pool: refill failed');
-    } finally {
-      this.cardPoolRefilling = false;
-    }
   }
 
   // ---- Connection lifecycle ----
@@ -377,7 +336,6 @@ class LarkChannel implements Channel {
     this.connected = true;
     await this.flushOutgoingQueue();
     this.syncChatMetadata().catch((err) => logger.error({ err }, 'Background chat metadata sync failed'));
-    this.refillCardPool().catch((err) => logger.warn({ err }, 'Card pool initial fill failed'));
   }
 
   // ---- Inbound message handling ----
@@ -417,7 +375,7 @@ class LarkChannel implements Channel {
     let hasTrigger = false;
     const embeddedImageKeys: string[] = [];
 
-    // Extract content by message type (unchanged from original)
+    // Extract content by message type
     if (messageType === 'text') {
       try { content = JSON.parse(message.content).text || ''; } catch { return; }
     } else if (messageType === 'image') {
@@ -544,7 +502,7 @@ class LarkChannel implements Channel {
     } catch (err) { logger.error({ err }, 'Error handling card action'); }
   }
 
-  // ---- Outbound: sendMessage with ReplySession ----
+  // ---- Outbound: sendMessage (text post only) ----
 
   async sendMessage(
     jid: string,
@@ -560,26 +518,8 @@ class LarkChannel implements Channel {
       return;
     }
 
-    const slotKey = opts?.slotKey;
-    if (slotKey) {
-      // Streaming path: use ReplySession
-      const session = this.getOrCreateSession(slotKey, jid, opts?.replyToMessageId);
-      try {
-        const accepted = await session.pushContent(text);
-        if (accepted) return;
-        // Card creation failed — fall through to post fallback
-      } catch (err) {
-        if (err instanceof MessageUnavailableError) {
-          logger.warn({ jid, messageId: err.messageId, code: err.apiCode }, 'Reply target unavailable, dropping message');
-          return;
-        }
-        logger.warn({ jid, err: formatLarkError(err) }, 'Streaming push failed, falling back to post');
-      }
-    }
-
-    // Non-streaming or fallback path: send as post
     try {
-      await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
+      await this._sendCard(jid, text, opts?.replyToMessageId, opts?.mentionUser);
     } catch (err) {
       if (err instanceof MessageUnavailableError) {
         logger.warn({ jid, messageId: err.messageId }, 'Reply target unavailable, dropping message');
@@ -591,85 +531,32 @@ class LarkChannel implements Channel {
     }
   }
 
-  // ---- ReplySession management ----
+  // ---- Card sending ----
 
-  private getOrCreateSession(slotKey: string, jid: string, replyToMessageId?: string): ReplySession {
-    let session = this.sessions.get(slotKey);
-    if (session && session.isActive) return session;
-
-    // Parse jid from slotKey if needed
-    const parsedJid = slotKey.includes('::') ? `lark:${parseSlotKey(slotKey).chatJid.replace(/^lark:/, '')}` : jid;
-
-    session = new ReplySession(this.client, parsedJid, {
-      replyToMessageId,
-      startedAt: this.sessionStartTimes.get(slotKey),
-      cardPool: this.cardPool,
-      refillCardPool: () => this.refillCardPool().catch(() => {}),
-    });
-    this.sessions.set(slotKey, session);
-    return session;
-  }
-
-  /** Per-key start times — set by recordStreamingStart, consumed by ReplySession. */
-  private sessionStartTimes = new Map<string, number>();
-
-  /**
-   * Record the start time for a streaming session.
-   * Matches the official plugin's timing: records when user message was received,
-   * so elapsed time in the card footer is accurate.
-   */
-  recordStreamingStart(keyOrJid: string, startedAt: number): void {
-    this.sessionStartTimes.set(keyOrJid, startedAt);
-  }
-
-  /**
-   * Pre-create a streaming card (legacy — kept for interface compatibility).
-   * With ReplySession, cards are created lazily by ensureCardCreated().
-   * This is now a no-op; recordStreamingStart handles timing.
-   */
-  async beginStreaming(
-    keyOrJid: string,
-    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; startedAt?: number },
-  ): Promise<void> {
-    // Record start time if provided (backward compat)
-    if (opts?.startedAt) {
-      this.recordStreamingStart(keyOrJid, opts.startedAt);
-    }
-  }
-
-  /**
-   * End a streaming session: finalize the card.
-   * Matches the official plugin's onIdle handler.
-   */
-  async endStreaming(
-    keyOrJid: string,
-    opts?: { isError?: boolean; reasoningText?: string; reasoningElapsedMs?: number },
-  ): Promise<void> {
-    const session = this.sessions.get(keyOrJid);
-    if (!session) return;
-
-    await session.finalize(opts);
-    this.sessions.delete(keyOrJid);
-    this.sessionStartTimes.delete(keyOrJid);
-  }
-
-  // ---- Post fallback ----
-
-  private async _sendPostFallback(
+  private async _sendCard(
     jid: string,
     text: string,
     replyToMessageId?: string,
     mentionUser?: { id: string; name: string },
   ): Promise<void> {
-    const chunks = splitMarkdown(text, MAX_TEXT_LENGTH);
+    const fullText = mentionUser
+      ? `${formatMentionForText(mentionUser)} ${text}`
+      : text;
+    const optimized = prepareTextForLark(fullText);
+    const chunks = splitMarkdown(optimized, MAX_TEXT_LENGTH);
+    // Combine all chunks into a single card with multiple markdown elements
+    const elements: any[] = [];
     for (let i = 0; i < chunks.length; i++) {
-      const chunkText = i === 0 && mentionUser
-        ? `${formatMentionForText(mentionUser)} ${chunks[i]}`
-        : chunks[i];
-      const content = JSON.stringify(markdownToPostContent(chunkText));
-      await this.sendToChat(jid, content, 'post', i === 0 ? replyToMessageId : undefined);
+      if (i > 0) elements.push({ tag: 'hr' });
+      elements.push({ tag: 'markdown', content: chunks[i] });
     }
-    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (post fallback)');
+    const cardJson = {
+      config: { wide_screen_mode: true },
+      elements,
+    };
+    const content = JSON.stringify(cardJson);
+    await this.sendToChat(jid, content, 'interactive', replyToMessageId);
+    logger.info({ jid, length: text.length, chunks: chunks.length }, 'Lark message sent (card)');
   }
 
   // ---- Channel interface methods ----
@@ -679,190 +566,8 @@ class LarkChannel implements Channel {
 
   async disconnect(): Promise<void> {
     this.connected = false;
-    for (const session of this.sessions.values()) session.destroy();
-    this.sessions.clear();
-    this.sessionStartTimes.clear();
     if (this.dedupTimer) { clearInterval(this.dedupTimer); this.dedupTimer = undefined; }
     if (this.server) { this.server.closeAllConnections(); this.server.close(); this.server = undefined; }
-  }
-
-  async setTyping(_jid: string, _isTyping: boolean): Promise<void> { /* no-op */ }
-
-  async sendCard(jid: string, cardJson: object, replyToMessageId?: string): Promise<void> {
-    const cardId = await createCardEntity(this.client, cardJson as Record<string, any>);
-    if (!cardId) throw new Error('Failed to create interactive card');
-    await sendCardByCardId(this.client, jid, cardId, replyToMessageId);
-    logger.info({ jid, cardId }, 'Lark interactive card sent');
-  }
-
-  async updateCard(_jid: string, messageId: string, cardJson: object): Promise<void> {
-    await withMessageGuard(
-      messageId,
-      () => this.client.im.v1.message.patch({
-        path: { message_id: messageId },
-        data: { content: JSON.stringify(cardJson) },
-      }) as any,
-      'im.message.patch(interactive)',
-    );
-  }
-
-  async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
-    try {
-      await withMessageGuard(
-        messageId,
-        () => this.client.im.messageReaction.create({
-          path: { message_id: messageId },
-          data: { reaction_type: { emoji_type: emojiType } },
-        }) as any,
-        'im.messageReaction.create',
-      );
-    } catch (err) {
-      // Code 231001 = invalid emoji type — provide helpful error
-      const code = extractLarkApiCode(err);
-      if (code === 231001) {
-        throw new Error(`Emoji type "${emojiType}" is not a valid Feishu reaction.`);
-      }
-      throw err;
-    }
-  }
-
-  async removeReaction(_jid: string, messageId: string, reactionId: string): Promise<void> {
-    await this.client.im.messageReaction.delete({
-      path: { message_id: messageId, reaction_id: reactionId },
-    });
-  }
-
-  async listReactions(_jid: string, messageId: string, emojiType?: string): Promise<Array<{ reactionId: string; emojiType: string; operatorType: string; operatorId: string }>> {
-    const reactions: Array<{ reactionId: string; emojiType: string; operatorType: string; operatorId: string }> = [];
-    let pageToken: string | undefined;
-    let hasMore = true;
-    while (hasMore) {
-      const params: Record<string, any> = { page_size: 50 };
-      if (emojiType) params.reaction_type = emojiType;
-      if (pageToken) params.page_token = pageToken;
-      const response = await this.client.im.messageReaction.list({ path: { message_id: messageId }, params });
-      const items = response?.data?.items;
-      if (items?.length) {
-        for (const item of items) {
-          reactions.push({
-            reactionId: item.reaction_id ?? '',
-            emojiType: item.reaction_type?.emoji_type ?? '',
-            operatorType: item.operator?.operator_type === 'app' ? 'app' : 'user',
-            operatorId: item.operator?.operator_id ?? '',
-          });
-        }
-      }
-      pageToken = response?.data?.page_token ?? undefined;
-      hasMore = response?.data?.has_more === true && !!pageToken;
-    }
-    return reactions;
-  }
-
-  async forwardMessage(messageId: string, targetJid: string): Promise<void> {
-    await this.client.im.v1.message.forward({
-      path: { message_id: messageId },
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: extractChatId(targetJid) },
-    });
-  }
-
-  async sendImage(jid: string, imagePath: string, replyToMessageId?: string): Promise<void> {
-    const uploadResp = await this.client.im.v1.image.create({
-      data: { image_type: 'message', image: fs.readFileSync(imagePath) },
-    });
-    const imageKey = uploadResp?.image_key;
-    if (!imageKey) throw new Error('Failed to upload image');
-    await this.sendToChat(jid, JSON.stringify({ image_key: imageKey }), 'image', replyToMessageId);
-  }
-
-  async sendFile(jid: string, filePath: string, replyToMessageId?: string): Promise<void> {
-    const fileName = path.basename(filePath);
-    const ext = path.extname(fileName).toLowerCase();
-    type LarkFileType = 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream';
-    const fileTypeMap: Record<string, LarkFileType> = {
-      '.opus': 'opus', '.ogg': 'opus', '.mp4': 'mp4', '.mov': 'mp4', '.avi': 'mp4', '.mkv': 'mp4', '.webm': 'mp4',
-      '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc', '.xls': 'xls', '.xlsx': 'xls', '.csv': 'xls', '.ppt': 'ppt', '.pptx': 'ppt',
-    };
-    const fileType: LarkFileType = fileTypeMap[ext] || 'stream';
-    const uploadResp = await this.client.im.v1.file.create({
-      data: { file_type: fileType, file_name: fileName, file: fs.readFileSync(filePath) },
-    });
-    const fileKey = uploadResp?.file_key;
-    if (!fileKey) throw new Error('Failed to upload file');
-    await this.sendToChat(jid, JSON.stringify({ file_key: fileKey }), 'file', replyToMessageId);
-  }
-
-  async editMessage(_jid: string, messageId: string, text: string): Promise<void> {
-    // Try CardKit path first (for streaming card messages)
-    let cardId: string | undefined;
-    try {
-      const convertResult = await this.client.cardkit.v1.card.idConvert({ data: { message_id: messageId } });
-      cardId = convertResult?.data?.card_id;
-    } catch { /* not a CardKit card */ }
-
-    if (cardId) {
-      // Replace the entire card with a new complete card
-      const completeCard = buildCompleteCard(text);
-      try {
-        await updateCardKitCard(this.client, cardId, completeCard, Date.now());
-        return;
-      } catch (err) {
-        logger.warn({ messageId, cardId, err }, 'CardKit card.update failed, falling back to post edit');
-      }
-    }
-
-    // Fallback: edit as post (for text/post messages)
-    await withMessageGuard(
-      messageId,
-      () => this.client.im.v1.message.patch({
-        path: { message_id: messageId },
-        data: { content: JSON.stringify(markdownToPostContent(text)) },
-      }) as any,
-      'im.message.patch(post)',
-    );
-  }
-
-  async getChatHistory(jid: string, count: number, beforeTimestamp?: string): Promise<ChatHistoryMessage[]> {
-    const chatId = extractChatId(jid);
-    const endTime = beforeTimestamp ? String(Math.floor(new Date(beforeTimestamp).getTime() / 1000)) : undefined;
-    const result = await this.client.im.v1.message.list({
-      params: {
-        container_id_type: 'chat', container_id: chatId,
-        page_size: Math.min(count, 50), sort_type: 'ByCreateTimeDesc',
-        ...(endTime ? { end_time: endTime } : {}),
-      },
-    });
-    return (result?.data?.items || []).map((item) => {
-      let content = '';
-      try {
-        if (item.body?.content) {
-          const parsed = JSON.parse(item.body.content);
-          if (typeof parsed === 'string') content = parsed;
-          else if (parsed.text) content = parsed.text;
-          else if (parsed.content) content = this.extractPostText(parsed.content);
-          else content = JSON.stringify(parsed);
-        }
-      } catch { content = item.body?.content || ''; }
-      return {
-        message_id: item.message_id || '', sender_id: item.sender?.id || '',
-        sender_type: item.sender?.sender_type || 'unknown', msg_type: item.msg_type || 'unknown',
-        content, create_time: item.create_time ? new Date(Number(item.create_time)).toISOString() : '',
-      };
-    });
-  }
-
-  async downloadResource(messageId: string, resourceKey: string, destPath: string): Promise<string> {
-    try {
-      const resp = await this.client.im.v1.messageResource.get({
-        path: { message_id: messageId, file_key: resourceKey }, params: { type: 'image' },
-      });
-      if (resp) { await resp.writeFile(destPath); return destPath; }
-    } catch { /* not an image */ }
-    const resp = await this.client.im.v1.messageResource.get({
-      path: { message_id: messageId, file_key: resourceKey }, params: { type: 'file' },
-    });
-    if (resp) { await resp.writeFile(destPath); return destPath; }
-    throw new Error(`Failed to download resource ${resourceKey}`);
   }
 
   // ---- Private helpers ----
@@ -937,18 +642,6 @@ class LarkChannel implements Channel {
       }
     } catch (err) { logger.warn({ jid, err }, 'Failed to download file'); }
     return content;
-  }
-
-  private extractPostText(content: any[][]): string {
-    if (!Array.isArray(content)) return '';
-    return content
-      .map((line) => (Array.isArray(line) ? line : []).map((el: any) => {
-        if (el.tag === 'text') return el.text || '';
-        if (el.tag === 'at') return `@${el.user_name || el.user_id || ''}`;
-        if (el.tag === 'a') return el.text || el.href || '';
-        return '';
-      }).join(''))
-      .join('\n');
   }
 
   async syncChatMetadata(): Promise<void> {

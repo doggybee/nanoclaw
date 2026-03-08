@@ -2,6 +2,9 @@
  * Stdio MCP Server for NanoClaw
  * Standalone process that agent teams subagents can inherit.
  * Reads context from environment variables, writes IPC files for the host.
+ *
+ * Lark tools use direct SDK calls when credentials are available,
+ * falling back to IPC for host-side processing when they're not.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -10,6 +13,8 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
+import { larkAvailable, larkClient } from './lark-client.js';
+import { createCardEntity, sendCardByCardId } from './lark/cardkit.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -19,6 +24,40 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+const MCP_LOG_PATH = '/tmp/mcp-nanoclaw.log';
+
+function mcpLog(tool: string, message: string): void {
+  const line = `[${new Date().toISOString()}] [mcp:${tool}] ${message}\n`;
+  try { fs.appendFileSync(MCP_LOG_PATH, line); } catch {}
+  console.error(line.trimEnd());
+}
+
+mcpLog('startup', `larkAvailable=${larkAvailable} chatJid=${chatJid} groupFolder=${groupFolder} isMain=${isMain}`);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function extractChatId(jid: string): string {
+  return jid.replace(/^lark:/, '');
+}
+
+function detectFileType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const map: Record<string, string> = {
+    '.opus': 'opus', '.ogg': 'opus',
+    '.mp4': 'mp4', '.mov': 'mp4', '.avi': 'mp4', '.mkv': 'mp4', '.webm': 'mp4',
+    '.pdf': 'pdf', '.doc': 'doc', '.docx': 'doc',
+    '.xls': 'xls', '.xlsx': 'xls', '.csv': 'xls',
+    '.ppt': 'ppt', '.pptx': 'ppt',
+  };
+  return map[ext] || 'stream';
+}
 
 function writeIpcFile(dir: string, data: object): string {
   fs.mkdirSync(dir, { recursive: true });
@@ -34,10 +73,18 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
 });
+
+// ---------------------------------------------------------------------------
+// Lark tools — direct SDK with IPC fallback
+// ---------------------------------------------------------------------------
 
 server.tool(
   'add_reaction',
@@ -47,18 +94,31 @@ server.tool(
     emoji_type: z.string().describe('The emoji type (e.g., "THUMBSUP", "SMILE", "HEART", "YES", "FireCracker", "OK")'),
   },
   async (args) => {
-    const data = {
-      type: 'add_reaction',
-      chatJid,
-      messageId: args.message_id,
-      emojiType: args.emoji_type,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    };
+    mcpLog('add_reaction', `messageId=${args.message_id} emoji=${args.emoji_type} larkAvailable=${larkAvailable}`);
 
-    writeIpcFile(MESSAGES_DIR, data);
+    if (larkAvailable) {
+      try {
+        await larkClient.im.messageReaction.create({
+          path: { message_id: args.message_id },
+          data: { reaction_type: { emoji_type: args.emoji_type } },
+        });
+        mcpLog('add_reaction', `success: ${args.emoji_type} on ${args.message_id}`);
+        return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji_type} added to message ${args.message_id}.` }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('add_reaction', `error: code=${code} msg=${msg}`);
+        // 231001 = invalid emoji type
+        if (code === 231001) {
+          return { content: [{ type: 'text' as const, text: `Emoji type "${args.emoji_type}" is not a valid Feishu reaction.` }], isError: true };
+        }
+        return { content: [{ type: 'text' as const, text: `Failed to add reaction: ${msg || 'unknown error'}` }], isError: true };
+      }
+    }
 
-    return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji_type} added to message ${args.message_id}.` }] };
+    // IPC fallback — no longer handled by host
+    mcpLog('add_reaction', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
 
@@ -72,44 +132,82 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
     before_timestamp: z.string().optional().describe('ISO timestamp — only return messages before this time. Omit for latest messages.'),
   },
   async (args) => {
-    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const count = args.count || 20;
+    mcpLog('get_chat_history', `count=${count} before=${args.before_timestamp || 'latest'} larkAvailable=${larkAvailable}`);
 
-    writeIpcFile(MESSAGES_DIR, {
-      type: 'get_chat_history',
-      chatJid,
-      count: args.count || 20,
-      beforeTimestamp: args.before_timestamp || undefined,
-      requestId,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
+    if (larkAvailable) {
+      try {
+        const chatId = extractChatId(chatJid);
+        const endTime = args.before_timestamp
+          ? String(Math.floor(new Date(args.before_timestamp).getTime() / 1000))
+          : undefined;
 
-    // Poll for response file
-    const responsePath = path.join(IPC_DIR, 'responses', `${requestId}.json`);
-    const timeout = 15_000;
-    const pollMs = 300;
-    const start = Date.now();
+        const result = await larkClient.im.v1.message.list({
+          params: {
+            container_id_type: 'chat',
+            container_id: chatId,
+            page_size: Math.min(count, 50),
+            sort_type: 'ByCreateTimeDesc',
+            ...(endTime ? { end_time: endTime } : {}),
+          },
+        });
 
-    while (Date.now() - start < timeout) {
-      if (fs.existsSync(responsePath)) {
-        const data = JSON.parse(fs.readFileSync(responsePath, 'utf-8'));
-        try { fs.unlinkSync(responsePath); } catch { /* ignore */ }
-        if (data.status === 'error') {
-          return { content: [{ type: 'text' as const, text: `Error fetching chat history: ${data.error}` }], isError: true };
-        }
-        const messages = data.messages || [];
-        if (messages.length === 0) {
+        const items = result?.data?.items || [];
+        if (items.length === 0) {
+          mcpLog('get_chat_history', 'success: 0 messages');
           return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
         }
-        const formatted = messages.map((m: any) =>
+
+        const messages = items.map((item) => {
+          let content = '';
+          try {
+            if (item.body?.content) {
+              const parsed = JSON.parse(item.body.content);
+              if (typeof parsed === 'string') content = parsed;
+              else if (parsed.text) content = parsed.text;
+              else if (parsed.content) {
+                // Extract text from post content
+                content = (Array.isArray(parsed.content) ? parsed.content : [])
+                  .map((line: any[]) => (Array.isArray(line) ? line : []).map((el: any) => {
+                    if (el.tag === 'text') return el.text || '';
+                    if (el.tag === 'at') return `@${el.user_name || el.user_id || ''}`;
+                    if (el.tag === 'a') return el.text || el.href || '';
+                    return '';
+                  }).join(''))
+                  .join('\n');
+              } else {
+                content = JSON.stringify(parsed);
+              }
+            }
+          } catch { content = item.body?.content || ''; }
+
+          return {
+            message_id: item.message_id || '',
+            sender_id: item.sender?.id || '',
+            sender_type: item.sender?.sender_type || 'unknown',
+            msg_type: item.msg_type || 'unknown',
+            content,
+            create_time: item.create_time ? new Date(Number(item.create_time)).toISOString() : '',
+          };
+        });
+
+        const formatted = messages.map((m) =>
           `[${m.create_time}] ${m.sender_type === 'bot' ? '(bot)' : '(user)'} ${m.sender_id}: [${m.msg_type}] ${m.content}`
         ).join('\n');
+
+        mcpLog('get_chat_history', `success: ${messages.length} messages`);
         return { content: [{ type: 'text' as const, text: formatted }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('get_chat_history', `error: code=${code} msg=${msg}`);
+        return { content: [{ type: 'text' as const, text: `Error fetching chat history: ${msg || 'unknown error'}` }], isError: true };
       }
-      await new Promise((r) => setTimeout(r, pollMs));
     }
 
-    return { content: [{ type: 'text' as const, text: 'Timeout waiting for chat history response.' }], isError: true };
+    // IPC fallback — no longer handled by host
+    mcpLog('get_chat_history', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
 
@@ -156,45 +254,88 @@ When a user clicks, you receive: [Card action: choose data={"action_id":"choose"
     card_json: z.string().describe('Lark Card JSON (schema 2.0) as a string'),
   },
   async (args) => {
-    let cardJson: object;
+    mcpLog('send_card', `jsonLen=${args.card_json.length} larkAvailable=${larkAvailable}`);
+
+    let cardJson: Record<string, any>;
     try {
       cardJson = JSON.parse(args.card_json);
     } catch {
       return { content: [{ type: 'text' as const, text: 'Invalid JSON in card_json' }], isError: true };
     }
 
-    writeIpcFile(MESSAGES_DIR, {
-      type: 'send_card',
-      chatJid,
-      cardJson,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
+    if (larkAvailable) {
+      try {
+        const cardId = await createCardEntity(larkClient, cardJson);
+        if (!cardId) {
+          mcpLog('send_card', 'error: createCardEntity returned null');
+          return { content: [{ type: 'text' as const, text: 'Failed to create card entity.' }], isError: true };
+        }
+        await sendCardByCardId(larkClient, extractChatId(chatJid), cardId);
+        mcpLog('send_card', `success: cardId=${cardId}`);
+        return { content: [{ type: 'text' as const, text: 'Interactive card sent.' }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('send_card', `error: code=${code} msg=${msg}`);
+        return { content: [{ type: 'text' as const, text: `Failed to send card: ${msg || 'unknown error'}` }], isError: true };
+      }
+    }
 
-    return { content: [{ type: 'text' as const, text: 'Interactive card sent.' }] };
+    // IPC fallback — no longer handled by host
+    mcpLog('send_card', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
 
 server.tool(
   'edit_message',
-  'Edit a previously sent message. Only works for messages sent by the bot. Use the message ID from the <message id="..."> attribute. The message content will be fully replaced with the new text.',
+  'Edit a previously sent message. Only works for messages sent by the bot. Use the message ID from the <message id="..."> attribute. The message content will be fully replaced with the new text. Works for both interactive cards and text/post messages.',
   {
     message_id: z.string().describe('The message ID of the bot message to edit (from the id attribute in <message> tags)'),
     text: z.string().describe('The new message text to replace the old content'),
   },
   async (args) => {
-    const data = {
-      type: 'edit_message',
-      chatJid,
-      messageId: args.message_id,
-      text: args.text,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    };
+    mcpLog('edit_message', `messageId=${args.message_id} textLen=${args.text.length} larkAvailable=${larkAvailable}`);
 
-    writeIpcFile(MESSAGES_DIR, data);
+    if (larkAvailable) {
+      // Try interactive card format first (most bot messages are CardKit cards)
+      try {
+        const interactiveContent = JSON.stringify({
+          config: { wide_screen_mode: true },
+          elements: [{ tag: 'markdown', content: args.text }],
+        });
+        await larkClient.im.v1.message.patch({
+          path: { message_id: args.message_id },
+          data: { content: interactiveContent },
+        });
+        mcpLog('edit_message', `success: interactive format on ${args.message_id}`);
+        return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
+      } catch (err: any) {
+        mcpLog('edit_message', `interactive format failed: code=${err?.code ?? err?.data?.code} msg=${err?.msg || err?.message}`);
+      }
 
-    return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
+      // Try post format (for text/post messages)
+      try {
+        const postContent = JSON.stringify({
+          zh_cn: { content: [[{ tag: 'md', text: args.text }]] },
+        });
+        await larkClient.im.v1.message.patch({
+          path: { message_id: args.message_id },
+          data: { content: postContent },
+        });
+        mcpLog('edit_message', `success: post format on ${args.message_id}`);
+        return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('edit_message', `post format also failed: code=${code} msg=${msg}`);
+        return { content: [{ type: 'text' as const, text: `Failed to edit message: ${msg || 'unknown error'}` }], isError: true };
+      }
+    }
+
+    // IPC fallback — no longer handled by host
+    mcpLog('edit_message', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
 
@@ -205,6 +346,8 @@ server.tool(
     image_path: z.string().describe('Absolute path to the image file inside the container'),
   },
   async (args) => {
+    mcpLog('send_image', `path=${args.image_path} larkAvailable=${larkAvailable}`);
+
     if (!fs.existsSync(args.image_path)) {
       return {
         content: [{ type: 'text' as const, text: `Image file not found: ${args.image_path}` }],
@@ -212,15 +355,38 @@ server.tool(
       };
     }
 
-    writeIpcFile(MESSAGES_DIR, {
-      type: 'send_image',
-      chatJid,
-      imagePath: args.image_path,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
+    if (larkAvailable) {
+      try {
+        const uploadResp = await larkClient.im.v1.image.create({
+          data: { image_type: 'message', image: fs.readFileSync(args.image_path) },
+        });
+        const imageKey = uploadResp?.image_key;
+        if (!imageKey) {
+          mcpLog('send_image', 'error: upload returned no image_key');
+          return { content: [{ type: 'text' as const, text: 'Failed to upload image.' }], isError: true };
+        }
 
-    return { content: [{ type: 'text' as const, text: `Image sent: ${args.image_path}` }] };
+        await larkClient.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: extractChatId(chatJid),
+            msg_type: 'image',
+            content: JSON.stringify({ image_key: imageKey }),
+          },
+        });
+        mcpLog('send_image', `success: imageKey=${imageKey}`);
+        return { content: [{ type: 'text' as const, text: `Image sent: ${args.image_path}` }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('send_image', `error: code=${code} msg=${msg}`);
+        return { content: [{ type: 'text' as const, text: `Failed to send image: ${msg || 'unknown error'}` }], isError: true };
+      }
+    }
+
+    // IPC fallback — no longer handled by host
+    mcpLog('send_image', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
 
@@ -231,6 +397,8 @@ server.tool(
     file_path: z.string().describe('Absolute path to the file inside the container'),
   },
   async (args) => {
+    mcpLog('send_file', `path=${args.file_path} larkAvailable=${larkAvailable}`);
+
     if (!fs.existsSync(args.file_path)) {
       return {
         content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
@@ -238,17 +406,101 @@ server.tool(
       };
     }
 
-    writeIpcFile(MESSAGES_DIR, {
-      type: 'send_file',
-      chatJid,
-      filePath: args.file_path,
-      groupFolder,
-      timestamp: new Date().toISOString(),
-    });
+    if (larkAvailable) {
+      try {
+        const fileName = path.basename(args.file_path);
+        const fileType = detectFileType(args.file_path);
 
-    return { content: [{ type: 'text' as const, text: `File sent: ${args.file_path}` }] };
+        const uploadResp = await larkClient.im.v1.file.create({
+          data: {
+            file_type: fileType as any,
+            file_name: fileName,
+            file: fs.readFileSync(args.file_path),
+          },
+        });
+        const fileKey = uploadResp?.file_key;
+        if (!fileKey) {
+          mcpLog('send_file', 'error: upload returned no file_key');
+          return { content: [{ type: 'text' as const, text: 'Failed to upload file.' }], isError: true };
+        }
+
+        await larkClient.im.v1.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: extractChatId(chatJid),
+            msg_type: 'file',
+            content: JSON.stringify({ file_key: fileKey }),
+          },
+        });
+        mcpLog('send_file', `success: fileKey=${fileKey} type=${fileType}`);
+        return { content: [{ type: 'text' as const, text: `File sent: ${args.file_path}` }] };
+      } catch (err: any) {
+        const code = err?.code ?? err?.data?.code;
+        const msg = err?.msg || err?.message || '';
+        mcpLog('send_file', `error: code=${code} msg=${msg}`);
+        return { content: [{ type: 'text' as const, text: `Failed to send file: ${msg || 'unknown error'}` }], isError: true };
+      }
+    }
+
+    // IPC fallback — no longer handled by host
+    mcpLog('send_file', 'no Lark credentials, returning error');
+    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
   },
 );
+
+// send_message: only available for scheduled tasks (conversation replies use streaming cards)
+const isTask = process.env.NANOCLAW_IS_TASK === '1';
+if (isTask) {
+  server.tool(
+    'send_message',
+    'Send a message to the group. Use this to deliver task results or notifications.',
+    {
+      text: z.string().describe('The message text to send'),
+    },
+    async (args) => {
+      mcpLog('send_message', `textLen=${args.text.length} larkAvailable=${larkAvailable}`);
+
+      if (larkAvailable) {
+        try {
+          const cardJson = {
+            config: { wide_screen_mode: true },
+            elements: [{ tag: 'markdown', content: args.text }],
+          };
+          await larkClient.im.v1.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: extractChatId(chatJid),
+              msg_type: 'interactive',
+              content: JSON.stringify(cardJson),
+            },
+          });
+          mcpLog('send_message', 'success');
+          return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+        } catch (err: any) {
+          const code = err?.code ?? err?.data?.code;
+          const msg = err?.msg || err?.message || '';
+          mcpLog('send_message', `error: code=${code} msg=${msg}`);
+          return { content: [{ type: 'text' as const, text: `Failed to send message: ${msg || 'unknown error'}` }], isError: true };
+        }
+      }
+
+      // IPC fallback
+      mcpLog('send_message', 'falling back to IPC');
+      writeIpcFile(MESSAGES_DIR, {
+        type: 'send_message',
+        chatJid,
+        text: args.text,
+        groupFolder,
+        timestamp: new Date().toISOString(),
+      });
+      return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Task/IPC tools — always use IPC (need host-side SQLite / state)
+// ---------------------------------------------------------------------------
 
 server.tool(
   'schedule_task',

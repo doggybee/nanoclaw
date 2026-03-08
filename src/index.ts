@@ -369,12 +369,6 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
-    logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
-    return true;
-  }
-
   const slotKey = makeSlotKey(chatJid, senderId);
 
   // Use per-slot cursor for timestamp tracking
@@ -439,57 +433,14 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
     pendingReplyTo[slotKey] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
   }
 
-  await channel.setTyping?.(chatJid, true);
-
-  // Record start time for elapsed display — card created lazily on first content
-  const messageReceivedAt = new Date(senderMessages[0].timestamp).getTime();
-  const streamingStartedAt = Number.isFinite(messageReceivedAt) ? messageReceivedAt : Date.now();
-  channel.recordStreamingStart?.(slotKey, streamingStartedAt);
-
   let hadError = false;
   let outputSentToUser = false;
-  let lastStreamedText = '';
 
   const output = await runAgent(group, prompt, chatJid, senderId, async (result) => {
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-
-      if (text) {
-        if (result.isStreaming) {
-          logger.info({ group: group.name, senderId }, `Streaming chunk: ${text.slice(0, 100)}`);
-          lastStreamedText = text;
-          const target = pendingReplyTo[slotKey];
-          delete pendingReplyTo[slotKey];
-          const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
-            ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
-            : { slotKey };
-          await channel.sendMessage(chatJid, text, opts);
-          outputSentToUser = true;
-        } else {
-          logger.info({ group: group.name, senderId }, `Agent output: ${raw.slice(0, 200)}`);
-          if (lastStreamedText) {
-            // Streaming was active — update the existing card with final text
-            if (text !== lastStreamedText) {
-              await channel.sendMessage(chatJid, text, { slotKey });
-            }
-          } else {
-            // No streaming happened — send as new message
-            const target = pendingReplyTo[slotKey];
-            delete pendingReplyTo[slotKey];
-            const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
-              ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
-              : { slotKey };
-            await channel.sendMessage(chatJid, text, opts);
-          }
-          outputSentToUser = true;
-          channel.endStreaming?.(slotKey)?.catch((err) =>
-            logger.warn({ slotKey, err }, 'Failed to end streaming on final result'));
-        }
-      }
+    // Container handles all message sending (CardKit streaming cards).
+    // Host only tracks state.
+    if (result.outputDelivered || result.result) {
+      outputSentToUser = true;
       resetIdleTimer();
     }
 
@@ -502,9 +453,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
     }
   }, model);
 
-  await channel.setTyping?.(chatJid, false);
   const isErrorState = output === 'error' || hadError;
-  await channel.endStreaming?.(slotKey, isErrorState ? { isError: true } : undefined);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (isErrorState) {
@@ -589,6 +538,9 @@ async function runAgent(
   const effectiveSlotId = warmHandle?.slotId || senderId;
 
   try {
+    // Pass replyToMessageId so the container can reply to the correct message
+    const replyTarget = pendingReplyTo[slotKey];
+
     const output = await runContainerAgent(
       group,
       {
@@ -600,6 +552,7 @@ async function runAgent(
         assistantName: ASSISTANT_NAME,
         model,
         slotId: senderId, // Used for cold-start containers only (warm ignores this)
+        replyToMessageId: replyTarget?.messageId,
       },
       (proc, containerName) => {
         queue.registerProcess(slotKey, proc, containerName, group.folder);
@@ -702,10 +655,9 @@ async function startMessageLoop(): Promise<void> {
             const slotKey = makeSlotKey(chatJid, senderId);
             const formatted = formatMessages(senderMsgs);
 
-            if (queue.sendMessage(chatJid, senderId, formatted)) {
-              // End current streaming card so the next reply creates a new one
-              await channel.endStreaming?.(slotKey);
-
+            // Find reply target for piped messages
+            const pipedReplyTarget = findReplyTarget(senderMsgs, needsTrigger);
+            if (queue.sendMessage(chatJid, senderId, formatted, { replyToMessageId: pipedReplyTarget?.messageId })) {
               logger.debug(
                 { slotKey, count: senderMsgs.length },
                 'Piped messages to active container',
@@ -714,16 +666,8 @@ async function startMessageLoop(): Promise<void> {
               lastAgentTimestamp[slotKey] =
                 senderMsgs[senderMsgs.length - 1].timestamp;
               saveState();
-              // Update reply target
-              pendingReplyTo[slotKey] = findReplyTarget(senderMsgs, needsTrigger);
-              // Record start time for piped message — card created lazily on first content
-              channel.recordStreamingStart?.(slotKey, Date.now());
-              // Show typing indicator
-              channel
-                .setTyping?.(chatJid, true)
-                ?.catch((err) =>
-                  logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
-                );
+              // Update reply target for host fallback path
+              pendingReplyTo[slotKey] = pipedReplyTarget;
             } else {
               // No active container for this sender — enqueue
               queue.enqueueMessageCheck(chatJid, senderId);
@@ -865,36 +809,6 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
-    },
-    addReaction: (jid, messageId, emojiType) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.addReaction) throw new Error(`No channel with reaction support for JID: ${jid}`);
-      return channel.addReaction(jid, messageId, emojiType);
-    },
-    sendImage: (jid, imagePath) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.sendImage) throw new Error(`No channel with image support for JID: ${jid}`);
-      return channel.sendImage(jid, imagePath);
-    },
-    sendFile: (jid, filePath) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.sendFile) throw new Error(`No channel with file support for JID: ${jid}`);
-      return channel.sendFile(jid, filePath);
-    },
-    editMessage: (jid, messageId, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.editMessage) throw new Error(`No channel with edit support for JID: ${jid}`);
-      return channel.editMessage(jid, messageId, text);
-    },
-    getChatHistory: (jid, count, beforeTimestamp) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.getChatHistory) throw new Error(`No channel with chat history support for JID: ${jid}`);
-      return channel.getChatHistory(jid, count, beforeTimestamp);
-    },
-    sendCard: (jid, cardJson, replyToMessageId) => {
-      const channel = findChannel(channels, jid);
-      if (!channel?.sendCard) throw new Error(`No channel with card support for JID: ${jid}`);
-      return channel.sendCard(jid, cardJson, replyToMessageId);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

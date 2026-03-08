@@ -113,6 +113,8 @@ export interface ContainerInput {
   model?: string;
   /** Slot ID for per-user IPC isolation. */
   slotId?: string;
+  /** Message ID to reply to (for streaming card reply and typing indicator). */
+  replyToMessageId?: string;
 }
 
 export interface ContainerOutput {
@@ -120,7 +122,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
-  isStreaming?: boolean;
+  /** Container already delivered output to user (via CardKit streaming). Host should NOT re-send. */
+  outputDelivered?: boolean;
 }
 
 interface VolumeMount {
@@ -327,6 +330,12 @@ function buildContainerArgs(
     args.push('-e', `CLAUDE_MODEL=${envModel}`);
   }
 
+  // Pass Lark credentials so container can call Lark API directly
+  const larkEnv = readEnvFile(['LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN']);
+  if (larkEnv.LARK_APP_ID) args.push('-e', `LARK_APP_ID=${larkEnv.LARK_APP_ID}`);
+  if (larkEnv.LARK_APP_SECRET) args.push('-e', `LARK_APP_SECRET=${larkEnv.LARK_APP_SECRET}`);
+  if (larkEnv.LARK_DOMAIN) args.push('-e', `LARK_DOMAIN=${larkEnv.LARK_DOMAIN}`);
+
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
   // or when getuid is unavailable (native Windows without WSL).
@@ -417,12 +426,7 @@ export async function spawnWarmContainer(
   let outputChain = Promise.resolve();
   let parseBuffer = '';
   let newSessionId: string | undefined;
-  let hadStreamingOutput = false;
-
-  // Coalescing: streaming chunks are full-text replacements, so intermediate
-  // ones can be skipped. Only the latest matters at any point in time.
-  let latestStreaming: ContainerOutput | null = null;
-  let streamingSendLoop: Promise<void> | null = null;
+  let hadOutput = false;
 
   // Timeout management
   const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
@@ -457,28 +461,12 @@ export async function spawnWarmContainer(
       try {
         const parsed: ContainerOutput = JSON.parse(jsonStr);
         if (parsed.newSessionId) newSessionId = parsed.newSessionId;
-        hadStreamingOutput = true;
+        hadOutput = true;
         resetTimeout();
         if (onOutput) {
-          if (parsed.isStreaming) {
-            latestStreaming = parsed;
-            if (!streamingSendLoop) {
-              streamingSendLoop = (async () => {
-                while (latestStreaming) {
-                  const toSend = latestStreaming;
-                  latestStreaming = null;
-                  await onOutput!(toSend);
-                }
-                streamingSendLoop = null;
-              })();
-            }
-          } else {
-            // Non-streaming output (result, session-update) must wait for
-            // streaming to finish, then deliver in order.
-            outputChain = outputChain
-              .then(() => streamingSendLoop || Promise.resolve())
-              .then(() => onOutput!(parsed));
-          }
+          // All outputs processed sequentially (no streaming coalescing needed —
+          // container handles streaming internally via CardKit)
+          outputChain = outputChain.then(() => onOutput!(parsed));
         }
       } catch (err) {
         logger.warn({ group: group.name, error: err }, 'Failed to parse warm container output');
@@ -496,8 +484,8 @@ export async function spawnWarmContainer(
   const exited = new Promise<ContainerOutput>((resolve) => {
     container.on('close', (code) => {
       clearTimeout(timeout);
-      outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
-        if (timedOut && hadStreamingOutput) {
+      outputChain.then(() => {
+        if (timedOut && hadOutput) {
           resolve({ status: 'success', result: null, newSessionId });
         } else if (timedOut) {
           resolve({ status: 'error', result: null, error: 'Warm container timed out' });
@@ -549,7 +537,7 @@ export async function runContainerAgent(
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
     const filepath = path.join(inputDir, filename);
     const tempPath = `${filepath}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: input.prompt, model: input.model, sessionId: input.sessionId }));
+    fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: input.prompt, model: input.model, sessionId: input.sessionId, replyToMessageId: input.replyToMessageId }));
     fs.renameSync(tempPath, filepath);
 
     logger.info(
@@ -623,14 +611,9 @@ export async function runContainerAgent(
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
-    // Coalescing: streaming chunks are full-text replacements, so intermediate
-    // ones can be skipped. Only the latest matters at any point in time.
-    let latestStreaming: ContainerOutput | null = null;
-    let streamingSendLoop: Promise<void> | null = null;
-
     // Declare before stdout handler to avoid TDZ issues
     let timedOut = false;
-    let hadStreamingOutput = false;
+    let hadOutput = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
@@ -701,28 +684,12 @@ export async function runContainerAgent(
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
             }
-            hadStreamingOutput = true;
+            hadOutput = true;
             // Activity detected — reset the hard timeout
             resetTimeout();
-            // Coalescing: streaming chunks skip intermediate updates,
-            // non-streaming output (result, session-update) preserves order.
-            if (parsed.isStreaming) {
-              latestStreaming = parsed;
-              if (!streamingSendLoop) {
-                streamingSendLoop = (async () => {
-                  while (latestStreaming) {
-                    const toSend = latestStreaming;
-                    latestStreaming = null;
-                    await onOutput(toSend);
-                  }
-                  streamingSendLoop = null;
-                })();
-              }
-            } else {
-              outputChain = outputChain
-                .then(() => streamingSendLoop || Promise.resolve())
-                .then(() => onOutput(parsed));
-            }
+            // All outputs processed sequentially (no streaming coalescing needed —
+            // container handles streaming internally via CardKit)
+            outputChain = outputChain.then(() => onOutput(parsed));
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -771,19 +738,19 @@ export async function runContainerAgent(
             `Container: ${containerName}`,
             `Duration: ${duration}ms`,
             `Exit Code: ${code}`,
-            `Had Streaming Output: ${hadStreamingOutput}`,
+            `Had Output: ${hadOutput}`,
           ].join('\n'),
         );
 
         // Timeout after output = idle cleanup, not failure.
         // The agent already sent its response; this is just the
         // container being reaped after the idle period expired.
-        if (hadStreamingOutput) {
+        if (hadOutput) {
           logger.info(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
-          outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
+          outputChain.then(() => {
             resolve({
               status: 'success',
               result: null,
@@ -885,9 +852,9 @@ export async function runContainerAgent(
         return;
       }
 
-      // Streaming mode: wait for output chain and any in-flight streaming to settle
+      // Streaming mode: wait for output chain to settle
       if (onOutput) {
-        outputChain.then(() => streamingSendLoop || Promise.resolve()).then(() => {
+        outputChain.then(() => {
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
