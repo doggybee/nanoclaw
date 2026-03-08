@@ -21,7 +21,11 @@ export async function createCardEntity(
   const response = await client.cardkit.v1.card.create({
     data: { type: 'card_json', data: JSON.stringify(card) },
   });
-  return response?.data?.card_id ?? (response as any)?.card_id ?? null;
+  const cardId = response?.data?.card_id ?? (response as any)?.card_id ?? null;
+  if (!cardId) {
+    logger.debug({ response: JSON.stringify(response).slice(0, 500) }, 'createCardEntity: empty card_id');
+  }
+  return cardId;
 }
 
 /**

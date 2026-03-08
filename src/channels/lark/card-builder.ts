@@ -24,11 +24,6 @@ export function buildThinkingCardJson(): Record<string, any> {
     config: {
       streaming_mode: true,
       summary: { content: '思考中...' },
-      streaming_config: {
-        print_frequency_ms: 20,
-        print_step: 10,
-        print_strategy: 'fast',
-      },
     },
     body: {
       elements: [

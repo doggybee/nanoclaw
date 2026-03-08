@@ -88,10 +88,9 @@ describe('buildThinkingCardJson', () => {
     expect(card.body.elements[1].element_id).toBe(LOADING_ELEMENT_ID);
   });
 
-  it('includes streaming_config for fast animation', () => {
+  it('does not include streaming_config (matches official plugin)', () => {
     const card = buildThinkingCardJson();
-    expect(card.config.streaming_config.print_frequency_ms).toBe(20);
-    expect(card.config.streaming_config.print_strategy).toBe('fast');
+    expect(card.config.streaming_config).toBeUndefined();
   });
 });
 
