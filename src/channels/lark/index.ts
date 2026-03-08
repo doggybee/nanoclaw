@@ -23,8 +23,8 @@ import {
   RegisteredGroup,
 } from '../../types.js';
 
-import { createCardEntity, sendCardByCardId } from './cardkit.js';
-import { buildThinkingCardJson, STREAMING_ELEMENT_ID } from './card-builder.js';
+import { createCardEntity, sendCardByCardId, updateCardKitCard } from './cardkit.js';
+import { buildThinkingCardJson, buildCompleteCard, STREAMING_ELEMENT_ID } from './card-builder.js';
 import { optimizeMarkdownStyle } from './markdown-style.js';
 import {
   withMessageGuard,
@@ -784,31 +784,32 @@ class LarkChannel implements Channel {
   }
 
   async editMessage(_jid: string, messageId: string, text: string): Promise<void> {
+    // Try CardKit path first (for streaming card messages)
     let cardId: string | undefined;
     try {
       const convertResult = await this.client.cardkit.v1.card.idConvert({ data: { message_id: messageId } });
       cardId = convertResult?.data?.card_id;
-    } catch { /* not a card */ }
+    } catch { /* not a CardKit card */ }
 
     if (cardId) {
-      await withMessageGuard(
-        messageId,
-        () => this.client.cardkit.v1.cardElement.content({
-          path: { card_id: cardId!, element_id: STREAMING_ELEMENT_ID },
-          data: { content: optimizeMarkdownStyle(text), sequence: Date.now() },
-        }) as any,
-        'cardkit.cardElement.content(edit)',
-      );
-      return;
+      // Replace the entire card with a new complete card
+      const completeCard = buildCompleteCard(text);
+      try {
+        await updateCardKitCard(this.client, cardId, completeCard, Date.now());
+        return;
+      } catch (err) {
+        logger.warn({ messageId, cardId, err }, 'CardKit card.update failed, falling back to post edit');
+      }
     }
 
+    // Fallback: edit as post (for text/post messages)
     await withMessageGuard(
       messageId,
       () => this.client.im.v1.message.patch({
         path: { message_id: messageId },
         data: { content: JSON.stringify(markdownToPostContent(text)) },
       }) as any,
-      'im.message.update(post)',
+      'im.message.patch(post)',
     );
   }
 

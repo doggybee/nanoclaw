@@ -3,12 +3,11 @@
  *
  * Adapted from the official feishu-openclaw-plugin's reply-dispatcher.js.
  * Each session corresponds to one slot (one user in one group) and handles:
- *   1. Lazy card creation (ensureCardCreated — only on first content)
- *   2. Throttled content streaming (pushContent → cardElement.content)
- *   3. Card finalization (finalize → close streaming + complete card)
- *
- * The official plugin uses closures inside createFeishuReplyDispatcher().
- * We use a class with equivalent state variables and the same lifecycle.
+ *   1. Typing indicator (emoji reaction on user's message)
+ *   2. Lazy card creation (ensureCardCreated — only on first content)
+ *   3. Throttled content streaming with concurrent flush mutex
+ *   4. Long-gap deferred batching (matches official BATCH_AFTER_GAP_MS)
+ *   5. Card finalization (finalize → close streaming + complete card)
  */
 import type * as Lark from '@larksuiteoapi/node-sdk';
 
@@ -27,9 +26,14 @@ import {
   type CompleteCardOpts,
 } from './card-builder.js';
 import { optimizeMarkdownStyle } from './markdown-style.js';
+import { addTypingIndicator, removeTypingIndicator, type TypingState } from './typing.js';
 
 // Matches official plugin's CARDKIT_THROTTLE_MS.
 const STREAMING_THROTTLE_MS = 100;
+// After a long gap (tool call / LLM thinking), batch briefly so the first
+// visible update contains meaningful text rather than just 1-2 characters.
+const LONG_GAP_THRESHOLD_MS = 2000;
+const BATCH_AFTER_GAP_MS = 300;
 
 export interface ReplySessionOpts {
   /** Message to reply to (first message in the batch). */
@@ -69,6 +73,16 @@ export class ReplySession {
   /** When the session started (message receipt time). */
   private readonly startedAt: number;
 
+  // ---- Concurrent flush mutex (matches official flushInProgress) ----
+  /** True while a streamCardContent API call is in flight. */
+  private flushInProgress = false;
+  /** True if new content arrived during an in-flight flush. */
+  private needsReflush = false;
+
+  // ---- Typing indicator state ----
+  private typingState: TypingState | null = null;
+  private typingStopped = false;
+
   constructor(
     private readonly client: Lark.Client,
     private readonly jid: string,
@@ -80,6 +94,38 @@ export class ReplySession {
   /** Whether this session has an active (not yet finalized) card. */
   get isActive(): boolean {
     return !this.cardCompleted;
+  }
+
+  // --------------------------------------------------------------------------
+  // Typing indicator — matches official createTypingCallbacks()
+  // --------------------------------------------------------------------------
+
+  /**
+   * Start the typing indicator (add emoji reaction to user's message).
+   * Best-effort — errors are silently caught.
+   */
+  private async startTyping(): Promise<void> {
+    if (this.typingStopped || !this.opts.replyToMessageId) return;
+    if (this.typingState?.reactionId) return; // Already active
+
+    this.typingState = await addTypingIndicator(this.client, this.opts.replyToMessageId);
+
+    // TOCTOU guard: stop() may have been called while addTypingIndicator
+    // was in flight. If so, clean up immediately.
+    if (this.typingStopped && this.typingState) {
+      await removeTypingIndicator(this.client, this.typingState);
+      this.typingState = null;
+    }
+  }
+
+  /**
+   * Stop the typing indicator (remove emoji reaction).
+   */
+  private async stopTyping(): Promise<void> {
+    this.typingStopped = true;
+    if (!this.typingState) return;
+    await removeTypingIndicator(this.client, this.typingState);
+    this.typingState = null;
   }
 
   // --------------------------------------------------------------------------
@@ -104,6 +150,9 @@ export class ReplySession {
     // First caller — trigger creation
     this.cardCreationPromise = (async () => {
       try {
+        // Start typing indicator in parallel with card creation
+        this.startTyping().catch(() => {});
+
         // Step 1: Get card_id (try pool first, fall back to card.create)
         let cardId = this.opts.cardPool?.shift() ?? null;
         if (cardId) {
@@ -146,6 +195,8 @@ export class ReplySession {
   /**
    * Push content to the streaming card. Creates the card lazily on first call.
    * Throttles updates to STREAMING_THROTTLE_MS (matches official CARDKIT_THROTTLE_MS).
+   * After long gaps (>2s), defers the first flush by BATCH_AFTER_GAP_MS to
+   * accumulate meaningful text (matches official pattern).
    *
    * @returns true if content was accepted (card exists or was created),
    *          false if card creation failed (caller should use post fallback).
@@ -160,24 +211,53 @@ export class ReplySession {
     // Throttle: skip if too soon, schedule deferred flush
     const now = Date.now();
     const elapsed = now - this.lastUpdateMs;
-    if (elapsed < STREAMING_THROTTLE_MS) {
-      if (this.pendingFlushTimer) clearTimeout(this.pendingFlushTimer);
+
+    if (elapsed >= STREAMING_THROTTLE_MS) {
+      // Past throttle window
+      if (this.pendingFlushTimer) {
+        clearTimeout(this.pendingFlushTimer);
+        this.pendingFlushTimer = null;
+      }
+
+      if (elapsed > LONG_GAP_THRESHOLD_MS && this.lastUpdateMs > 0) {
+        // After a long gap, batch briefly so the first visible update
+        // contains meaningful text rather than just 1-2 characters.
+        this.pendingFlushTimer = setTimeout(() => {
+          this.pendingFlushTimer = null;
+          this.flushContent();
+        }, BATCH_AFTER_GAP_MS);
+      } else {
+        // Normal streaming — flush immediately
+        this.flushContent();
+      }
+    } else if (!this.pendingFlushTimer) {
+      // Inside throttle window — schedule a deferred flush
       this.pendingFlushTimer = setTimeout(() => {
         this.pendingFlushTimer = null;
         this.flushContent();
       }, STREAMING_THROTTLE_MS - elapsed);
-      return true;
     }
 
-    this.flushContent();
     return true;
   }
 
   /**
-   * Flush current content to the card. Fire-and-forget to avoid blocking streaming.
+   * Flush current content to the card.
+   * Uses a mutex to prevent concurrent API calls (matches official flushInProgress).
+   * Out-of-order sequences cause 300317 errors — the mutex prevents this.
    */
   private flushContent(): void {
     if (!this.cardId || this.cardCompleted) return;
+
+    // Concurrent flush guard: if a flush is already in flight,
+    // mark needsReflush so we schedule a follow-up when it completes.
+    if (this.flushInProgress) {
+      this.needsReflush = true;
+      return;
+    }
+
+    this.flushInProgress = true;
+    this.needsReflush = false;
 
     const nextSeq = this.sequence + 1;
     this.sequence = nextSeq;
@@ -190,7 +270,6 @@ export class ReplySession {
 
     const optimized = optimizeMarkdownStyle(this.lastContent);
 
-    // Fire-and-forget — don't await (matches official pattern)
     streamCardContent(
       this.client,
       this.cardId,
@@ -199,6 +278,16 @@ export class ReplySession {
       nextSeq,
     ).catch((err) => {
       logger.warn({ cardId: this.cardId, seq: nextSeq, err }, 'Streaming content update failed');
+    }).finally(() => {
+      this.flushInProgress = false;
+      // If new content arrived during the API call, schedule a follow-up flush
+      if (this.needsReflush && !this.cardCompleted && !this.pendingFlushTimer) {
+        this.needsReflush = false;
+        this.pendingFlushTimer = setTimeout(() => {
+          this.pendingFlushTimer = null;
+          this.flushContent();
+        }, 0);
+      }
     });
   }
 
@@ -220,6 +309,9 @@ export class ReplySession {
       clearTimeout(this.pendingFlushTimer);
       this.pendingFlushTimer = null;
     }
+
+    // Stop typing indicator (best-effort, don't block on failure)
+    await this.stopTyping().catch(() => {});
 
     // Wait for in-progress card creation
     if (this.cardCreationPromise) {
@@ -276,6 +368,7 @@ export class ReplySession {
    */
   destroy(): void {
     this.cardCompleted = true;
+    this.typingStopped = true;
     if (this.pendingFlushTimer) {
       clearTimeout(this.pendingFlushTimer);
       this.pendingFlushTimer = null;

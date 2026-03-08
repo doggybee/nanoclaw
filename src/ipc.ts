@@ -16,19 +16,39 @@ import { ChatHistoryMessage, RegisteredGroup } from './types.js';
 
 /**
  * Resolve a container-internal path to the corresponding host path.
- * Container mounts: /workspace/group → groups/{folder}
+ * Supported container mount prefixes:
+ *   /workspace/group/  → groups/{folder}/
+ *   /workspace/project/ → project root (read-only)
  */
 function resolveContainerPath(containerPath: string, groupFolder: string): string {
-  if (!containerPath.startsWith('/workspace/group/')) {
-    throw new Error(`Invalid container path: ${containerPath}`);
+  if (containerPath.startsWith('/workspace/group/')) {
+    const relative = containerPath.slice('/workspace/group/'.length);
+    const groupDir = resolveGroupFolderPath(groupFolder);
+    const resolved = path.resolve(groupDir, relative);
+    if (!resolved.startsWith(groupDir + path.sep) && resolved !== groupDir) {
+      throw new Error(`Path escapes group directory: ${containerPath}`);
+    }
+    return resolved;
   }
-  const relative = containerPath.slice('/workspace/group/'.length);
-  const groupDir = resolveGroupFolderPath(groupFolder);
-  const resolved = path.resolve(groupDir, relative);
-  if (!resolved.startsWith(groupDir + path.sep) && resolved !== groupDir) {
-    throw new Error(`Path escapes group directory: ${containerPath}`);
+
+  if (containerPath.startsWith('/workspace/project/')) {
+    const relative = containerPath.slice('/workspace/project/'.length);
+    const projectRoot = process.cwd();
+    const resolved = path.resolve(projectRoot, relative);
+    if (!resolved.startsWith(projectRoot + path.sep) && resolved !== projectRoot) {
+      throw new Error(`Path escapes project directory: ${containerPath}`);
+    }
+    return resolved;
   }
-  return resolved;
+
+  if (containerPath.startsWith('/tmp/') || containerPath.startsWith('/home/')) {
+    throw new Error(
+      `Container path "${containerPath}" is not host-accessible. ` +
+      `Files must be saved to /workspace/group/ (e.g. /workspace/group/tmp/) to be sendable.`,
+    );
+  }
+
+  throw new Error(`Unsupported container path: ${containerPath}`);
 }
 
 export interface IpcDeps {

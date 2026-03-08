@@ -268,7 +268,10 @@ function createMockClient() {
   const start = Date.now();
   const track = (method: string) => (...args: any[]) => {
     calls.push({ method, args, ts: Date.now() - start });
-    return Promise.resolve({ data: { card_id: `card_${calls.length}` }, code: 0 });
+    return Promise.resolve({
+      data: { card_id: `card_${calls.length}`, reaction_id: `reaction_${calls.length}` },
+      code: 0,
+    });
   };
 
   const client = {
@@ -290,6 +293,10 @@ function createMockClient() {
           reply: track('im.message.reply'),
           create: track('im.message.create'),
         },
+      },
+      messageReaction: {
+        create: track('im.messageReaction.create'),
+        delete: track('im.messageReaction.delete'),
       },
     },
   };
@@ -462,6 +469,118 @@ describe('ReplySession lifecycle', () => {
     await session.abort();
     expect(calls.some(c => c.method === 'card.update')).toBe(true);
     expect(session.isActive).toBe(false);
+  });
+
+  it('adds typing indicator when replyToMessageId is set', async () => {
+    const { client, calls } = createMockClient();
+    const session = new ReplySession(client, 'lark:chat123', {
+      replyToMessageId: 'om_msg_123',
+    });
+
+    await session.pushContent('Hello');
+    // Typing indicator should be added
+    expect(calls.some(c => c.method === 'im.messageReaction.create')).toBe(true);
+  });
+
+  it('removes typing indicator on finalize', async () => {
+    const { client, calls } = createMockClient();
+    const session = new ReplySession(client, 'lark:chat123', {
+      replyToMessageId: 'om_msg_123',
+    });
+
+    await session.pushContent('test');
+    calls.length = 0;
+
+    await session.finalize();
+    // Typing indicator removal is fire-and-forget, advance timers
+    await vi.advanceTimersByTimeAsync(50);
+    expect(calls.some(c => c.method === 'im.messageReaction.delete')).toBe(true);
+  });
+
+  it('does not add typing without replyToMessageId', async () => {
+    const { client, calls } = createMockClient();
+    const session = new ReplySession(client, 'lark:chat123', {});
+
+    await session.pushContent('Hello');
+    expect(calls.some(c => c.method === 'im.messageReaction.create')).toBe(false);
+  });
+
+  it('uses deferred batch after long gap', async () => {
+    const { client, calls } = createMockClient();
+    const session = new ReplySession(client, 'lark:chat123', {});
+
+    // First push — creates card + streams
+    await session.pushContent('chunk1');
+    const initialStreamCalls = calls.filter(c => c.method === 'cardElement.content').length;
+
+    // Simulate a long gap (>2s) before next content
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // Push after long gap — should be batched, not immediate
+    await session.pushContent('chunk1chunk2');
+    const afterGapCalls = calls.filter(c => c.method === 'cardElement.content').length;
+    expect(afterGapCalls).toBe(initialStreamCalls); // Not flushed yet
+
+    // After BATCH_AFTER_GAP_MS (300ms), it should flush
+    await vi.advanceTimersByTimeAsync(350);
+    const afterBatchCalls = calls.filter(c => c.method === 'cardElement.content').length;
+    expect(afterBatchCalls).toBe(initialStreamCalls + 1);
+  });
+
+  it('concurrent flush mutex prevents overlapping API calls', async () => {
+    vi.useRealTimers(); // Need real timing for this test
+
+    // Create a mock that delays responses
+    const calls: string[] = [];
+    let resolveFlush: (() => void) | null = null as (() => void) | null;
+    const slowClient = {
+      cardkit: {
+        v1: {
+          card: {
+            create: () => Promise.resolve({ data: { card_id: 'card_1' }, code: 0 }),
+            update: () => Promise.resolve({ code: 0 }),
+            settings: () => Promise.resolve({ code: 0 }),
+          },
+          cardElement: {
+            content: () => {
+              calls.push('content_start');
+              return new Promise<any>(resolve => {
+                resolveFlush = () => {
+                  calls.push('content_end');
+                  resolve({ code: 0 });
+                };
+              });
+            },
+          },
+        },
+      },
+      im: {
+        v1: { message: { create: () => Promise.resolve({}), reply: () => Promise.resolve({}) } },
+        messageReaction: { create: () => Promise.resolve({}), delete: () => Promise.resolve({}) },
+      },
+    };
+
+    const session = new ReplySession(slowClient as any, 'lark:chat123', {});
+    await session.pushContent('first');
+
+    // First flush is in flight
+    expect(calls).toContain('content_start');
+    expect(calls).not.toContain('content_end');
+
+    // Second push should NOT start another concurrent API call
+    const callsBefore = calls.filter(c => c === 'content_start').length;
+    await session.pushContent('second');
+
+    // Resolve the first flush
+    resolveFlush?.();
+    // Wait enough for: first flush .finally() + throttle timer (100ms) + reflush
+    await new Promise(r => setTimeout(r, 200));
+
+    // Now the reflush should have fired with the second content
+    const totalCalls = calls.filter(c => c === 'content_start').length;
+    expect(totalCalls).toBeGreaterThanOrEqual(2); // Original + at least one reflush
+
+    session.destroy();
   });
 });
 
