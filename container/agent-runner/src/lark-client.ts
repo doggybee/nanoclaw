@@ -14,6 +14,11 @@ const appSecret = process.env.LARK_APP_SECRET;
 export const larkAvailable = !!(appId && appSecret);
 
 /** Lark SDK client. Only use after checking `larkAvailable`. */
+/** Strip the `lark:` prefix from a JID to get the raw chat_id. */
+export function extractChatId(jid: string): string {
+  return jid.replace(/^lark:/, '');
+}
+
 export const larkClient = larkAvailable
   ? new Client({
       appId: appId!,

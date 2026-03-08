@@ -19,13 +19,12 @@ import {
 import {
   buildThinkingCardJson,
   buildCompleteCard,
+  buildSimpleMarkdownCard,
   STREAMING_ELEMENT_ID,
   type CompleteCardOpts,
 } from './card-builder.js';
 import { optimizeMarkdownStyle } from './markdown-style.js';
 import { addTypingIndicator, removeTypingIndicator, type TypingState } from './typing.js';
-
-const STREAMING_THROTTLE_MS = 100;
 
 function log(message: string): void {
   console.error(`[reply-session] ${message}`);
@@ -39,13 +38,12 @@ export interface ReplySessionOpts {
 export class ReplySession {
   private cardId: string | null = null;
   private cardCreationPromise: Promise<void> | null = null;
-  private cardReady = false;
   cardCreationFailed = false;
   private cardCompleted = false;
   private sequence = 0;
-  private lastUpdateMs = 0;
   private lastContent = '';
-  private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private _optimizedContent = '';
+  private _optimizedFor = '';
   private readonly startedAt: number;
 
   private flushCount = 0;
@@ -69,6 +67,11 @@ export class ReplySession {
 
   get isActive(): boolean {
     return !this.cardCompleted;
+  }
+
+  /** Whether a card has been created (either CardKit or IM patch). */
+  private get cardReady(): boolean {
+    return !!(this.cardId || this.cardMessageId);
   }
 
   /** Whether a card was successfully created and content was delivered to the user. */
@@ -124,7 +127,6 @@ export class ReplySession {
           this.opts.replyToMessageId,
         );
 
-        this.cardReady = true;
         log(`card created and sent: cardId=${cardId} chatId=${this.chatId}`);
 
         // Flush any buffered content that arrived during card creation
@@ -136,15 +138,11 @@ export class ReplySession {
 
         // Level 2: IM patch fallback
         try {
-          const cardJson = {
-            config: { wide_screen_mode: true },
-            elements: [{ tag: 'markdown', content: '思考中...' }],
-          };
           const resp = await this.client.im.v1.message.create({
             data: {
               receive_id: this.chatId,
               msg_type: 'interactive',
-              content: JSON.stringify(cardJson),
+              content: JSON.stringify(buildSimpleMarkdownCard('思考中...')),
             },
             params: { receive_id_type: 'chat_id' },
           });
@@ -153,7 +151,6 @@ export class ReplySession {
 
           this.cardMessageId = messageId;
           this.useImPatch = true;
-          this.cardReady = true;
           log(`IM patch fallback active: messageId=${messageId}`);
 
           // Flush buffered content
@@ -178,7 +175,7 @@ export class ReplySession {
 
   /**
    * Push new content to the streaming card.
-   * SYNCHRONOUS — never awaits. Matches main branch fire-and-forget pattern.
+   * SYNCHRONOUS — never awaits. Caller (100ms setInterval in index.ts) handles throttling.
    * If card isn't ready yet, content is buffered and flushed when card creation completes.
    */
   pushContent(text: string): boolean {
@@ -190,19 +187,6 @@ export class ReplySession {
     // when ensureCardCreated() completes (see the flush-after-create logic above).
     if (!this.cardReady) return true;
 
-    const now = Date.now();
-    const elapsed = now - this.lastUpdateMs;
-
-    if (elapsed < STREAMING_THROTTLE_MS) {
-      // Too soon — schedule a deferred flush
-      if (this.pendingFlushTimer) clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = setTimeout(() => {
-        this.pendingFlushTimer = null;
-        this.flushContent();
-      }, STREAMING_THROTTLE_MS - elapsed);
-      return true;
-    }
-
     this.flushContent();
     return true;
   }
@@ -213,14 +197,13 @@ export class ReplySession {
     this.flushCount++;
     const nextSeq = this.sequence + 1;
     this.sequence = nextSeq;
-    this.lastUpdateMs = Date.now();
 
-    if (this.pendingFlushTimer) {
-      clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = null;
+    // Cache optimizeMarkdownStyle — only recompute when content changes
+    if (this.lastContent !== this._optimizedFor) {
+      this._optimizedFor = this.lastContent;
+      this._optimizedContent = optimizeMarkdownStyle(this.lastContent);
     }
-
-    const optimized = optimizeMarkdownStyle(this.lastContent);
+    const optimized = this._optimizedContent;
 
     if (this.flushCount <= 3 || this.flushCount % 10 === 0) {
       log(`flush #${this.flushCount}: seq=${nextSeq} len=${this.lastContent.length}`);
@@ -228,13 +211,9 @@ export class ReplySession {
 
     if (this.useImPatch && this.cardMessageId) {
       // Level 2: IM patch — fire-and-forget
-      const cardJson = {
-        config: { wide_screen_mode: true },
-        elements: [{ tag: 'markdown', content: optimized }],
-      };
       this.client.im.v1.message.patch({
         path: { message_id: this.cardMessageId },
-        data: { content: JSON.stringify(cardJson) },
+        data: { content: JSON.stringify(buildSimpleMarkdownCard(optimized)) },
       }).catch((err) => {
         log(`IM patch update failed: messageId=${this.cardMessageId} err=${err instanceof Error ? err.message : String(err)}`);
       });
@@ -267,15 +246,11 @@ export class ReplySession {
   private switchToImPatch(): void {
     if (this.useImPatch || !this.cardId) return;
 
-    const cardJson = {
-      config: { wide_screen_mode: true },
-      elements: [{ tag: 'markdown', content: this.lastContent || '...' }],
-    };
     this.client.im.v1.message.create({
       data: {
         receive_id: this.chatId,
         msg_type: 'interactive',
-        content: JSON.stringify(cardJson),
+        content: JSON.stringify(buildSimpleMarkdownCard(this.lastContent || '...')),
       },
       params: { receive_id_type: 'chat_id' },
     }).then((resp) => {
@@ -296,11 +271,6 @@ export class ReplySession {
   async finalize(opts?: CompleteCardOpts): Promise<void> {
     if (this.cardCompleted) return;
     this.cardCompleted = true;
-
-    if (this.pendingFlushTimer) {
-      clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = null;
-    }
 
     await this.stopTyping().catch(() => {});
 
@@ -362,9 +332,5 @@ export class ReplySession {
   destroy(): void {
     this.cardCompleted = true;
     this.typingStopped = true;
-    if (this.pendingFlushTimer) {
-      clearTimeout(this.pendingFlushTimer);
-      this.pendingFlushTimer = null;
-    }
   }
 }

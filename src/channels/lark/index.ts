@@ -86,11 +86,6 @@ function prepareTextForLark(text: string): string {
   return processed;
 }
 
-function markdownToPostContent(text: string): any {
-  const processed = prepareTextForLark(text);
-  return { zh_cn: { content: [[{ tag: 'md', text: processed }]] } };
-}
-
 function splitMarkdown(text: string, maxLen: number): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
@@ -507,7 +502,7 @@ class LarkChannel implements Channel {
   async sendMessage(
     jid: string,
     text: string,
-    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string },
+    opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string } },
   ): Promise<void> {
     if (!this.connected) {
       if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {

@@ -13,8 +13,9 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
-import { larkAvailable, larkClient } from './lark-client.js';
+import { larkAvailable, larkClient, extractChatId } from './lark-client.js';
 import { createCardEntity, sendCardByCardId } from './lark/cardkit.js';
+import { buildSimpleMarkdownCard } from './lark/card-builder.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -43,8 +44,16 @@ mcpLog('startup', `larkAvailable=${larkAvailable} chatJid=${chatJid} groupFolder
 // Helpers
 // ---------------------------------------------------------------------------
 
-function extractChatId(jid: string): string {
-  return jid.replace(/^lark:/, '');
+function extractLarkError(err: any): { code: any; msg: string } {
+  return {
+    code: err?.code ?? err?.data?.code,
+    msg: err?.msg || err?.message || '',
+  };
+}
+
+function noLarkError(tool: string) {
+  mcpLog(tool, 'no Lark credentials, returning error');
+  return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
 }
 
 function detectFileType(filePath: string): string {
@@ -105,10 +114,8 @@ server.tool(
         mcpLog('add_reaction', `success: ${args.emoji_type} on ${args.message_id}`);
         return { content: [{ type: 'text' as const, text: `Reaction ${args.emoji_type} added to message ${args.message_id}.` }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('add_reaction', `error: code=${code} msg=${msg}`);
-        // 231001 = invalid emoji type
         if (code === 231001) {
           return { content: [{ type: 'text' as const, text: `Emoji type "${args.emoji_type}" is not a valid Feishu reaction.` }], isError: true };
         }
@@ -116,9 +123,7 @@ server.tool(
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('add_reaction', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('add_reaction');
   },
 );
 
@@ -198,16 +203,13 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
         mcpLog('get_chat_history', `success: ${messages.length} messages`);
         return { content: [{ type: 'text' as const, text: formatted }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('get_chat_history', `error: code=${code} msg=${msg}`);
         return { content: [{ type: 'text' as const, text: `Error fetching chat history: ${msg || 'unknown error'}` }], isError: true };
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('get_chat_history', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('get_chat_history');
   },
 );
 
@@ -274,16 +276,13 @@ When a user clicks, you receive: [Card action: choose data={"action_id":"choose"
         mcpLog('send_card', `success: cardId=${cardId}`);
         return { content: [{ type: 'text' as const, text: 'Interactive card sent.' }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('send_card', `error: code=${code} msg=${msg}`);
         return { content: [{ type: 'text' as const, text: `Failed to send card: ${msg || 'unknown error'}` }], isError: true };
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('send_card', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('send_card');
   },
 );
 
@@ -300,18 +299,15 @@ server.tool(
     if (larkAvailable) {
       // Try interactive card format first (most bot messages are CardKit cards)
       try {
-        const interactiveContent = JSON.stringify({
-          config: { wide_screen_mode: true },
-          elements: [{ tag: 'markdown', content: args.text }],
-        });
         await larkClient.im.v1.message.patch({
           path: { message_id: args.message_id },
-          data: { content: interactiveContent },
+          data: { content: JSON.stringify(buildSimpleMarkdownCard(args.text)) },
         });
         mcpLog('edit_message', `success: interactive format on ${args.message_id}`);
         return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
       } catch (err: any) {
-        mcpLog('edit_message', `interactive format failed: code=${err?.code ?? err?.data?.code} msg=${err?.msg || err?.message}`);
+        const { code, msg } = extractLarkError(err);
+        mcpLog('edit_message', `interactive format failed: code=${code} msg=${msg}`);
       }
 
       // Try post format (for text/post messages)
@@ -326,16 +322,13 @@ server.tool(
         mcpLog('edit_message', `success: post format on ${args.message_id}`);
         return { content: [{ type: 'text' as const, text: `Message ${args.message_id} edited.` }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('edit_message', `post format also failed: code=${code} msg=${msg}`);
         return { content: [{ type: 'text' as const, text: `Failed to edit message: ${msg || 'unknown error'}` }], isError: true };
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('edit_message', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('edit_message');
   },
 );
 
@@ -377,16 +370,13 @@ server.tool(
         mcpLog('send_image', `success: imageKey=${imageKey}`);
         return { content: [{ type: 'text' as const, text: `Image sent: ${args.image_path}` }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('send_image', `error: code=${code} msg=${msg}`);
         return { content: [{ type: 'text' as const, text: `Failed to send image: ${msg || 'unknown error'}` }], isError: true };
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('send_image', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('send_image');
   },
 );
 
@@ -435,16 +425,13 @@ server.tool(
         mcpLog('send_file', `success: fileKey=${fileKey} type=${fileType}`);
         return { content: [{ type: 'text' as const, text: `File sent: ${args.file_path}` }] };
       } catch (err: any) {
-        const code = err?.code ?? err?.data?.code;
-        const msg = err?.msg || err?.message || '';
+        const { code, msg } = extractLarkError(err);
         mcpLog('send_file', `error: code=${code} msg=${msg}`);
         return { content: [{ type: 'text' as const, text: `Failed to send file: ${msg || 'unknown error'}` }], isError: true };
       }
     }
 
-    // IPC fallback — no longer handled by host
-    mcpLog('send_file', 'no Lark credentials, returning error');
-    return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
+    return noLarkError('send_file');
   },
 );
 
@@ -462,23 +449,18 @@ if (isTask) {
 
       if (larkAvailable) {
         try {
-          const cardJson = {
-            config: { wide_screen_mode: true },
-            elements: [{ tag: 'markdown', content: args.text }],
-          };
           await larkClient.im.v1.message.create({
             params: { receive_id_type: 'chat_id' },
             data: {
               receive_id: extractChatId(chatJid),
               msg_type: 'interactive',
-              content: JSON.stringify(cardJson),
+              content: JSON.stringify(buildSimpleMarkdownCard(args.text)),
             },
           });
           mcpLog('send_message', 'success');
           return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
         } catch (err: any) {
-          const code = err?.code ?? err?.data?.code;
-          const msg = err?.msg || err?.message || '';
+          const { code, msg } = extractLarkError(err);
           mcpLog('send_message', `error: code=${code} msg=${msg}`);
           return { content: [{ type: 'text' as const, text: `Failed to send message: ${msg || 'unknown error'}` }], isError: true };
         }

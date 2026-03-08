@@ -324,17 +324,12 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Pass model override if configured
-  const envModel = readEnvFile(['CLAUDE_MODEL']).CLAUDE_MODEL;
-  if (envModel) {
-    args.push('-e', `CLAUDE_MODEL=${envModel}`);
-  }
-
-  // Pass Lark credentials so container can call Lark API directly
-  const larkEnv = readEnvFile(['LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN']);
-  if (larkEnv.LARK_APP_ID) args.push('-e', `LARK_APP_ID=${larkEnv.LARK_APP_ID}`);
-  if (larkEnv.LARK_APP_SECRET) args.push('-e', `LARK_APP_SECRET=${larkEnv.LARK_APP_SECRET}`);
-  if (larkEnv.LARK_DOMAIN) args.push('-e', `LARK_DOMAIN=${larkEnv.LARK_DOMAIN}`);
+  // Pass model override and Lark credentials so container can call Lark API directly
+  const env = readEnvFile(['CLAUDE_MODEL', 'LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN']);
+  if (env.CLAUDE_MODEL) args.push('-e', `CLAUDE_MODEL=${env.CLAUDE_MODEL}`);
+  if (env.LARK_APP_ID) args.push('-e', `LARK_APP_ID=${env.LARK_APP_ID}`);
+  if (env.LARK_APP_SECRET) args.push('-e', `LARK_APP_SECRET=${env.LARK_APP_SECRET}`);
+  if (env.LARK_DOMAIN) args.push('-e', `LARK_DOMAIN=${env.LARK_DOMAIN}`);
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),

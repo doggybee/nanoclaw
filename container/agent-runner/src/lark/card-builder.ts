@@ -5,7 +5,7 @@
 import { optimizeMarkdownStyle } from './markdown-style.js';
 
 export const STREAMING_ELEMENT_ID = 'streaming_content';
-export const LOADING_ELEMENT_ID = 'loading_icon';
+const LOADING_ELEMENT_ID = 'loading_icon';
 
 export function buildThinkingCardJson(): Record<string, any> {
   return {
@@ -44,6 +44,11 @@ export interface CompleteCardOpts {
   reasoningText?: string;
   reasoningElapsedMs?: number;
   elapsedMs?: number;
+}
+
+/** Simple interactive card with a single markdown element (for IM patch fallback). */
+export function buildSimpleMarkdownCard(content: string): Record<string, any> {
+  return { config: { wide_screen_mode: true }, elements: [{ tag: 'markdown', content }] };
 }
 
 export function buildCompleteCard(

@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
-import { larkAvailable, larkClient } from './lark-client.js';
+import { larkAvailable, larkClient, extractChatId } from './lark-client.js';
 import { ReplySession } from './lark/reply-session.js';
 
 interface ContainerInput {
@@ -69,22 +69,28 @@ interface SDKUserMessage {
 class TextAccumulator {
   private currentTurn = '';
   private allTurns = '';
+  private _cachedFull = '';
+  private _dirty = false;
 
-  push(delta: string): void { this.currentTurn += delta; }
+  push(delta: string): void {
+    this.currentTurn += delta;
+    this._dirty = true;
+  }
 
-  /** Full text: all previous turns + current turn. */
+  /** Full text: all previous turns + current turn. Cached until content changes. */
   get fullText(): string {
-    return this.allTurns
-      ? this.allTurns + '\n\n' + this.currentTurn
-      : this.currentTurn;
+    if (this._dirty) {
+      this._cachedFull = this.allTurns
+        ? this.allTurns + (this.currentTurn ? '\n\n' + this.currentTurn : '')
+        : this.currentTurn;
+      this._dirty = false;
+    }
+    return this._cachedFull;
   }
 
   /** Final text (at query end). Returns null if no content. */
   get finalText(): string | null {
-    const combined = this.allTurns
-      ? this.allTurns + (this.currentTurn ? '\n\n' + this.currentTurn : '')
-      : this.currentTurn;
-    return combined || null;
+    return this.fullText || null;
   }
 
   /** Called when an assistant turn ends — archives current turn text. */
@@ -93,13 +99,10 @@ class TextAccumulator {
       this.allTurns += (this.allTurns ? '\n\n' : '') + this.currentTurn;
     }
     this.currentTurn = '';
+    this._dirty = true;
   }
 
   get hasContent(): boolean { return this.currentTurn.length > 0; }
-}
-
-function extractChatId(jid: string): string {
-  return jid.replace(/^lark:/, '');
 }
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
@@ -374,11 +377,12 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  * Check for _close sentinel.
  */
 function shouldClose(): boolean {
-  if (fs.existsSync(IPC_INPUT_CLOSE_SENTINEL)) {
-    try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try {
+    fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL);
     return true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 interface IpcMessage {
@@ -621,9 +625,6 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-            ...(process.env.LARK_APP_ID ? { LARK_APP_ID: process.env.LARK_APP_ID } : {}),
-            ...(process.env.LARK_APP_SECRET ? { LARK_APP_SECRET: process.env.LARK_APP_SECRET } : {}),
-            ...(process.env.LARK_DOMAIN ? { LARK_DOMAIN: process.env.LARK_DOMAIN } : {}),
             ...(containerInput.isScheduledTask ? { NANOCLAW_IS_TASK: '1' } : {}),
           },
         },
