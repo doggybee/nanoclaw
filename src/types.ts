@@ -89,6 +89,9 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: emoji reaction on a message.
   addReaction?(jid: string, messageId: string, emojiType: string): Promise<void>;
+  // Optional: record the start time for a streaming session (for elapsed-time display).
+  // Does NOT create or send any card — cards are created lazily on first content.
+  recordStreamingStart?(keyOrJid: string, startedAt: number): void;
   // Optional: pre-create a streaming card so the first chunk only needs a content update.
   // keyOrJid can be a slotKey (for per-user isolation) or a plain jid.
   beginStreaming?(keyOrJid: string, opts?: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; startedAt?: number }): Promise<void>;

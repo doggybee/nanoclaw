@@ -13,7 +13,7 @@ import {
   TRIGGER_PATTERN,
   WARM_POOL_SIZE,
 } from './config.js';
-import { LarkChannel } from './channels/lark.js';
+import { LarkChannel } from './channels/lark/index.js';
 import {
   ContainerOutput,
   WarmContainerHandle,
@@ -441,19 +441,10 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
 
   await channel.setTyping?.(chatJid, true);
 
-  // Pre-create streaming card (using slotKey for isolation)
-  // Use the earliest message timestamp as start time for accurate elapsed display
+  // Record start time for elapsed display — card created lazily on first content
   const messageReceivedAt = new Date(senderMessages[0].timestamp).getTime();
   const streamingStartedAt = Number.isFinite(messageReceivedAt) ? messageReceivedAt : Date.now();
-  const replyTarget = pendingReplyTo[slotKey];
-  if (channel.beginStreaming) {
-    channel.beginStreaming(slotKey, replyTarget
-      ? { replyToMessageId: replyTarget.messageId, mentionUser: { id: replyTarget.senderId, name: replyTarget.senderName }, startedAt: streamingStartedAt }
-      : { startedAt: streamingStartedAt },
-    ).catch((err) => {
-      logger.warn({ slotKey, err }, 'Failed to pre-create streaming card, will create on first chunk');
-    });
-  }
+  channel.recordStreamingStart?.(slotKey, streamingStartedAt);
 
   let hadError = false;
   let outputSentToUser = false;
@@ -725,17 +716,8 @@ async function startMessageLoop(): Promise<void> {
               saveState();
               // Update reply target
               pendingReplyTo[slotKey] = findReplyTarget(senderMsgs, needsTrigger);
-              // Pre-create streaming card for the piped message
-              // (same as processSlotMessages does for fresh containers)
-              const pipeReplyTarget = pendingReplyTo[slotKey];
-              if (channel.beginStreaming) {
-                channel.beginStreaming(slotKey, pipeReplyTarget
-                  ? { replyToMessageId: pipeReplyTarget.messageId, mentionUser: { id: pipeReplyTarget.senderId, name: pipeReplyTarget.senderName } }
-                  : undefined,
-                ).catch((err) => {
-                  logger.warn({ slotKey, err }, 'Failed to pre-create streaming card, will create on first chunk');
-                });
-              }
+              // Record start time for piped message — card created lazily on first content
+              channel.recordStreamingStart?.(slotKey, Date.now());
               // Show typing indicator
               channel
                 .setTyping?.(chatJid, true)

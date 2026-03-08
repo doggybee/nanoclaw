@@ -1,0 +1,284 @@
+/**
+ * Reply session — manages the lifecycle of one streaming card reply.
+ *
+ * Adapted from the official feishu-openclaw-plugin's reply-dispatcher.js.
+ * Each session corresponds to one slot (one user in one group) and handles:
+ *   1. Lazy card creation (ensureCardCreated — only on first content)
+ *   2. Throttled content streaming (pushContent → cardElement.content)
+ *   3. Card finalization (finalize → close streaming + complete card)
+ *
+ * The official plugin uses closures inside createFeishuReplyDispatcher().
+ * We use a class with equivalent state variables and the same lifecycle.
+ */
+import type * as Lark from '@larksuiteoapi/node-sdk';
+
+import { logger } from '../../logger.js';
+import {
+  createCardEntity,
+  streamCardContent,
+  updateCardKitCard,
+  setCardStreamingMode,
+  sendCardByCardId,
+} from './cardkit.js';
+import {
+  buildThinkingCardJson,
+  buildCompleteCard,
+  STREAMING_ELEMENT_ID,
+  type CompleteCardOpts,
+} from './card-builder.js';
+import { optimizeMarkdownStyle } from './markdown-style.js';
+
+// Matches official plugin's CARDKIT_THROTTLE_MS.
+const STREAMING_THROTTLE_MS = 100;
+
+export interface ReplySessionOpts {
+  /** Message to reply to (first message in the batch). */
+  replyToMessageId?: string;
+  /** When the user's message was received (for elapsed time display). */
+  startedAt?: number;
+  /** Shared card pool — sessions borrow pre-created card IDs from here. */
+  cardPool?: string[];
+  /** Callback to refill the shared card pool after borrowing. */
+  refillCardPool?: () => void;
+}
+
+/**
+ * A single streaming reply session for one slot.
+ *
+ * State machine matches the official plugin's reply-dispatcher:
+ *   (idle) → ensureCardCreated → pushContent* → finalize
+ */
+export class ReplySession {
+  // ---- State matching official reply-dispatcher.js ----
+  /** CardKit card entity ID (set after card.create). */
+  private cardId: string | null = null;
+  /** Promise for in-progress card creation (prevents race conditions). */
+  private cardCreationPromise: Promise<void> | null = null;
+  /** True if card creation failed — skip further streaming attempts. */
+  private cardCreationFailed = false;
+  /** True after finalize() — guard against duplicate finalization. */
+  private cardCompleted = false;
+  /** Monotonically increasing sequence for CardKit operations. */
+  private sequence = 0;
+  /** Timestamp of last cardElement.content() call — for throttling. */
+  private lastUpdateMs = 0;
+  /** Last pushed text — for building the final complete card. */
+  private lastContent = '';
+  /** Pending deferred flush timer. */
+  private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** When the session started (message receipt time). */
+  private readonly startedAt: number;
+
+  constructor(
+    private readonly client: Lark.Client,
+    private readonly jid: string,
+    private readonly opts: ReplySessionOpts,
+  ) {
+    this.startedAt = opts.startedAt ?? Date.now();
+  }
+
+  /** Whether this session has an active (not yet finalized) card. */
+  get isActive(): boolean {
+    return !this.cardCompleted;
+  }
+
+  // --------------------------------------------------------------------------
+  // ensureCardCreated — matches official ensureCardCreated()
+  // --------------------------------------------------------------------------
+
+  /**
+   * Lazily create the streaming card. Safe to call multiple times — the first
+   * caller triggers creation, subsequent callers await the same promise.
+   * Matches the official plugin's ensureCardCreated().
+   */
+  async ensureCardCreated(): Promise<void> {
+    // Already created or failed
+    if (this.cardId || this.cardCreationFailed || this.cardCompleted) return;
+
+    // Creation in progress — await same promise (prevents race)
+    if (this.cardCreationPromise) {
+      await this.cardCreationPromise;
+      return;
+    }
+
+    // First caller — trigger creation
+    this.cardCreationPromise = (async () => {
+      try {
+        // Step 1: Get card_id (try pool first, fall back to card.create)
+        let cardId = this.opts.cardPool?.shift() ?? null;
+        if (cardId) {
+          logger.debug({ cardId, poolRemaining: this.opts.cardPool?.length }, 'ReplySession: using pooled card');
+          this.opts.refillCardPool?.();
+        } else {
+          cardId = await createCardEntity(this.client, buildThinkingCardJson());
+          if (!cardId) throw new Error('card.create returned empty card_id');
+        }
+
+        this.cardId = cardId;
+        this.sequence = 1;
+
+        // Step 2: Send IM message referencing card_id
+        await sendCardByCardId(
+          this.client,
+          this.jid,
+          cardId,
+          this.opts.replyToMessageId,
+        );
+
+        logger.info({ jid: this.jid, cardId }, 'ReplySession: card created and sent');
+      } catch (err) {
+        logger.warn({ jid: this.jid, err }, 'ReplySession: card creation failed');
+        this.cardCreationFailed = true;
+      }
+    })();
+
+    try {
+      await this.cardCreationPromise;
+    } finally {
+      this.cardCreationPromise = null;
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // pushContent — matches official onPartialReply → throttledCardUpdate
+  // --------------------------------------------------------------------------
+
+  /**
+   * Push content to the streaming card. Creates the card lazily on first call.
+   * Throttles updates to STREAMING_THROTTLE_MS (matches official CARDKIT_THROTTLE_MS).
+   *
+   * @returns true if content was accepted (card exists or was created),
+   *          false if card creation failed (caller should use post fallback).
+   */
+  async pushContent(text: string): Promise<boolean> {
+    // Ensure card exists
+    await this.ensureCardCreated();
+    if (!this.cardId || this.cardCompleted) return false;
+
+    this.lastContent = text;
+
+    // Throttle: skip if too soon, schedule deferred flush
+    const now = Date.now();
+    const elapsed = now - this.lastUpdateMs;
+    if (elapsed < STREAMING_THROTTLE_MS) {
+      if (this.pendingFlushTimer) clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = setTimeout(() => {
+        this.pendingFlushTimer = null;
+        this.flushContent();
+      }, STREAMING_THROTTLE_MS - elapsed);
+      return true;
+    }
+
+    this.flushContent();
+    return true;
+  }
+
+  /**
+   * Flush current content to the card. Fire-and-forget to avoid blocking streaming.
+   */
+  private flushContent(): void {
+    if (!this.cardId || this.cardCompleted) return;
+
+    const nextSeq = this.sequence + 1;
+    this.sequence = nextSeq;
+    this.lastUpdateMs = Date.now();
+
+    if (this.pendingFlushTimer) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+
+    const optimized = optimizeMarkdownStyle(this.lastContent);
+
+    // Fire-and-forget — don't await (matches official pattern)
+    streamCardContent(
+      this.client,
+      this.cardId,
+      STREAMING_ELEMENT_ID,
+      optimized,
+      nextSeq,
+    ).catch((err) => {
+      logger.warn({ cardId: this.cardId, seq: nextSeq, err }, 'Streaming content update failed');
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // finalize — matches official onIdle (close streaming → complete card)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Finalize the streaming card: close streaming mode, replace with complete card.
+   * Matches the official plugin's onIdle handler.
+   */
+  async finalize(opts?: CompleteCardOpts): Promise<void> {
+    // Guard against duplicate calls
+    if (this.cardCompleted) return;
+    this.cardCompleted = true;
+
+    // Cancel pending flush
+    if (this.pendingFlushTimer) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+
+    // Wait for in-progress card creation
+    if (this.cardCreationPromise) {
+      await this.cardCreationPromise;
+    }
+
+    // No card was ever created — nothing to finalize
+    if (!this.cardId) return;
+
+    try {
+      // Step 1: Close streaming mode (required before card.update)
+      this.sequence += 1;
+      await setCardStreamingMode(
+        this.client,
+        this.cardId,
+        false,
+        this.sequence,
+      );
+
+      // Step 2: Build and apply complete card
+      const elapsedMs = Date.now() - this.startedAt;
+      const completeCard = buildCompleteCard(
+        this.lastContent || 'Done.',
+        {
+          ...opts,
+          elapsedMs,
+        },
+      );
+
+      this.sequence += 1;
+      await updateCardKitCard(
+        this.client,
+        this.cardId,
+        completeCard,
+        this.sequence,
+      );
+
+      logger.info({ cardId: this.cardId, elapsedMs }, 'ReplySession: card finalized');
+    } catch (err) {
+      logger.warn({ cardId: this.cardId, err }, 'ReplySession: finalize failed');
+    }
+  }
+
+  /**
+   * Abort the streaming card (best-effort).
+   * Used when the container process exits abnormally.
+   */
+  async abort(): Promise<void> {
+    await this.finalize({ isError: true });
+  }
+
+  /**
+   * Clean up without finalizing (e.g., on disconnect).
+   */
+  destroy(): void {
+    this.cardCompleted = true;
+    if (this.pendingFlushTimer) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+  }
+}
