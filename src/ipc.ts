@@ -33,7 +33,6 @@ function resolveContainerPath(containerPath: string, groupFolder: string): strin
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
-  endStreaming?: (jid: string) => Promise<void>;
   addReaction?: (jid: string, messageId: string, emojiType: string) => Promise<void>;
   sendImage?: (jid: string, imagePath: string) => Promise<void>;
   sendFile?: (jid: string, filePath: string) => Promise<void>;
@@ -84,6 +83,7 @@ async function processIpcMessage(
   isMain: boolean,
   deps: IpcDeps,
   ipcBaseDir: string,
+  slotId?: string,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
   const { type, chatJid } = data;
@@ -97,15 +97,6 @@ async function processIpcMessage(
   }
 
   switch (type) {
-    case 'message': {
-      if (!data.text) return;
-      await deps.sendMessage(chatJid, data.text);
-      // Finalize the streaming card immediately (IPC messages are one-shot)
-      await deps.endStreaming?.(chatJid);
-      logger.info({ chatJid, sourceGroup }, 'IPC message sent');
-      return;
-    }
-
     case 'add_reaction': {
       if (!data.messageId || !data.emojiType) return;
       if (!deps.addReaction) {
@@ -168,8 +159,9 @@ async function processIpcMessage(
       // Write response to the slot's responses dir if slotId is present,
       // otherwise fall back to group-level responses dir.
       const groupIpcDir = path.join(ipcBaseDir, sourceGroup);
-      const responseBase = data.slotId
-        ? path.join(groupIpcDir, 'slots', data.slotId, 'responses')
+      const effectiveSlotId = slotId || data.slotId;
+      const responseBase = effectiveSlotId
+        ? path.join(groupIpcDir, 'slots', effectiveSlotId, 'responses')
         : path.join(groupIpcDir, 'responses');
       // Sanitize: ensure response path stays within the group's IPC directory
       const sanitizedRequestId = String(data.requestId).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -283,7 +275,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
           const slotTasksDir = path.join(slotsDir, slotId, 'tasks');
 
           await processDir(slotMessagesDir, sourceGroup, (data) =>
-            processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir),
+            processIpcMessage(data, sourceGroup, isMain, deps, ipcBaseDir, slotId),
           );
           await processDir(slotTasksDir, sourceGroup, (data) =>
             processTaskIpc(data, sourceGroup, isMain, deps),

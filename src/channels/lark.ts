@@ -27,133 +27,39 @@ const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
- * Parse a single line of text into an array of Lark post elements.
- * Handles:
- * - <at user_id="...">name</at> → {tag: "at", user_id: "..."}
- * - [text](url)                 → {tag: "a", text, href}
- * - **bold**                    → {tag: "text", text, style: ["bold"]}
- * - *italic*                    → {tag: "text", text, style: ["italic"]}
- * - `code`                      → {tag: "text", text, style: ["code"]}
- * - Plain text                  → {tag: "text", text}
+ * Normalise `<at>` mention tags that AI frequently writes incorrectly.
+ * Fixes: `<at id=xxx>`, `<at open_id="xxx">`, unquoted values.
+ * Matches official feishu-openclaw-plugin's normalizeAtMentions().
  */
-function parseLineToElements(line: string): any[] {
-  const elements: any[] = [];
-  let remaining = line;
-
-  while (remaining.length > 0) {
-    // Lark @mention: <at user_id="...">name</at>
-    const atMatch = remaining.match(/^<at user_id="([^"]+)">([^<]*)<\/at>/);
-    if (atMatch) {
-      elements.push({ tag: 'at', user_id: atMatch[1], user_name: atMatch[2] });
-      remaining = remaining.slice(atMatch[0].length);
-      continue;
-    }
-
-    // Markdown links: [text](url)
-    const linkMatch = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
-    if (linkMatch) {
-      elements.push({ tag: 'a', text: linkMatch[1], href: linkMatch[2] });
-      remaining = remaining.slice(linkMatch[0].length);
-      continue;
-    }
-
-    // Inline code: `code`
-    const codeMatch = remaining.match(/^`([^`]+)`/);
-    if (codeMatch) {
-      elements.push({ tag: 'text', text: codeMatch[1], style: ['code'] });
-      remaining = remaining.slice(codeMatch[0].length);
-      continue;
-    }
-
-    // Bold: **text**
-    const boldMatch = remaining.match(/^\*\*(.+?)\*\*/);
-    if (boldMatch) {
-      elements.push({ tag: 'text', text: boldMatch[1], style: ['bold'] });
-      remaining = remaining.slice(boldMatch[0].length);
-      continue;
-    }
-
-    // Italic: *text* (but not **)
-    const italicMatch = remaining.match(/^\*([^*]+)\*/);
-    if (italicMatch) {
-      elements.push({ tag: 'text', text: italicMatch[1], style: ['italic'] });
-      remaining = remaining.slice(italicMatch[0].length);
-      continue;
-    }
-
-    // Plain text: consume until next special character
-    const plainMatch = remaining.match(/^([^*`\[<]+)/);
-    if (plainMatch) {
-      elements.push({ tag: 'text', text: plainMatch[1] });
-      remaining = remaining.slice(plainMatch[0].length);
-      continue;
-    }
-
-    // Fallback: consume one character
-    elements.push({ tag: 'text', text: remaining[0] });
-    remaining = remaining.slice(1);
-  }
-
-  return elements;
+function normalizeAtMentions(text: string): string {
+  return text.replace(
+    /<at\s+(?:id|open_id|user_id)\s*=\s*"?([^">\s]+)"?\s*>/gi,
+    '<at user_id="$1">',
+  );
 }
 
 /**
- * Convert markdown text to Lark post message content structure.
- * Post messages are rich text (NOT cards).
- *
- * Supported: text (with bold/italic/code styles), a (links), at (@mentions).
- * Headings (# ...) → bold text.
- * Fenced code blocks (```) → preserved as plain text lines.
+ * Pre-process text for Lark rendering:
+ * mention normalisation + markdown style optimization.
+ * Matches official feishu-openclaw-plugin's prepareTextForLark().
+ */
+function prepareTextForLark(text: string): string {
+  let processed = normalizeAtMentions(text);
+  processed = optimizeMarkdownStyle(processed, 1);
+  return processed;
+}
+
+/**
+ * Build a Lark post-format content envelope using the `md` tag.
+ * The `md` tag lets Lark handle markdown rendering natively,
+ * matching the official feishu-openclaw-plugin's approach.
  */
 export function markdownToPostContent(text: string): any {
-  const lines = text.split('\n');
-  const content: any[][] = [];
-  let inCodeBlock = false;
-
-  for (const line of lines) {
-    // Fenced code block toggle: ```
-    // Post format has no code_block tag, so preserve raw text as-is.
-    if (line.trimStart().startsWith('```')) {
-      inCodeBlock = !inCodeBlock;
-      content.push([{ tag: 'text', text: line }]);
-      continue;
-    }
-
-    // Inside code block: emit raw text without markdown parsing
-    if (inCodeBlock) {
-      content.push([{ tag: 'text', text: line }]);
-      continue;
-    }
-
-    // Heading: "## Title" → bold text
-    const headingMatch = line.match(/^(#{1,6})\s+(.*)/);
-    if (headingMatch) {
-      const headingElements = parseLineToElements(headingMatch[2]);
-      // Wrap all elements with bold style
-      for (const el of headingElements) {
-        if (el.tag === 'text') {
-          el.style = el.style ? [...el.style, 'bold'] : ['bold'];
-        }
-      }
-      content.push(headingElements);
-      continue;
-    }
-
-    // Empty line → paragraph break
-    if (line.length === 0) {
-      content.push([{ tag: 'text', text: '' }]);
-      continue;
-    }
-
-    const elements = parseLineToElements(line);
-    if (elements.length > 0) {
-      content.push(elements);
-    }
-  }
-
+  const processed = prepareTextForLark(text);
   return {
-    zh_cn: { content },
-    en_us: { content },
+    zh_cn: {
+      content: [[{ tag: 'md', text: processed }]],
+    },
   };
 }
 
@@ -206,9 +112,19 @@ export function splitMarkdown(text: string, maxLen: number): string[] {
  * - Code block spacing: adds <br> before/after code blocks
  * - Consecutive headings: adds <br> between them
  * - Compresses excess blank lines
+ * - Strips invalid image keys (prevents CardKit error 200570)
  */
 export function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
   try {
+    let r = _optimizeMarkdownStyleInner(text, cardVersion);
+    r = stripInvalidImageKeys(r);
+    return r;
+  } catch {
+    return text;
+  }
+}
+
+function _optimizeMarkdownStyleInner(text: string, cardVersion: number): string {
     // 1. Extract code blocks, protect with placeholders
     const MARK = '___CB_';
     const codeBlocks: string[] = [];
@@ -247,9 +163,26 @@ export function optimizeMarkdownStyle(text: string, cardVersion = 2): string {
     // 6. Compress excess blank lines
     r = r.replace(/\n{3,}/g, '\n\n');
     return r;
-  } catch {
-    return text;
-  }
+}
+
+// ---------------------------------------------------------------------------
+// stripInvalidImageKeys — from official feishu-openclaw-plugin
+// ---------------------------------------------------------------------------
+/** Matches complete markdown image syntax: `![alt](value)` */
+const IMAGE_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+
+/**
+ * Strip `![alt](value)` where value is not a valid Feishu image key
+ * (`img_xxx`) or remote URL. Prevents CardKit error 200570.
+ */
+function stripInvalidImageKeys(text: string): string {
+  if (!text.includes('![')) return text;
+  return text.replace(IMAGE_RE, (fullMatch, _alt: string, value: string) => {
+    if (value.startsWith('img_')) return fullMatch;
+    if (value.startsWith('http://')) return fullMatch;
+    if (value.startsWith('https://')) return fullMatch;
+    return value;
+  });
 }
 
 /**
@@ -292,31 +225,108 @@ function convertMarkdownTables(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Message unavailable guard
+// Message unavailable guard — from official feishu-openclaw-plugin
 // ---------------------------------------------------------------------------
-// Lark API error codes for recalled/deleted messages
 const TERMINAL_MESSAGE_CODES = new Set([230011, 231003]);
 const UNAVAILABLE_CACHE_TTL_MS = 30 * 60 * 1000;
-const unavailableMessages = new Map<string, number>();
+const MAX_CACHE_SIZE_BEFORE_PRUNE = 512;
 
-function extractLarkApiCode(err: any): number | undefined {
-  if (!err || typeof err !== 'object') return undefined;
-  const code = err.code ?? err.data?.code ?? err.response?.data?.code;
-  if (typeof code === 'number' && Number.isFinite(code)) return code;
-  if (typeof code === 'string') {
-    const n = Number(code);
-    if (Number.isFinite(n)) return n;
+interface UnavailableState {
+  apiCode: number;
+  operation?: string;
+  markedAtMs: number;
+}
+
+const unavailableMessages = new Map<string, UnavailableState>();
+
+/** Normalize composite message IDs (e.g. "om_xxx:auth-complete" → "om_xxx"). */
+function normalizeMessageId(messageId: string | undefined): string | undefined {
+  if (!messageId) return undefined;
+  const colonIndex = messageId.indexOf(':');
+  if (colonIndex >= 0) return messageId.slice(0, colonIndex);
+  return messageId;
+}
+
+function coerceCode(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
 }
 
-async function withMessageGuard<T>(messageId: string | undefined, fn: () => Promise<T>): Promise<T> {
-  if (!messageId) return fn();
+/** Extract Feishu API error code from SDK thrown errors. */
+function extractLarkApiCode(err: any): number | undefined {
+  if (!err || typeof err !== 'object') return undefined;
+  return coerceCode(err.code)
+    ?? coerceCode(err.data?.code)
+    ?? coerceCode(err.response?.data?.code);
+}
 
-  // Check if already marked unavailable
-  const markedAt = unavailableMessages.get(messageId);
-  if (markedAt && Date.now() - markedAt < UNAVAILABLE_CACHE_TTL_MS) {
-    throw new Error(`Message ${messageId} is unavailable (recalled/deleted)`);
+/**
+ * Extract a meaningful error message from a Lark SDK / Axios error.
+ * Matches official feishu-openclaw-plugin's formatLarkError().
+ */
+function formatLarkError(err: unknown): string {
+  if (!err || typeof err !== 'object') return String(err);
+  const e = err as any;
+  // Path 1: Lark SDK merges Feishu fields onto the thrown error
+  if (typeof e.code === 'number' && e.msg) return e.msg;
+  // Path 2: Axios error — dig into response.data
+  const data = e.response?.data;
+  if (data && typeof data.code === 'number' && data.msg) return data.msg;
+  // Fallback
+  return e.message ?? String(err);
+}
+
+class MessageUnavailableError extends Error {
+  messageId: string;
+  apiCode: number;
+  operation?: string;
+  constructor(params: { messageId: string; apiCode: number; operation?: string }) {
+    const opText = params.operation ? `, op=${params.operation}` : '';
+    super(`[feishu-message-unavailable] message ${params.messageId} unavailable (code=${params.apiCode}${opText})`);
+    this.name = 'MessageUnavailableError';
+    this.messageId = params.messageId;
+    this.apiCode = params.apiCode;
+    this.operation = params.operation;
+  }
+}
+
+function pruneExpiredMessages(nowMs = Date.now()) {
+  for (const [id, state] of unavailableMessages) {
+    if (nowMs - state.markedAtMs > UNAVAILABLE_CACHE_TTL_MS) {
+      unavailableMessages.delete(id);
+    }
+  }
+}
+
+/**
+ * Unified message guard matching official runWithMessageUnavailableGuard():
+ * - Pre-check: skip API call if message already marked unavailable
+ * - Post-check: detect terminal codes (230011/231003), mark + throw MessageUnavailableError
+ */
+async function withMessageGuard<T>(
+  messageId: string | undefined,
+  fn: () => Promise<T>,
+  operation?: string,
+): Promise<T> {
+  const normalizedId = normalizeMessageId(messageId);
+  if (!normalizedId) return fn();
+
+  // Pre-check: already marked?
+  const state = unavailableMessages.get(normalizedId);
+  if (state) {
+    if (Date.now() - state.markedAtMs > UNAVAILABLE_CACHE_TTL_MS) {
+      unavailableMessages.delete(normalizedId);
+    } else {
+      throw new MessageUnavailableError({
+        messageId: normalizedId,
+        apiCode: state.apiCode,
+        operation: operation ?? state.operation,
+      });
+    }
   }
 
   try {
@@ -324,18 +334,35 @@ async function withMessageGuard<T>(messageId: string | undefined, fn: () => Prom
   } catch (err) {
     const code = extractLarkApiCode(err);
     if (code && TERMINAL_MESSAGE_CODES.has(code)) {
-      unavailableMessages.set(messageId, Date.now());
-      // Prune old entries
-      if (unavailableMessages.size > 512) {
-        const now = Date.now();
-        for (const [id, ts] of unavailableMessages) {
-          if (now - ts > UNAVAILABLE_CACHE_TTL_MS) unavailableMessages.delete(id);
-        }
+      if (unavailableMessages.size >= MAX_CACHE_SIZE_BEFORE_PRUNE) {
+        pruneExpiredMessages();
       }
-      throw new Error(`Message ${messageId} unavailable (code=${code})`);
+      unavailableMessages.set(normalizedId, {
+        apiCode: code,
+        operation,
+        markedAtMs: Date.now(),
+      });
+      throw new MessageUnavailableError({
+        messageId: normalizedId,
+        apiCode: code,
+        operation,
+      });
     }
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mention format helpers — from official feishu-openclaw-plugin
+// ---------------------------------------------------------------------------
+/** Format a mention for text/post messages: `<at user_id="ou_xxx">Name</at>` */
+function formatMentionForText(target: { id: string; name: string }): string {
+  return `<at user_id="${target.id}">${target.name}</at>`;
+}
+
+/** Format a mention for interactive card messages: `<at id=ou_xxx></at>` */
+function formatMentionForCard(target: { id: string }): string {
+  return `<at id=${target.id}></at>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -728,11 +755,13 @@ export class LarkChannel implements Channel {
     replyToMessageId?: string,
   ): Promise<void> {
     if (replyToMessageId) {
-      await withMessageGuard(replyToMessageId, () =>
-        this.client.im.v1.message.reply({
+      await withMessageGuard(
+        replyToMessageId,
+        () => this.client.im.v1.message.reply({
           path: { message_id: replyToMessageId },
           data: { content, msg_type: msgType },
         }),
+        `im.message.reply(${msgType})`,
       );
     } else {
       await this.client.im.v1.message.create({
@@ -1134,7 +1163,7 @@ export class LarkChannel implements Channel {
     try {
       await this._sendStreaming(jid, text, opts?.replyToMessageId, opts?.mentionUser, opts?.slotKey);
     } catch (err) {
-      logger.warn({ jid, err }, 'Streaming card send failed, falling back to post');
+      logger.warn({ jid, err: formatLarkError(err) }, 'Streaming card send failed, falling back to post');
       try {
         await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
       } catch (fallbackErr) {
@@ -1144,7 +1173,7 @@ export class LarkChannel implements Channel {
         }
         this.outgoingQueue.push({ jid, text });
         logger.warn(
-          { jid, err: fallbackErr, queueSize: this.outgoingQueue.length },
+          { jid, err: formatLarkError(fallbackErr), queueSize: this.outgoingQueue.length },
           'Failed to send Lark message, queued',
         );
       }
@@ -1203,7 +1232,7 @@ export class LarkChannel implements Channel {
     } else {
       // Create new streaming card
       const mentionPrefix = mentionUser
-        ? `<at id=${mentionUser.id}></at> `
+        ? `${formatMentionForCard(mentionUser)} `
         : '';
 
       const createResult = await this.client.cardkit.v1.card.create({
@@ -1346,7 +1375,7 @@ export class LarkChannel implements Channel {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = i === 0 && mentionUser
-        ? `<at user_id="${mentionUser.id}">${mentionUser.name}</at> ${chunks[i]}`
+        ? `${formatMentionForText(mentionUser)} ${chunks[i]}`
         : chunks[i];
 
       const postContent = markdownToPostContent(chunkText);
@@ -1406,11 +1435,13 @@ export class LarkChannel implements Channel {
   }
 
   async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
-    await withMessageGuard(messageId, () =>
-      this.client.im.messageReaction.create({
+    await withMessageGuard(
+      messageId,
+      () => this.client.im.messageReaction.create({
         path: { message_id: messageId },
         data: { reaction_type: { emoji_type: emojiType } },
       }),
+      'im.messageReaction.create',
     );
     logger.info({ messageId, emojiType }, 'Lark reaction added');
   }

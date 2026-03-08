@@ -482,7 +482,6 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
           logger.info({ group: group.name, senderId }, `Agent output: ${raw.slice(0, 200)}`);
           if (lastStreamedText) {
             // Streaming was active — update the existing card with final text
-            // (avoids creating a second message due to minor text differences)
             if (text !== lastStreamedText) {
               await channel.sendMessage(chatJid, text, { slotKey });
             }
@@ -883,10 +882,6 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
-    },
-    endStreaming: (jid) => {
-      const channel = findChannel(channels, jid);
-      return channel?.endStreaming?.(jid) || Promise.resolve();
     },
     addReaction: (jid, messageId, emojiType) => {
       const channel = findChannel(channels, jid);

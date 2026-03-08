@@ -138,7 +138,7 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { LarkChannel, LarkChannelOpts, markdownToPostContent, splitMarkdown } from './lark.js';
+import { LarkChannel, LarkChannelOpts, markdownToPostContent, splitMarkdown, optimizeMarkdownStyle } from './lark.js';
 import { updateChatNamesBatch } from '../db.js';
 import { readEnvFile } from '../env.js';
 import * as LarkSdk from '@larksuiteoapi/node-sdk';
@@ -902,95 +902,56 @@ describe('LarkChannel', () => {
 // --- Standalone helper function tests ---
 
 describe('markdownToPostContent', () => {
-  it('converts plain text to post content structure', () => {
+  it('wraps text in md tag (matching official plugin format)', () => {
     const result = markdownToPostContent('Hello world');
     expect(result).toEqual({
-      zh_cn: { content: [[{ tag: 'text', text: 'Hello world' }]] },
-      en_us: { content: [[{ tag: 'text', text: 'Hello world' }]] },
+      zh_cn: { content: [[{ tag: 'md', text: 'Hello world' }]] },
     });
   });
 
-  it('converts bold text with ** and style', () => {
-    const result = markdownToPostContent('**bold text**');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'bold text', style: ['bold'] }],
-    ]);
+  it('preserves markdown formatting for Lark native rendering', () => {
+    const result = markdownToPostContent('**bold** and `code`');
+    expect(result.zh_cn.content[0][0].tag).toBe('md');
+    expect(result.zh_cn.content[0][0].text).toContain('**bold**');
+    expect(result.zh_cn.content[0][0].text).toContain('`code`');
   });
 
-  it('converts italic text with * and style', () => {
-    const result = markdownToPostContent('*italic text*');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'italic text', style: ['italic'] }],
-    ]);
+  it('normalizes malformed <at> mentions', () => {
+    const result = markdownToPostContent('<at id=ou_123></at> hello');
+    expect(result.zh_cn.content[0][0].text).toContain('<at user_id="ou_123">');
   });
 
-  it('converts inline code with backticks and style', () => {
-    const result = markdownToPostContent('`code block`');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'code block', style: ['code'] }],
-    ]);
+  it('normalizes unquoted <at> mentions', () => {
+    const result = markdownToPostContent('<at user_id=ou_123></at> hello');
+    expect(result.zh_cn.content[0][0].text).toContain('<at user_id="ou_123">');
   });
 
-  it('converts markdown links to a tags', () => {
-    const result = markdownToPostContent('[click here](https://example.com)');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'a', text: 'click here', href: 'https://example.com' }],
-    ]);
+  it('applies optimizeMarkdownStyle to content', () => {
+    // Code blocks get <br> spacing from optimizeMarkdownStyle
+    const result = markdownToPostContent('text\n```python\ncode\n```');
+    expect(result.zh_cn.content[0][0].tag).toBe('md');
+  });
+});
+
+describe('optimizeMarkdownStyle', () => {
+  it('strips invalid image keys (non img_/http)', () => {
+    const input = 'Look: ![alt](some_fake_key) and ![ok](img_v3_abc)';
+    const result = optimizeMarkdownStyle(input, 1);
+    expect(result).toContain('some_fake_key');
+    expect(result).not.toContain('![alt](some_fake_key)');
+    expect(result).toContain('![ok](img_v3_abc)');
   });
 
-  it('converts mixed inline formatting', () => {
-    const result = markdownToPostContent('Normal **bold** and `code`');
-    expect(result.zh_cn.content).toEqual([
-      [
-        { tag: 'text', text: 'Normal ' },
-        { tag: 'text', text: 'bold', style: ['bold'] },
-        { tag: 'text', text: ' and ' },
-        { tag: 'text', text: 'code', style: ['code'] },
-      ],
-    ]);
+  it('preserves valid http image URLs', () => {
+    const input = '![pic](https://example.com/img.png)';
+    const result = optimizeMarkdownStyle(input, 1);
+    expect(result).toContain('![pic](https://example.com/img.png)');
   });
 
-  it('handles multiple lines', () => {
-    const result = markdownToPostContent('Line 1\nLine 2\nLine 3');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'Line 1' }],
-      [{ tag: 'text', text: 'Line 2' }],
-      [{ tag: 'text', text: 'Line 3' }],
-    ]);
-  });
-
-  it('preserves empty lines as paragraph breaks', () => {
-    const result = markdownToPostContent('Para 1\n\nPara 2');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'Para 1' }],
-      [{ tag: 'text', text: '' }],
-      [{ tag: 'text', text: 'Para 2' }],
-    ]);
-  });
-
-  it('parses Lark <at> tags into proper at elements', () => {
-    const result = markdownToPostContent('<at user_id="ou_123">Alice</at> hello');
-    expect(result.zh_cn.content[0]).toEqual([
-      { tag: 'at', user_id: 'ou_123', user_name: 'Alice' },
-      { tag: 'text', text: ' hello' },
-    ]);
-  });
-
-  it('converts headings to bold text', () => {
-    const result = markdownToPostContent('## Section Title');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: 'Section Title', style: ['bold'] }],
-    ]);
-  });
-
-  it('preserves fenced code blocks as raw text', () => {
-    const result = markdownToPostContent('```python\nprint("hello")\nx = 1\n```');
-    expect(result.zh_cn.content).toEqual([
-      [{ tag: 'text', text: '```python' }],
-      [{ tag: 'text', text: 'print("hello")' }],
-      [{ tag: 'text', text: 'x = 1' }],
-      [{ tag: 'text', text: '```' }],
-    ]);
+  it('preserves text without images unchanged', () => {
+    const input = 'Hello world';
+    const result = optimizeMarkdownStyle(input, 1);
+    expect(result).toBe('Hello world');
   });
 });
 
