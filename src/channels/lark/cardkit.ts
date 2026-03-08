@@ -47,7 +47,7 @@ export async function streamCardContent(
   });
   const code = (resp as any)?.code;
   if (code && code !== 0) {
-    logger.warn({ cardId, sequence, code }, 'cardkit cardElement.content failed');
+    logger.warn({ cardId, sequence, code, msg: (resp as any)?.msg }, 'cardkit cardElement.content failed');
   }
 }
 

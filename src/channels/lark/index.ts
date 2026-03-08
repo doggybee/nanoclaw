@@ -707,14 +707,23 @@ class LarkChannel implements Channel {
   }
 
   async addReaction(_jid: string, messageId: string, emojiType: string): Promise<void> {
-    await withMessageGuard(
-      messageId,
-      () => this.client.im.messageReaction.create({
-        path: { message_id: messageId },
-        data: { reaction_type: { emoji_type: emojiType } },
-      }) as any,
-      'im.messageReaction.create',
-    );
+    try {
+      await withMessageGuard(
+        messageId,
+        () => this.client.im.messageReaction.create({
+          path: { message_id: messageId },
+          data: { reaction_type: { emoji_type: emojiType } },
+        }) as any,
+        'im.messageReaction.create',
+      );
+    } catch (err) {
+      // Code 231001 = invalid emoji type — provide helpful error
+      const code = extractLarkApiCode(err);
+      if (code === 231001) {
+        throw new Error(`Emoji type "${emojiType}" is not a valid Feishu reaction.`);
+      }
+      throw err;
+    }
   }
 
   async removeReaction(_jid: string, messageId: string, reactionId: string): Promise<void> {
