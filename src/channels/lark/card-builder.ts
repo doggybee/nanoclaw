@@ -15,8 +15,8 @@ export const LOADING_ELEMENT_ID = 'loading_icon';
 // ---------------------------------------------------------------------------
 
 /**
- * Build the thinking card JSON for streaming.
- * Includes streaming_config for faster client-side animation.
+ * Build the thinking card JSON for CardKit streaming.
+ * Matches official plugin's thinkingCardJson structure.
  */
 export function buildThinkingCardJson(): Record<string, any> {
   return {
