@@ -688,16 +688,21 @@ export class LarkChannel implements Channel {
     this.dedupTimer = setInterval(() => this.cleanupDedup(), DEDUP_CLEANUP_INTERVAL_MS);
   }
 
+  /** Create a CardKit card entity for streaming. Returns the card_id or null. */
+  private async createThinkingCard(): Promise<string | null> {
+    const result = await this.client.cardkit.v1.card.create({
+      data: { type: 'card_json', data: JSON.stringify(buildThinkingCardJson()) },
+    });
+    return result?.data?.card_id ?? null;
+  }
+
   /** Pre-create CardKit card entities so beginStreaming only needs sendToChat (saves ~1.5s). */
   private async refillCardPool(): Promise<void> {
     if (this.cardPoolRefilling) return;
     this.cardPoolRefilling = true;
     try {
       while (this.cardPool.length < this.CARD_POOL_SIZE) {
-        const result = await this.client.cardkit.v1.card.create({
-          data: { type: 'card_json', data: JSON.stringify(buildThinkingCardJson()) },
-        });
-        const cardId = result?.data?.card_id;
+        const cardId = await this.createThinkingCard();
         if (cardId) {
           this.cardPool.push(cardId);
           logger.debug({ cardId, poolSize: this.cardPool.length }, 'Card pool: pre-created');
@@ -720,7 +725,7 @@ export class LarkChannel implements Channel {
   private async sendToChat(
     jid: string,
     content: string,
-    msgType: string,
+    msgType: 'text' | 'post' | 'interactive' | 'image' | 'file',
     replyToMessageId?: string,
   ): Promise<void> {
     if (replyToMessageId) {
@@ -1169,24 +1174,7 @@ export class LarkChannel implements Channel {
         return;
       }
       logger.warn({ jid, err: formatLarkError(err) }, 'Streaming card send failed, falling back to post');
-      try {
-        await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
-      } catch (fallbackErr) {
-        // Same check for post fallback path
-        if (fallbackErr instanceof MessageUnavailableError) {
-          logger.warn({ jid, messageId: fallbackErr.messageId, code: fallbackErr.apiCode }, 'Reply target unavailable, dropping message');
-          return;
-        }
-        if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
-          const dropped = this.outgoingQueue.shift();
-          logger.warn({ jid: dropped?.jid }, 'Outgoing queue full, dropping oldest message');
-        }
-        this.outgoingQueue.push({ jid, text });
-        logger.warn(
-          { jid, err: formatLarkError(fallbackErr), queueSize: this.outgoingQueue.length },
-          'Failed to send Lark message, queued',
-        );
-      }
+      await this._sendPostWithQueue(jid, text, opts?.replyToMessageId, opts?.mentionUser);
     }
   }
 
@@ -1245,14 +1233,7 @@ export class LarkChannel implements Channel {
         ? `${formatMentionForCard(mentionUser)} `
         : '';
 
-      const createResult = await this.client.cardkit.v1.card.create({
-        data: {
-          type: 'card_json',
-          data: JSON.stringify(buildThinkingCardJson()),
-        },
-      });
-
-      const cardId = createResult?.data?.card_id;
+      const cardId = await this.createThinkingCard();
       if (!cardId) throw new Error('Failed to create card entity');
 
       const fullText = mentionPrefix + text;
@@ -1305,10 +1286,7 @@ export class LarkChannel implements Channel {
         this.refillCardPool().catch(() => {});
       } else {
         // Pool empty — create on the fly (fallback)
-        const createResult = await this.client.cardkit.v1.card.create({
-          data: { type: 'card_json', data: JSON.stringify(buildThinkingCardJson()) },
-        });
-        cardId = createResult?.data?.card_id ?? null;
+        cardId = await this.createThinkingCard();
         if (!cardId) throw new Error('Failed to pre-create streaming card');
       }
 
@@ -1369,6 +1347,32 @@ export class LarkChannel implements Channel {
       logger.info({ keyOrJid, cardId: card.cardId, elapsedMs }, 'Streaming ended');
     } catch (err) {
       logger.warn({ keyOrJid, err }, 'Failed to end streaming');
+    }
+  }
+
+  /** Try post fallback; on failure queue the message (unless message was recalled). */
+  private async _sendPostWithQueue(
+    jid: string,
+    text: string,
+    replyToMessageId?: string,
+    mentionUser?: { id: string; name: string },
+  ): Promise<void> {
+    try {
+      await this._sendPostFallback(jid, text, replyToMessageId, mentionUser);
+    } catch (err) {
+      if (err instanceof MessageUnavailableError) {
+        logger.warn({ jid, messageId: err.messageId, code: err.apiCode }, 'Reply target unavailable, dropping message');
+        return;
+      }
+      if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
+        const dropped = this.outgoingQueue.shift();
+        logger.warn({ jid: dropped?.jid }, 'Outgoing queue full, dropping oldest message');
+      }
+      this.outgoingQueue.push({ jid, text });
+      logger.warn(
+        { jid, err: formatLarkError(err), queueSize: this.outgoingQueue.length },
+        'Failed to send Lark message, queued',
+      );
     }
   }
 
