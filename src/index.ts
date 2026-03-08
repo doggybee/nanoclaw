@@ -480,15 +480,22 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
           outputSentToUser = true;
         } else {
           logger.info({ group: group.name, senderId }, `Agent output: ${raw.slice(0, 200)}`);
-          if (text !== lastStreamedText) {
+          if (lastStreamedText) {
+            // Streaming was active — update the existing card with final text
+            // (avoids creating a second message due to minor text differences)
+            if (text !== lastStreamedText) {
+              await channel.sendMessage(chatJid, text, { slotKey });
+            }
+          } else {
+            // No streaming happened — send as new message
             const target = pendingReplyTo[slotKey];
             delete pendingReplyTo[slotKey];
             const opts: { replyToMessageId?: string; mentionUser?: { id: string; name: string }; slotKey?: string } = target
               ? { replyToMessageId: target.messageId, mentionUser: { id: target.senderId, name: target.senderName }, slotKey }
               : { slotKey };
             await channel.sendMessage(chatJid, text, opts);
-            outputSentToUser = true;
           }
+          outputSentToUser = true;
           channel.endStreaming?.(slotKey)?.catch((err) =>
             logger.warn({ slotKey, err }, 'Failed to end streaming on final result'));
         }
@@ -876,6 +883,10 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       return channel.sendMessage(jid, text);
+    },
+    endStreaming: (jid) => {
+      const channel = findChannel(channels, jid);
+      return channel?.endStreaming?.(jid) || Promise.resolve();
     },
     addReaction: (jid, messageId, emojiType) => {
       const channel = findChannel(channels, jid);

@@ -33,6 +33,7 @@ function resolveContainerPath(containerPath: string, groupFolder: string): strin
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  endStreaming?: (jid: string) => Promise<void>;
   addReaction?: (jid: string, messageId: string, emojiType: string) => Promise<void>;
   sendImage?: (jid: string, imagePath: string) => Promise<void>;
   sendFile?: (jid: string, filePath: string) => Promise<void>;
@@ -99,6 +100,8 @@ async function processIpcMessage(
     case 'message': {
       if (!data.text) return;
       await deps.sendMessage(chatJid, data.text);
+      // Finalize the streaming card immediately (IPC messages are one-shot)
+      await deps.endStreaming?.(chatJid);
       logger.info({ chatJid, sourceGroup }, 'IPC message sent');
       return;
     }
