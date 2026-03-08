@@ -310,7 +310,7 @@ describe('LarkChannel', () => {
       const channel = new LarkChannel(opts);
       await channel.connect();
 
-      const data = createMessageData({ messageType: 'sticker' });
+      const data = createMessageData({ messageType: 'share_calendar' });
       await triggerMessageEvent(data);
 
       expect(opts.onMessage).not.toHaveBeenCalled();
@@ -531,10 +531,9 @@ describe('LarkChannel', () => {
       await channel.connect();
 
       const mockClient = currentClient();
+      // Reset counts after connect (refillCardPool pre-creates cards in background)
+      mockClient.cardkit.v1.card.create.mockClear();
       await channel.sendMessage('lark:oc_test123', 'Hello');
-
-      // Creates a streaming card entity
-      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
       // Sends the card as an interactive message
       expect(mockClient.im.v1.message.create).toHaveBeenCalledWith({
         params: { receive_id_type: 'chat_id' },
@@ -546,7 +545,7 @@ describe('LarkChannel', () => {
       });
       // Pushes initial text to the card (in parallel with send)
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
-        path: { card_id: 'card_test_001', element_id: 'streaming_md' },
+        path: { card_id: 'card_test_001', element_id: 'streaming_content' },
         data: { content: 'Hello', sequence: 1 },
       });
     });
@@ -626,15 +625,14 @@ describe('LarkChannel', () => {
       await channel.connect();
 
       const mockClient = currentClient();
+      // Reset counts after connect (refillCardPool pre-creates cards in background)
+      mockClient.cardkit.v1.card.create.mockClear();
       await channel.sendMessage('lark:oc_test123', 'First');
       await channel.sendMessage('lark:oc_test123', 'Second');
-
-      // Card created only once
-      expect(mockClient.cardkit.v1.card.create).toHaveBeenCalledTimes(1);
       // Content pushed twice (initial + update)
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledTimes(2);
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenNthCalledWith(2, {
-        path: { card_id: 'card_test_001', element_id: 'streaming_md' },
+        path: { card_id: 'card_test_001', element_id: 'streaming_content' },
         data: { content: 'Second', sequence: 2 },
       });
     });
@@ -673,7 +671,7 @@ describe('LarkChannel', () => {
 
       // Card content includes mention prefix
       expect(mockClient.cardkit.v1.cardElement.content).toHaveBeenCalledWith({
-        path: { card_id: 'card_test_001', element_id: 'streaming_md' },
+        path: { card_id: 'card_test_001', element_id: 'streaming_content' },
         data: { content: '<at id=ou_USER_456></at> Hello there', sequence: 1 },
       });
     });

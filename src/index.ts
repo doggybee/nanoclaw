@@ -90,6 +90,12 @@ function claimWarm(chatJid: string): WarmContainerHandle | undefined {
   const idx = warmPool.findIndex((e) => e.chatJid === chatJid);
   if (idx === -1) return undefined;
   const entry = warmPool.splice(idx, 1)[0];
+  // Verify the container process is still alive
+  if (entry.handle.process.killed || entry.handle.process.exitCode !== null) {
+    logger.warn({ chatJid }, 'Warm container already dead, discarding');
+    setTimeout(() => replenishWarmPool(), 1000);
+    return undefined;
+  }
   // Replenish the pool after claiming
   setTimeout(() => replenishWarmPool(), 2000);
   return entry.handle;
@@ -104,12 +110,16 @@ function replenishWarmPool(): void {
     const candidates = Object.keys(registeredGroups).filter((jid) => !poolJids.has(jid));
     if (candidates.length === 0) break;
 
-    // Prefer the group with the most recent agent activity
-    candidates.sort((a, b) => {
-      const tsA = lastAgentTimestamp[a] || '';
-      const tsB = lastAgentTimestamp[b] || '';
-      return tsB.localeCompare(tsA);
-    });
+    // Prefer the group with the most recent agent activity.
+    // Timestamps are stored under slotKeys (chatJid::senderId), so aggregate.
+    const maxSlotTimestamp = (jid: string): string => {
+      let max = lastAgentTimestamp[jid] || '';
+      for (const [key, ts] of Object.entries(lastAgentTimestamp)) {
+        if (key.startsWith(`${jid}::`) && ts > max) max = ts;
+      }
+      return max;
+    };
+    candidates.sort((a, b) => maxSlotTimestamp(b).localeCompare(maxSlotTimestamp(a)));
     const chatJid = candidates[0];
     warmUpForPool(chatJid);
     break; // One at a time to avoid burst
@@ -744,23 +754,30 @@ async function startMessageLoop(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
-    // Check group-level cursor for recovery
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
-    if (pending.length > 0) {
-      // Group by sender for per-user recovery
-      const senders = new Set(pending.map((m) => m.sender));
-      for (const senderId of senders) {
-        const senderPending = pending.filter((m) => m.sender === senderId);
-        const hasTrigger = group.requiresTrigger === false ||
-          senderPending.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
-        if (hasTrigger) {
-          logger.info(
-            { group: group.name, senderId, pendingCount: senderPending.length },
-            'Recovery: found unprocessed messages for user',
-          );
-          queue.enqueueMessageCheck(chatJid, senderId);
-        }
+    // Use group-level cursor as baseline
+    const groupCursor = lastAgentTimestamp[chatJid] || '';
+    const pending = getMessagesSince(chatJid, groupCursor, ASSISTANT_NAME);
+    if (pending.length === 0) continue;
+
+    // Group by sender for per-user recovery
+    const senders = new Set(pending.map((m) => m.sender));
+    for (const senderId of senders) {
+      // Check per-sender: slot cursor may be ahead of group cursor
+      const slotKey = makeSlotKey(chatJid, senderId);
+      const slotCursor = lastAgentTimestamp[slotKey] || groupCursor;
+      const senderPending = pending.filter(
+        (m) => m.sender === senderId && m.timestamp > slotCursor,
+      );
+      if (senderPending.length === 0) continue;
+
+      const hasTrigger = group.requiresTrigger === false ||
+        senderPending.some((m) => TRIGGER_PATTERN.test(m.content.trim()));
+      if (hasTrigger) {
+        logger.info(
+          { group: group.name, senderId, pendingCount: senderPending.length },
+          'Recovery: found unprocessed messages for user',
+        );
+        queue.enqueueMessageCheck(chatJid, senderId);
       }
     }
   }
@@ -780,6 +797,11 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    // Kill warm pool containers
+    for (const entry of warmPool) {
+      try { entry.handle.process.kill('SIGTERM'); } catch { /* already dead */ }
+    }
+    warmPool.length = 0;
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

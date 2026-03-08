@@ -66,9 +66,7 @@ export function selectModel(messages: NewMessage[]): string | undefined {
   if (!MODEL_FAST) return undefined;
 
   // Combine all message content for classification
-  const combined = messages.map((m) => m.content).join('\n');
-  // Strip the XML wrapper from formatMessages
-  const text = combined.replace(/<\/?messages?[^>]*>/g, '').trim();
+  const text = messages.map((m) => m.content).join('\n').trim();
 
   const complexity = classifyMessage(text);
   const model = complexity === 'simple' ? MODEL_FAST : (MODEL_FULL || undefined);

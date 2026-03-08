@@ -1671,7 +1671,8 @@ export class LarkChannel implements Channel {
     try {
       const parsed = JSON.parse(rawContent);
       const fileKey = parsed.file_key;
-      const fileName = parsed.file_name || `file_${Date.now()}`;
+      // Sanitize fileName to prevent path traversal (e.g. "../../etc/passwd")
+      const fileName = path.basename(parsed.file_name || `file_${Date.now()}`);
       const tmpDir = path.join(process.cwd(), 'groups', groupFolder, 'tmp');
       fs.mkdirSync(tmpDir, { recursive: true });
       const destPath = path.join(tmpDir, fileName);

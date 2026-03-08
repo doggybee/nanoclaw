@@ -267,9 +267,17 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
           continue;
         }
 
-        deps.queue.enqueueTask(currentTask.chat_jid, currentTask.id, () =>
-          runTask(currentTask, deps),
-        );
+        const taskId = currentTask.id;
+        const chatJid = currentTask.chat_jid;
+        deps.queue.enqueueTask(chatJid, taskId, async () => {
+          // Re-read task at execution time in case it was paused/cancelled while queued
+          const freshTask = getTaskById(taskId);
+          if (!freshTask || freshTask.status !== 'active') {
+            logger.info({ taskId }, 'Task no longer active at execution time, skipping');
+            return;
+          }
+          await runTask(freshTask, deps);
+        });
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');

@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -26,6 +26,8 @@ import {
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
+
+const PARSE_BUFFER_MAX = 10 * 1024 * 1024; // 10MB — prevent unbounded growth
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -430,7 +432,7 @@ export async function spawnWarmContainer(
   const killOnTimeout = () => {
     timedOut = true;
     logger.error({ group: group.name, containerName }, 'Warm container timeout, stopping');
-    exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
+    stopContainer(containerName, { timeout: 15000 }, (err) => {
       if (err) container.kill('SIGKILL');
     });
   };
@@ -443,6 +445,9 @@ export async function spawnWarmContainer(
   container.stdout.on('data', (data) => {
     const chunk = data.toString();
     parseBuffer += chunk;
+    if (parseBuffer.length > PARSE_BUFFER_MAX) {
+      parseBuffer = parseBuffer.slice(-PARSE_BUFFER_MAX / 2);
+    }
     let startIdx: number;
     while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
       const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
@@ -623,6 +628,39 @@ export async function runContainerAgent(
     let latestStreaming: ContainerOutput | null = null;
     let streamingSendLoop: Promise<void> | null = null;
 
+    // Declare before stdout handler to avoid TDZ issues
+    let timedOut = false;
+    let hadStreamingOutput = false;
+    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
+    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
+    // graceful _close sentinel has time to trigger before the hard kill fires.
+    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+
+    const killOnTimeout = () => {
+      timedOut = true;
+      logger.error(
+        { group: group.name, containerName },
+        'Container timeout, stopping gracefully',
+      );
+      stopContainer(containerName, { timeout: 15000 }, (err) => {
+        if (err) {
+          logger.warn(
+            { group: group.name, containerName, err },
+            'Graceful stop failed, force killing',
+          );
+          container.kill('SIGKILL');
+        }
+      });
+    };
+
+    let timeout = setTimeout(killOnTimeout, timeoutMs);
+
+    // Reset the timeout whenever there's activity (streaming output)
+    const resetTimeout = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(killOnTimeout, timeoutMs);
+    };
+
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
 
@@ -644,6 +682,10 @@ export async function runContainerAgent(
       // Stream-parse for output markers
       if (onOutput) {
         parseBuffer += chunk;
+        // Prevent unbounded growth if no markers are found
+        if (parseBuffer.length > PARSE_BUFFER_MAX) {
+          parseBuffer = parseBuffer.slice(-PARSE_BUFFER_MAX / 2);
+        }
         let startIdx: number;
         while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
           const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
@@ -712,38 +754,6 @@ export async function runContainerAgent(
         stderr += chunk;
       }
     });
-
-    let timedOut = false;
-    let hadStreamingOutput = false;
-    const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
-    // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
-
-    const killOnTimeout = () => {
-      timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
-      );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
-    };
-
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
-
-    // Reset the timeout whenever there's activity (streaming output)
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
-    };
 
     container.on('close', (code) => {
       clearTimeout(timeout);
