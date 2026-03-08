@@ -26,6 +26,14 @@ const MAX_OUTGOING_QUEUE = 1000;
 const DEDUP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const DEDUP_CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+// Supported inbound message types (matches official plugin converter list)
+const SUPPORTED_MESSAGE_TYPES = new Set([
+  'text', 'image', 'file', 'post', 'interactive',
+  'audio', 'video', 'media', 'sticker',
+  'merge_forward', 'location', 'todo',
+  'share_chat', 'share_user', 'system',
+]);
+
 /**
  * Normalise `<at>` mention tags that AI frequently writes incorrectly.
  * Fixes: `<at id=xxx>`, `<at open_id="xxx">`, unquoted values.
@@ -183,45 +191,6 @@ function stripInvalidImageKeys(text: string): string {
     if (value.startsWith('https://')) return fullMatch;
     return value;
   });
-}
-
-/**
- * Convert markdown tables to bullet-list format for Lark rendering.
- * Lark's card markdown doesn't render tables well in some contexts.
- * Converts each row into a bullet item with "column: value" pairs.
- */
-function convertMarkdownTables(text: string): string {
-  const lines = text.split('\n');
-  const result: string[] = [];
-  let i = 0;
-
-  while (i < lines.length) {
-    // Detect table: header row | col1 | col2 |
-    if (lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
-      const headerLine = lines[i].trim();
-      // Check next line is separator |---|---|
-      if (i + 1 < lines.length && /^\|[\s:|-]+\|$/.test(lines[i + 1].trim())) {
-        const headers = headerLine.split('|').filter(h => h.trim()).map(h => h.trim());
-        i += 2; // skip header + separator
-
-        // Process data rows
-        while (i < lines.length && lines[i].trim().startsWith('|') && lines[i].trim().endsWith('|')) {
-          const cells = lines[i].trim().split('|').filter(c => c.trim()).map(c => c.trim());
-          const parts: string[] = [];
-          for (let j = 0; j < Math.min(headers.length, cells.length); j++) {
-            parts.push(`${headers[j]}: ${cells[j]}`);
-          }
-          result.push(`- ${parts.join(', ')}`);
-          i++;
-        }
-        continue;
-      }
-    }
-    result.push(lines[i]);
-    i++;
-  }
-
-  return result.join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -909,14 +878,7 @@ export class LarkChannel implements Channel {
     if (messageId) this.seenMessages.set(messageId, Date.now());
 
     const messageType = message.message_type;
-    // Supported inbound message types (matches official plugin converter list)
-    const SUPPORTED_TYPES = new Set([
-      'text', 'image', 'file', 'post', 'interactive',
-      'audio', 'video', 'media', 'sticker',
-      'merge_forward', 'location', 'todo',
-      'share_chat', 'share_user', 'system',
-    ]);
-    if (!SUPPORTED_TYPES.has(messageType)) return;
+    if (!SUPPORTED_MESSAGE_TYPES.has(messageType)) return;
 
     const chatId = message.chat_id;
     if (!chatId) return;
@@ -975,25 +937,63 @@ export class LarkChannel implements Channel {
         return;
       }
     } else if (messageType === 'post') {
-      // Rich text: extract text and image_keys from nested content array
+      // Rich text: matches official convertPost — paragraph-per-line, markdown elements
       try {
         const parsed = JSON.parse(message.content);
-        // Post content structure: { title, content: [[{tag, ...}]] }
-        const rows = parsed.content as Array<Array<{ tag: string; text?: string; image_key?: string; user_id?: string }>>;
-        const textParts: string[] = [];
-        if (parsed.title) textParts.push(parsed.title);
-        for (const row of rows || []) {
-          for (const el of row) {
-            if (el.tag === 'text' && el.text) {
-              textParts.push(el.text);
-            } else if (el.tag === 'at' && el.user_id) {
-              textParts.push(el.user_id); // @_user_N placeholder
-            } else if (el.tag === 'img' && el.image_key) {
-              embeddedImageKeys.push(el.image_key);
+        const lines: string[] = [];
+        if (parsed.title) {
+          lines.push(`**${parsed.title}**`, '');
+        }
+        const contentBlocks = (parsed.content ?? []) as Array<Array<{
+          tag: string; text?: string; image_key?: string; file_key?: string;
+          user_id?: string; user_name?: string; href?: string; language?: string;
+          style?: string[];
+        }>>;
+        for (const paragraph of contentBlocks) {
+          if (!Array.isArray(paragraph)) continue;
+          let line = '';
+          for (const el of paragraph) {
+            switch (el.tag) {
+              case 'text': {
+                let t = el.text ?? '';
+                // Apply styles matching official applyStyle()
+                if (el.style?.includes('bold')) t = `**${t}**`;
+                if (el.style?.includes('italic')) t = `*${t}*`;
+                if (el.style?.includes('underline')) t = `<u>${t}</u>`;
+                if (el.style?.includes('lineThrough')) t = `~~${t}~~`;
+                if (el.style?.includes('codeInline')) t = `\`${t}\``;
+                line += t;
+                break;
+              }
+              case 'a':
+                line += el.href ? `[${el.text ?? el.href}](${el.href})` : (el.text ?? '');
+                break;
+              case 'at':
+                line += el.user_id ?? ''; // @_user_N placeholder, resolved by mention handling below
+                break;
+              case 'img':
+                if (el.image_key) {
+                  embeddedImageKeys.push(el.image_key);
+                  line += `![image](${el.image_key})`;
+                }
+                break;
+              case 'media':
+                if (el.file_key) line += `<file key="${el.file_key}"/>`;
+                break;
+              case 'code_block':
+                line += `\n\`\`\`${el.language ?? ''}\n${el.text ?? ''}\n\`\`\`\n`;
+                break;
+              case 'hr':
+                line += '\n---\n';
+                break;
+              default:
+                line += el.text ?? '';
+                break;
             }
           }
+          lines.push(line);
         }
-        content = textParts.join('');
+        content = lines.join('\n').trim() || '';
       } catch {
         return;
       }
@@ -1163,10 +1163,20 @@ export class LarkChannel implements Channel {
     try {
       await this._sendStreaming(jid, text, opts?.replyToMessageId, opts?.mentionUser, opts?.slotKey);
     } catch (err) {
+      // Message recalled/deleted — don't fallback or queue, matches official reply-dispatcher
+      if (err instanceof MessageUnavailableError) {
+        logger.warn({ jid, messageId: err.messageId, code: err.apiCode }, 'Reply target unavailable, dropping message');
+        return;
+      }
       logger.warn({ jid, err: formatLarkError(err) }, 'Streaming card send failed, falling back to post');
       try {
         await this._sendPostFallback(jid, text, opts?.replyToMessageId, opts?.mentionUser);
       } catch (fallbackErr) {
+        // Same check for post fallback path
+        if (fallbackErr instanceof MessageUnavailableError) {
+          logger.warn({ jid, messageId: fallbackErr.messageId, code: fallbackErr.apiCode }, 'Reply target unavailable, dropping message');
+          return;
+        }
         if (this.outgoingQueue.length >= MAX_OUTGOING_QUEUE) {
           const dropped = this.outgoingQueue.shift();
           logger.warn({ jid: dropped?.jid }, 'Outgoing queue full, dropping oldest message');
@@ -1486,10 +1496,14 @@ export class LarkChannel implements Channel {
   }
 
   async updateCard(_jid: string, messageId: string, cardJson: object): Promise<void> {
-    await this.client.im.v1.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(cardJson) },
-    });
+    await withMessageGuard(
+      messageId,
+      () => this.client.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: { content: JSON.stringify(cardJson) },
+      }),
+      'im.message.patch(interactive)',
+    );
     logger.info({ messageId }, 'Lark card updated via PATCH');
   }
 
@@ -1575,22 +1589,32 @@ export class LarkChannel implements Channel {
     }
 
     if (cardId) {
-      await this.client.cardkit.v1.cardElement.content({
-        path: { card_id: cardId, element_id: STREAMING_ELEMENT_ID },
-        data: { content: text, sequence: Date.now() },
-      });
+      // Apply optimizeMarkdownStyle matching official editMessageFeishu
+      const optimized = optimizeMarkdownStyle(text);
+      await withMessageGuard(
+        messageId,
+        () => this.client.cardkit.v1.cardElement.content({
+          path: { card_id: cardId!, element_id: STREAMING_ELEMENT_ID },
+          data: { content: optimized, sequence: Date.now() },
+        }),
+        'cardkit.cardElement.content(edit)',
+      );
       logger.info({ messageId, cardId, length: text.length }, 'Lark card message edited');
       return;
     }
 
-    // Fallback: edit text/post messages via im.v1.message.patch
+    // Fallback: edit text/post messages — matches official editMessageFeishu
     const postContent = markdownToPostContent(text);
-    await this.client.im.v1.message.patch({
-      path: { message_id: messageId },
-      data: {
-        content: JSON.stringify(postContent),
-      },
-    });
+    await withMessageGuard(
+      messageId,
+      () => this.client.im.v1.message.patch({
+        path: { message_id: messageId },
+        data: {
+          content: JSON.stringify(postContent),
+        },
+      }),
+      'im.message.update(post)',
+    );
     logger.info({ messageId, length: text.length }, 'Lark message edited');
   }
 
