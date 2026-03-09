@@ -3,11 +3,49 @@
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
 import { execFileSync, execFile } from 'child_process';
+import fs from 'fs';
+import os from 'os';
 
 import { logger } from './logger.js';
 
 /** The container runtime binary name. */
 export const CONTAINER_RUNTIME_BIN = 'docker';
+
+/** Hostname containers use to reach the host machine. */
+export const CONTAINER_HOST_GATEWAY = 'host.docker.internal';
+
+/**
+ * Detect the right bind address for the credential proxy.
+ * - macOS / WSL: Docker Desktop routes host.docker.internal to loopback
+ * - Bare-metal Linux: bind to docker0 bridge IP
+ */
+export function detectProxyBindHost(): string {
+  if (os.platform() === 'darwin') return '127.0.0.1';
+
+  // WSL: Docker Desktop handles routing
+  try {
+    if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return '127.0.0.1';
+  } catch {}
+
+  // Linux: bind to docker0 bridge IP so containers can reach the proxy
+  const docker0 = os.networkInterfaces()['docker0'];
+  if (docker0) {
+    const ipv4 = docker0.find((a) => a.family === 'IPv4');
+    if (ipv4) return ipv4.address;
+  }
+
+  return '0.0.0.0';
+}
+
+/** Docker --add-host args for host.docker.internal on Linux. */
+export function hostGatewayArgs(): string[] {
+  // macOS/WSL Docker Desktop handles this automatically
+  if (os.platform() === 'darwin') return [];
+  try {
+    if (fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop')) return [];
+  } catch {}
+  return ['--add-host', `${CONTAINER_HOST_GATEWAY}:host-gateway`];
+}
 
 /** Returns CLI args for a readonly bind mount. */
 export function readonlyMountArgs(

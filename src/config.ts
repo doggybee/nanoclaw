@@ -100,6 +100,12 @@ export const SESSION_MAX_BYTES = parseInt(
   process.env.SESSION_MAX_BYTES || '2097152', 10,
 ); // 2MB default
 
+// Credential proxy port — containers route API traffic through this proxy
+// so they never see real API keys.
+export const CREDENTIAL_PROXY_PORT = parseInt(
+  process.env.CREDENTIAL_PROXY_PORT || '3001', 10,
+);
+
 // Lark configuration
 // LARK_APP_ID and LARK_APP_SECRET are read directly by LarkChannel
 // from .env via readEnvFile() to keep secrets off the config module entirely.

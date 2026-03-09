@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
@@ -24,8 +25,10 @@ import {
 } from './container-runner.js';
 import {
   cleanupOrphans,
+  detectProxyBindHost,
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import {
   chatVersion,
   deleteSession,
@@ -759,6 +762,13 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+
+  // Start credential proxy before any containers are spawned
+  const proxyServer = await startCredentialProxy(
+    CREDENTIAL_PROXY_PORT,
+    detectProxyBindHost(),
+  );
+
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -767,6 +777,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     saveStateFlush();
+    proxyServer.close();
     // Kill warm pool containers
     for (const entry of warmPool) {
       try { entry.handle.process.kill('SIGTERM'); } catch { /* already dead */ }

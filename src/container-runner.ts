@@ -12,17 +12,19 @@ import {
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_MEMORY,
   CONTAINER_TIMEOUT,
+  CREDENTIAL_PROXY_PORT,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   TIMEZONE,
 } from './config.js';
-import { getClaudeOAuthToken } from './claude-credentials.js';
 import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath, resolveSlotIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
   readonlyMountArgs,
   stopContainer,
 } from './container-runtime.js';
@@ -108,7 +110,6 @@ export interface ContainerInput {
   isMain: boolean;
   isScheduledTask?: boolean;
   assistantName?: string;
-  secrets?: Record<string, string>;
   /** Override model for this run (from model router). */
   model?: string;
   /** Slot ID for per-user IPC isolation. */
@@ -154,7 +155,7 @@ function buildVolumeMounts(
     });
 
     // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
+    // Credentials are injected by the credential proxy, never stored in containers.
     const envFile = path.join(projectRoot, '.env');
     if (fs.existsSync(envFile)) {
       mounts.push({
@@ -299,20 +300,11 @@ function buildVolumeMounts(
   return mounts;
 }
 
-/**
- * Read allowed secrets from .env for passing to the container via stdin.
- * Falls back to ~/.claude/.credentials.json with auto-refresh.
- * Secrets are never written to disk or mounted as files.
- */
-async function readSecrets(): Promise<Record<string, string>> {
-  const envSecrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
-  if (envSecrets.CLAUDE_CODE_OAUTH_TOKEN || envSecrets.ANTHROPIC_API_KEY) {
-    return envSecrets;
-  }
-  // Fall back to Claude CLI credentials with auto-refresh
-  const token = await getClaudeOAuthToken();
-  if (token) return { CLAUDE_CODE_OAUTH_TOKEN: token };
-  return {};
+/** Detect auth mode to tell the container which placeholder to use. */
+function detectAuthMode(): 'api-key' | 'oauth' {
+  const env = readEnvFile(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
+  if (env.ANTHROPIC_API_KEY) return 'api-key';
+  return 'oauth'; // default: OAuth (either from .env or CLI credentials)
 }
 
 function buildContainerArgs(
@@ -320,6 +312,21 @@ function buildContainerArgs(
   containerName: string,
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName, '--memory', CONTAINER_MEMORY, '--cpus', CONTAINER_CPUS];
+
+  // Allow containers to reach the host (for credential proxy)
+  args.push(...hostGatewayArgs());
+
+  // Route API traffic through the credential proxy — containers never see real keys
+  const proxyUrl = `http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`;
+  args.push('-e', `ANTHROPIC_BASE_URL=${proxyUrl}`);
+
+  // Tell container which auth mode to use (with placeholder credential)
+  const authMode = detectAuthMode();
+  if (authMode === 'api-key') {
+    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  } else {
+    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -388,7 +395,6 @@ export async function spawnWarmContainer(
   cachedMkdir(groupDir);
 
   const mounts = buildVolumeMounts(group, isMain, slotId);
-  const secrets = await readSecrets();
 
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-warm-${safeName}-${Date.now()}`;
@@ -410,7 +416,6 @@ export async function spawnWarmContainer(
     chatJid,
     isMain,
     assistantName,
-    secrets,
     model,
   };
   container.stdin.write(JSON.stringify(warmInput));
@@ -547,11 +552,7 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   cachedMkdir(groupDir);
 
-  // Run buildVolumeMounts and readSecrets in parallel — they're independent.
-  const [mounts, secrets] = await Promise.all([
-    Promise.resolve(buildVolumeMounts(group, input.isMain, input.slotId)),
-    readSecrets(),
-  ]);
+  const mounts = buildVolumeMounts(group, input.isMain, input.slotId);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   const containerArgs = buildContainerArgs(mounts, containerName);
@@ -594,12 +595,8 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = secrets;
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
-    // Remove secrets from input so they don't appear in logs
-    delete input.secrets;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
