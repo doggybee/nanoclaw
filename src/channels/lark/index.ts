@@ -29,7 +29,7 @@ import {
 } from './message-guard.js';
 
 // Re-export for external consumers
-export { LarkChannel };
+export { LarkChannel, splitMarkdown };
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -671,13 +671,18 @@ class LarkChannel implements Channel {
     if (this.flushing || this.outgoingQueue.length === 0) return;
     this.flushing = true;
     try {
-      while (this.outgoingQueue.length > 0) {
-        const item = this.outgoingQueue[0];
-        await this.sendMessage(item.jid, item.text);
-        this.outgoingQueue.shift();
+      const initialLength = this.outgoingQueue.length;
+      for (let i = 0; i < initialLength; i++) {
+        const item = this.outgoingQueue.shift();
+        if (!item) break;
+        try {
+          await this._sendCard(item.jid, item.text);
+        } catch {
+          // Re-queue at end and stop — API is likely down
+          this.outgoingQueue.push(item);
+          break;
+        }
       }
-    } catch (err) {
-      logger.warn({ err }, 'Failed to flush outgoing queue');
     } finally {
       this.flushing = false;
     }

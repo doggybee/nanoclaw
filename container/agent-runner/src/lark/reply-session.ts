@@ -216,8 +216,10 @@ export class ReplySession {
   }
 
   /** Switch from CardKit streaming to IM patch mode mid-session. */
+  private switchingToImPatch = false;
   private switchToImPatch(): void {
-    if (this.useImPatch || !this.cardId) return;
+    if (this.useImPatch || this.switchingToImPatch || !this.cardId) return;
+    this.switchingToImPatch = true;
 
     this.client.im.v1.message.create({
       data: {
@@ -235,6 +237,7 @@ export class ReplySession {
         log(`Switched to IM patch fallback: messageId=${messageId}`);
       }
     }).catch((imErr) => {
+      this.switchingToImPatch = false;
       log(`IM patch fallback switch failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
     });
   }

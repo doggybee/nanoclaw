@@ -680,17 +680,15 @@ server.tool(
     schedule_value: z.string().optional().describe('New schedule value (see schedule_task for format)'),
   },
   async (args) => {
-    // Validate schedule_value if provided
-    if (args.schedule_type === 'cron' || (!args.schedule_type && args.schedule_value)) {
-      if (args.schedule_value) {
-        try {
-          CronExpressionParser.parse(args.schedule_value);
-        } catch {
-          return {
-            content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}".` }],
-            isError: true,
-          };
-        }
+    // Validate schedule_value only when schedule_type is explicitly provided
+    if (args.schedule_type === 'cron' && args.schedule_value) {
+      try {
+        CronExpressionParser.parse(args.schedule_value);
+      } catch {
+        return {
+          content: [{ type: 'text' as const, text: `Invalid cron: "${args.schedule_value}".` }],
+          isError: true,
+        };
       }
     }
     if (args.schedule_type === 'interval' && args.schedule_value) {
