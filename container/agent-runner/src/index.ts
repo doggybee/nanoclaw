@@ -526,6 +526,12 @@ async function runQuery(
   let streamEventCount = 0;
   const accumulator = new TextAccumulator();
 
+  // Reasoning (thinking) state — reset per query
+  let accumulatedReasoningText = '';
+  let reasoningStartTime: number | null = null;
+  let reasoningElapsedMs = 0;
+  let isReasoningPhase = false;
+
   // Timer-based streaming flush: instead of calling pushContent() on every
   // stream_event (which floods the event loop with microtasks and delays API
   // response callbacks), we check every 100ms if content changed and flush once.
@@ -535,10 +541,15 @@ async function runQuery(
     if (streamingTimer || !replySession) return;
     const session = replySession; // capture for closure
     streamingTimer = setInterval(() => {
-      const text = accumulator.fullText;
-      if (text && text !== lastFlushedText) {
-        lastFlushedText = text;
-        session.pushContent(text);
+      let displayText: string;
+      if (isReasoningPhase && accumulatedReasoningText) {
+        displayText = `💭 **Thinking...**\n\n${accumulatedReasoningText}`;
+      } else {
+        displayText = accumulator.fullText;
+      }
+      if (displayText && displayText !== lastFlushedText) {
+        lastFlushedText = displayText;
+        session.pushContent(displayText);
       }
     }, 100);
   };
@@ -585,7 +596,9 @@ async function runQuery(
         },
       },
       includePartialMessages: true,
-      thinking: { type: 'disabled' as const },
+      thinking: process.env.THINKING_BUDGET === '0'
+        ? { type: 'disabled' as const }
+        : { type: 'enabled' as const, budgetTokens: parseInt(process.env.THINKING_BUDGET || '10000', 10) },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
@@ -604,11 +617,25 @@ async function runQuery(
         firstTokenTime = Date.now();
         log(`[timing] first stream_event at +${firstTokenTime - queryStartTime}ms from query start`);
       }
-      const event = (message as { event: { type: string; delta?: { type?: string; text?: string } } }).event;
-      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta' && event.delta.text) {
-        accumulator.push(event.delta.text);
-        // Streaming flush handled by streamingTimer (100ms interval) —
-        // not here, to avoid flooding the event loop with microtasks.
+      const event = (message as { event: { type: string; delta?: { type?: string; text?: string; thinking?: string } } }).event;
+      if (event.type === 'content_block_delta') {
+        if (event.delta?.type === 'thinking_delta' && event.delta.thinking) {
+          // Reasoning phase
+          if (!reasoningStartTime) {
+            reasoningStartTime = Date.now();
+            log(`[thinking] reasoning phase started at +${reasoningStartTime - queryStartTime}ms`);
+          }
+          isReasoningPhase = true;
+          accumulatedReasoningText += event.delta.thinking;
+        } else if (event.delta?.type === 'text_delta' && event.delta.text) {
+          // Answer phase — transition from reasoning if needed
+          if (isReasoningPhase) {
+            isReasoningPhase = false;
+            reasoningElapsedMs = reasoningStartTime ? Date.now() - reasoningStartTime : 0;
+            log(`[thinking] answer phase started, reasoning took ${reasoningElapsedMs}ms (${accumulatedReasoningText.length} chars)`);
+          }
+          accumulator.push(stripReasoningTags(event.delta.text));
+        }
       }
       continue;
     }
@@ -649,7 +676,11 @@ async function runQuery(
         if (finalText && finalText !== lastFlushedText) {
           replySession.pushContent(finalText);
         }
-        await replySession.finalize({ isError });
+        await replySession.finalize({
+          isError,
+          reasoningText: accumulatedReasoningText || undefined,
+          reasoningElapsedMs: reasoningElapsedMs || undefined,
+        });
         const delivered = replySession.outputDelivered;
         log(`Result #${resultCount}: subtype=${message.subtype} outputDelivered=${delivered}${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
         writeOutput({
@@ -929,6 +960,13 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+}
+
+function stripReasoningTags(text: string): string {
+  let result = text.replace(/<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*?<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi, '');
+  result = result.replace(/<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*$/gi, '');
+  result = result.replace(/<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi, '');
+  return result.trim();
 }
 
 main();

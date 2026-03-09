@@ -61,15 +61,23 @@ export function buildCompleteCard(
     elements.push({
       tag: 'collapsible_panel',
       expanded: false,
-      background_color: 'grey',
       header: {
         title: {
           tag: 'markdown',
           content: `💭 ${formatReasoningDuration(opts.reasoningElapsedMs)}`,
-          text_size: 'notation',
         },
+        vertical_align: 'center',
+        icon: {
+          tag: 'standard_icon',
+          token: 'down-small-ccm_outlined',
+          size: '16px 16px',
+        },
+        icon_position: 'follow_text',
+        icon_expanded_angle: -180,
       },
       border: { color: 'grey', corner_radius: '5px' },
+      vertical_spacing: '8px',
+      padding: '8px 8px 8px 8px',
       elements: [
         {
           tag: 'markdown',
