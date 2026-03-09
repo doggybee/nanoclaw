@@ -100,6 +100,11 @@ export const SESSION_MAX_BYTES = parseInt(
   process.env.SESSION_MAX_BYTES || '2097152', 10,
 ); // 2MB default
 
+// Message retention: auto-purge messages older than this many days (0 = keep forever)
+export const MESSAGE_RETENTION_DAYS = parseInt(
+  process.env.MESSAGE_RETENTION_DAYS || '0', 10,
+);
+
 // Credential proxy port — containers route API traffic through this proxy
 // so they never see real API keys.
 export const CREDENTIAL_PROXY_PORT = parseInt(

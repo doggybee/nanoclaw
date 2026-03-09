@@ -7,6 +7,7 @@ import {
   DATA_DIR,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
+  MESSAGE_RETENTION_DAYS,
   MODEL_FAST,
   POLL_INTERVAL,
   SESSION_IDLE_TIMEOUT,
@@ -43,6 +44,7 @@ import {
   setRegisteredGroup,
   setRouterState,
   setSession,
+  purgeOldMessages,
   storeChatMetadata,
   storeMessage,
   taskVersion,
@@ -171,6 +173,10 @@ function warmUpForPool(chatJid: string): void {
       handle.exited.then((output) => {
         const idx = warmPool.findIndex((e) => e.handle === handle);
         if (idx !== -1) warmPool.splice(idx, 1);
+
+        // Clean up warm slot timestamp to prevent memory leak
+        const warmSlotKey = makeSlotKey(chatJid, warmSlotId);
+        delete lastAgentTimestamp[warmSlotKey];
 
         if (output.status === 'error' && !output.result) {
           const count = (warmFailures.get(chatJid) || 0) + 1;
@@ -764,9 +770,17 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
 
   // Start credential proxy before any containers are spawned
+  const startedAt = Date.now();
   const proxyServer = await startCredentialProxy(
     CREDENTIAL_PROXY_PORT,
     detectProxyBindHost(),
+    () => ({
+      uptime: Math.round((Date.now() - startedAt) / 1000),
+      activeContainers: queue.active,
+      warmPool: warmPool.length,
+      registeredGroups: Object.keys(registeredGroups).length,
+      messageLoopRunning,
+    }),
   );
 
   initDatabase();
@@ -901,6 +915,20 @@ async function main(): Promise<void> {
 
   // Warm pool: pre-warm containers for registered groups
   replenishWarmPool();
+
+  // Periodic message cleanup (every 6 hours)
+  if (MESSAGE_RETENTION_DAYS > 0) {
+    const runPurge = () => {
+      try {
+        const deleted = purgeOldMessages();
+        if (deleted > 0) logger.info({ deleted, retentionDays: MESSAGE_RETENTION_DAYS }, 'Purged old messages');
+      } catch (err) {
+        logger.warn({ err }, 'Message purge failed');
+      }
+    };
+    runPurge(); // run once at startup
+    setInterval(runPurge, 6 * 3600_000);
+  }
 
   startMessageLoop().catch((err) => {
     logger.fatal({ err }, 'Message loop crashed unexpectedly');

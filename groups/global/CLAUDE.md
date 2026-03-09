@@ -59,6 +59,10 @@ Files you create are saved in `/workspace/group/`. Use this for notes, research,
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.
 
+```bash
+qmd query "之前讨论过的方案" --collection conversations
+```
+
 When you learn something important:
 - Create files for structured data (e.g., `customers.md`, `preferences.md`)
 - Split files larger than 500 lines into folders

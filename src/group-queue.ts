@@ -53,6 +53,9 @@ export class GroupQueue {
   private onMaxRetriesFn: ((chatJid: string, senderId: string) => void) | null = null;
   private shuttingDown = false;
 
+  /** Number of currently active containers (for health checks). */
+  get active(): number { return this.activeCount; }
+
   private getSlot(slotKey: SlotKey): SlotState {
     let state = this.slots.get(slotKey);
     if (!state) {
@@ -334,10 +337,12 @@ export class GroupQueue {
         { slotKey, retryCount: state.retryCount },
         'Max retries exceeded, dropping messages (will retry on next incoming message)',
       );
-      state.retryCount = 0;
       if (this.onMaxRetriesFn) {
         try { this.onMaxRetriesFn(state.chatJid, state.senderId); } catch { /* ignore */ }
       }
+      // Clean up the dead slot so it doesn't leak in memory
+      this.slots.delete(slotKey);
+      this.waitingSet.delete(slotKey);
       return;
     }
 
@@ -355,6 +360,7 @@ export class GroupQueue {
 
   private drainSlot(slotKey: SlotKey): void {
     if (this.shuttingDown) return;
+    if (!this.slots.has(slotKey)) return; // already cleaned up (e.g. max retry)
 
     const state = this.getSlot(slotKey);
 

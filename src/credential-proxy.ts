@@ -14,6 +14,9 @@ import { logger } from './logger.js';
 
 const UPSTREAM = 'https://api.anthropic.com';
 
+/** Only allow known Anthropic API paths. Everything else is rejected. */
+const ALLOWED_PATH_PREFIXES = ['/v1/messages', '/v1/models', '/v1/oauth'];
+
 type AuthMode = 'api-key' | 'oauth' | 'none';
 
 interface Credentials {
@@ -53,9 +56,12 @@ function stripHopByHopHeaders(headers: http.IncomingHttpHeaders): Record<string,
   return out;
 }
 
+export type HealthInfo = () => Record<string, unknown>;
+
 export async function startCredentialProxy(
   port: number,
   bindHost: string,
+  healthInfo?: HealthInfo,
 ): Promise<http.Server> {
   let creds = await loadCredentials();
 
@@ -69,6 +75,24 @@ export async function startCredentialProxy(
   }, 4 * 60 * 1000); // every 4 minutes
 
   const server = http.createServer((req, res) => {
+    const reqPath = req.url || '/';
+
+    // Health check endpoint
+    if (reqPath === '/health') {
+      const info = healthInfo ? healthInfo() : {};
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', authMode: creds.mode, ...info }));
+      return;
+    }
+
+    // Block requests to non-allowlisted paths
+    if (!ALLOWED_PATH_PREFIXES.some((p) => reqPath.startsWith(p))) {
+      logger.warn({ path: reqPath }, 'Credential proxy: blocked non-allowlisted path');
+      res.writeHead(403, { 'content-type': 'text/plain' });
+      res.end('Forbidden');
+      return;
+    }
+
     const headers = stripHopByHopHeaders(req.headers);
 
     // Inject credentials based on auth mode

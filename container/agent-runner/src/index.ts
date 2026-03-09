@@ -735,17 +735,20 @@ async function main(): Promise<void> {
   let globalClaudeMd: string | undefined;
   try { if (!containerInput.isMain) globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8'); } catch {}
 
-  // Auto-index shared knowledge base in background (non-blocking).
+  // Auto-index knowledge base and conversation history in background (non-blocking).
   // QMD skips unchanged files, so repeated runs are near-instant.
-  const knowledgeDir = '/workspace/global/knowledge';
-  try {
-    if (fs.existsSync(knowledgeDir) && fs.readdirSync(knowledgeDir).some(f => f.endsWith('.md'))) {
-      execFile('qmd', ['collection', 'add', knowledgeDir, '--name', 'kb', '--mask', '*.md'], (err) => {
-        if (err) log(`Knowledge base indexing failed: ${err.message}`);
-        else log('Knowledge base indexed');
-      });
-    }
-  } catch {}
+  const qmdIndex = (dir: string, collection: string) => {
+    try {
+      if (fs.existsSync(dir) && fs.readdirSync(dir).some(f => f.endsWith('.md'))) {
+        execFile('qmd', ['collection', 'add', dir, '--name', collection, '--mask', '*.md'], (err) => {
+          if (err) log(`QMD index [${collection}] failed: ${err.message}`);
+          else log(`QMD index [${collection}] done`);
+        });
+      }
+    } catch {}
+  };
+  qmdIndex('/workspace/global/knowledge', 'kb');
+  qmdIndex('/workspace/group/conversations', 'conversations');
 
   // Discover extra mount directories once
   const extraDirs: string[] = [];

@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
-import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
+import { ASSISTANT_NAME, DATA_DIR, MESSAGE_RETENTION_DAYS, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -633,6 +633,16 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Message cleanup ---
+
+/** Delete messages older than MESSAGE_RETENTION_DAYS. Returns the number of rows deleted. */
+export function purgeOldMessages(): number {
+  if (MESSAGE_RETENTION_DAYS <= 0) return 0;
+  const cutoff = new Date(Date.now() - MESSAGE_RETENTION_DAYS * 86_400_000).toISOString();
+  const info = db.prepare('DELETE FROM messages WHERE timestamp < ?').run(cutoff);
+  return info.changes;
 }
 
 // --- JSON migration ---
