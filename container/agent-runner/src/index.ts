@@ -480,6 +480,8 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   replySession: ReplySession | null,
+  globalClaudeMd: string | undefined,
+  extraDirs: string[],
   resumeAt?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
@@ -567,29 +569,6 @@ async function runQuery(
   // Start timer immediately if ReplySession was pre-created (non-warm mode)
   if (replySession) {
     startStreamingTimer();
-  }
-
-  // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
-    globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
-  }
-
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
-      }
-    }
-  }
-  if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
   for await (const message of query({
@@ -779,6 +758,21 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
+  // Load global CLAUDE.md once (doesn't change during container lifetime)
+  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  let globalClaudeMd: string | undefined;
+  try { if (!containerInput.isMain) globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8'); } catch {}
+
+  // Discover extra mount directories once
+  const extraDirs: string[] = [];
+  try {
+    for (const entry of fs.readdirSync('/workspace/extra')) {
+      const fullPath = `/workspace/extra/${entry}`;
+      if (fs.statSync(fullPath).isDirectory()) extraDirs.push(fullPath);
+    }
+  } catch {}
+  if (extraDirs.length > 0) log(`Additional directories: ${extraDirs.join(', ')}`);
+
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
@@ -829,7 +823,7 @@ async function main(): Promise<void> {
         replySession.ensureCardCreated().catch(() => {});
       }
 
-      const queryResult = await runQuery(prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv, replySession, resumeAt);
+      const queryResult = await runQuery(prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv, replySession, globalClaudeMd, extraDirs, resumeAt);
       // ReplySession cleanup is handled inside runQuery
 
       if (queryResult.newSessionId) {

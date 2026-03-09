@@ -7,41 +7,8 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Client } from '@larksuiteoapi/node-sdk';
 import { z } from 'zod';
-import fs from 'fs';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-const MCP_LOG_PATH = '/tmp/mcp-nanoclaw.log';
-
-function mcpLog(tool: string, message: string): void {
-  const line = `[${new Date().toISOString()}] [mcp:${tool}] ${message}\n`;
-  try { fs.appendFileSync(MCP_LOG_PATH, line); } catch {}
-  console.error(line.trimEnd());
-}
-
-function extractLarkError(err: any): { code: any; msg: string } {
-  return {
-    code: err?.code ?? err?.data?.code,
-    msg: err?.msg || err?.message || '',
-  };
-}
-
-function noLarkError(tool: string) {
-  mcpLog(tool, 'no Lark credentials');
-  return { content: [{ type: 'text' as const, text: 'Lark credentials not available.' }], isError: true };
-}
-
-function larkError(tool: string, err: any) {
-  const { code, msg } = extractLarkError(err);
-  mcpLog(tool, `error: code=${code} msg=${msg}`);
-  return { content: [{ type: 'text' as const, text: `${tool} failed: ${msg || 'unknown error'} (code=${code})` }], isError: true };
-}
-
-function ok(text: string) {
-  return { content: [{ type: 'text' as const, text }] };
-}
+import { extractChatId } from '../lark-client.js';
+import { mcpLog, noLarkError, larkError, ok } from './mcp-helpers.js';
 
 // Extract spreadsheet token from URL or raw token
 function parseSpreadsheetToken(input: string): string {
@@ -87,8 +54,6 @@ export function registerWorkspaceTools(
   const groups = enabledGroups();
   mcpLog('workspace', `enabled groups: ${[...groups].join(', ') || '(none)'}`);
   if (groups.size === 0) return;
-
-  const extractChatId = (jid: string) => jid.replace(/^lark:/, '');
 
   // =========================================================================
   // DOCX — Cloud Documents
@@ -523,21 +488,23 @@ Supports filtering by sender type, message type, and time range.`,
         const items: string[] = resp?.data?.items || resp?.items || [];
         if (items.length === 0) return ok('No messages found.');
 
-        const results = items.map((item: any) => {
-          // Items may be JSON strings or objects
-          const msg = typeof item === 'string' ? JSON.parse(item) : item;
-          const time = msg.create_time ? new Date(Number(msg.create_time) * 1000).toISOString().slice(0, 16) : '';
-          const sender = msg.sender?.sender_type === 'bot' ? '(bot)' : '(user)';
-          const chatId = msg.chat_id || '';
-          let content = '';
+        const results: string[] = [];
+        for (const item of items) {
           try {
-            if (msg.body?.content) {
-              const parsed = JSON.parse(msg.body.content);
-              content = parsed.text || parsed.content || JSON.stringify(parsed).slice(0, 200);
-            }
-          } catch { content = msg.body?.content?.slice(0, 200) || ''; }
-          return `[${time}] ${sender} in ${chatId}: ${content}`;
-        });
+            const msg = typeof item === 'string' ? JSON.parse(item) : item;
+            const time = msg.create_time ? new Date(Number(msg.create_time) * 1000).toISOString().slice(0, 16) : '';
+            const sender = msg.sender?.sender_type === 'bot' ? '(bot)' : '(user)';
+            const chatId = msg.chat_id || '';
+            let content = '';
+            try {
+              if (msg.body?.content) {
+                const parsed = JSON.parse(msg.body.content);
+                content = parsed.text || parsed.content || JSON.stringify(parsed).slice(0, 200);
+              }
+            } catch { content = msg.body?.content?.slice(0, 200) || ''; }
+            results.push(`[${time}] ${sender} in ${chatId}: ${content}`);
+          } catch { /* skip malformed item */ }
+        }
 
         mcpLog('search_messages', `success: ${results.length} results`);
         return ok(results.join('\n'));
@@ -593,10 +560,9 @@ function descToBlock(desc: any): any {
   }
 
   // heading, bullet, ordered, quote, text — all use elements
-  const fieldName = type.startsWith('heading') ? type : type;
   return {
     block_type: blockType,
-    [fieldName]: { elements: textElements(desc.content || '') },
+    [type]: { elements: textElements(desc.content || '') },
   };
 }
 

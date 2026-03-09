@@ -17,6 +17,7 @@ import { larkAvailable, larkClient, extractChatId } from './lark-client.js';
 import { createCardEntity, sendCardByCardId } from './lark/cardkit.js';
 import { buildSimpleMarkdownCard } from './lark/card-builder.js';
 import { registerWorkspaceTools } from './lark/workspace-tools.js';
+import { mcpLog, extractLarkError, noLarkError, ok } from './lark/mcp-helpers.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -27,35 +28,7 @@ const chatJid = process.env.NANOCLAW_CHAT_JID!;
 const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
 const isMain = process.env.NANOCLAW_IS_MAIN === '1';
 
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
-
-const MCP_LOG_PATH = '/tmp/mcp-nanoclaw.log';
-
-function mcpLog(tool: string, message: string): void {
-  const line = `[${new Date().toISOString()}] [mcp:${tool}] ${message}\n`;
-  try { fs.appendFileSync(MCP_LOG_PATH, line); } catch {}
-  console.error(line.trimEnd());
-}
-
 mcpLog('startup', `larkAvailable=${larkAvailable} chatJid=${chatJid} groupFolder=${groupFolder} isMain=${isMain}`);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function extractLarkError(err: any): { code: any; msg: string } {
-  return {
-    code: err?.code ?? err?.data?.code,
-    msg: err?.msg || err?.message || '',
-  };
-}
-
-function noLarkError(tool: string) {
-  mcpLog(tool, 'no Lark credentials, returning error');
-  return { content: [{ type: 'text' as const, text: 'Lark credentials not available in this container. Cannot perform this action.' }], isError: true };
-}
 
 function detectFileType(filePath: string): string {
   const ext = path.extname(filePath).toLowerCase();
@@ -69,8 +42,9 @@ function detectFileType(filePath: string): string {
   return map[ext] || 'stream';
 }
 
+const createdDirs = new Set<string>();
 function writeIpcFile(dir: string, data: object): string {
-  fs.mkdirSync(dir, { recursive: true });
+  if (!createdDirs.has(dir)) { fs.mkdirSync(dir, { recursive: true }); createdDirs.add(dir); }
 
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
@@ -342,11 +316,13 @@ server.tool(
   async (args) => {
     mcpLog('send_image', `path=${args.image_path} larkAvailable=${larkAvailable}`);
 
-    if (!fs.existsSync(args.image_path)) {
-      return {
-        content: [{ type: 'text' as const, text: `Image file not found: ${args.image_path}` }],
-        isError: true,
-      };
+    try {
+      const stat = fs.statSync(args.image_path);
+      if (stat.size > 30 * 1024 * 1024) {
+        return ok(`Image too large (${(stat.size / 1024 / 1024).toFixed(1)}MB, max 30MB).`);
+      }
+    } catch {
+      return { content: [{ type: 'text' as const, text: `Image file not found: ${args.image_path}` }], isError: true };
     }
 
     if (larkAvailable) {
@@ -390,11 +366,13 @@ server.tool(
   async (args) => {
     mcpLog('send_file', `path=${args.file_path} larkAvailable=${larkAvailable}`);
 
-    if (!fs.existsSync(args.file_path)) {
-      return {
-        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
-        isError: true,
-      };
+    try {
+      const stat = fs.statSync(args.file_path);
+      if (stat.size > 30 * 1024 * 1024) {
+        return ok(`File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB, max 30MB).`);
+      }
+    } catch {
+      return { content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }], isError: true };
     }
 
     if (larkAvailable) {
