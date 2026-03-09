@@ -27,6 +27,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  chatVersion,
   deleteSession,
   getAllChats,
   getAllRegisteredGroups,
@@ -41,12 +42,14 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  taskVersion,
 } from './db.js';
 import { GroupQueue, makeSlotKey } from './group-queue.js';
 import { resolveGroupFolderPath, resolveSlotIpcPath, TASK_SENDER_ID, WARM_SENDER_PREFIX } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { selectModel } from './model-router.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { extractSessionCommand, findSessionCommand } from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -60,6 +63,15 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 // Per-slot (chatJid::senderId) timestamps for cursor tracking
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// Snapshot dirty tracking — skip DB queries when data hasn't changed
+let lastSeenTaskVersion = -1;
+let lastSeenChatVersion = -1;
+let cachedTasksSnapshot: Array<{
+  id: string; groupFolder: string; prompt: string;
+  schedule_type: string; schedule_value: string; status: string; next_run: string | null;
+}> = [];
+let cachedAvailableGroups: import('./container-runner.js').AvailableGroup[] = [];
 
 // Per-slot reply target: shared between processUserSlot callback and
 // startMessageLoop piping path so piped messages also get reply-to.
@@ -232,7 +244,24 @@ function loadState(): void {
   );
 }
 
+let _saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Debounced state persistence — coalesces writes within 1s window. */
 function saveState(): void {
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    setRouterState('last_timestamp', lastTimestamp);
+    setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+  }, 1000);
+}
+
+/** Immediate state flush — call on shutdown or critical rollback. */
+function saveStateFlush(): void {
+  if (_saveTimer) {
+    clearTimeout(_saveTimer);
+    _saveTimer = null;
+  }
   setRouterState('last_timestamp', lastTimestamp);
   setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
 }
@@ -371,37 +400,47 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
 
   const slotKey = makeSlotKey(chatJid, senderId);
 
-  // Use per-slot cursor for timestamp tracking
+  // Use per-slot cursor for timestamp tracking; filter by sender in SQL
   const sinceTimestamp = lastAgentTimestamp[slotKey] || lastAgentTimestamp[chatJid] || '';
-  const missedMessages = getMessagesSince(
-    chatJid,
-    sinceTimestamp,
-    ASSISTANT_NAME,
-  );
-
-  if (missedMessages.length === 0) return true;
-
-  // Filter to only this sender's messages
-  const senderMessages = missedMessages.filter((m) => m.sender === senderId);
+  const senderMessages = getMessagesSince(chatJid, sinceTimestamp, senderId);
   if (senderMessages.length === 0) return true;
 
-  // Check if trigger is required and present
+  // Check if trigger is required and present (session commands always pass)
   if (group.requiresTrigger !== false) {
     const hasTrigger = senderMessages.some((m) =>
-      TRIGGER_PATTERN.test(m.content.trim()),
+      TRIGGER_PATTERN.test(m.content.trim()) ||
+      extractSessionCommand(m.content, TRIGGER_PATTERN) !== null,
     );
     if (!hasTrigger) return true;
   }
 
-  // For trigger-required groups, only send messages that contain the trigger.
+  // For trigger-required groups, only send messages that contain the trigger or a session command.
   const relevantMessages = group.requiresTrigger !== false
-    ? senderMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+    ? senderMessages.filter((m) =>
+        TRIGGER_PATTERN.test(m.content.trim()) ||
+        extractSessionCommand(m.content, TRIGGER_PATTERN) !== null)
     : senderMessages;
 
-  const prompt = formatMessages(relevantMessages);
+  // Intercept session commands (e.g. /compact)
+  const isMain = group.folder === MAIN_GROUP_FOLDER;
+  const sessionCmd = findSessionCommand(relevantMessages, TRIGGER_PATTERN, isMain);
+  if (sessionCmd && 'denied' in sessionCmd) {
+    // Unauthorized — advance cursor, silently consume
+    const slotKey = makeSlotKey(chatJid, senderId);
+    lastAgentTimestamp[slotKey] = sessionCmd.denied.timestamp;
+    saveState();
+    const channel = findChannel(channels, chatJid);
+    if (channel) await channel.sendMessage(chatJid, 'Session commands require admin access.');
+    return true;
+  }
+
+  // If a session command is found, send it as the raw prompt (container handles it)
+  const prompt = sessionCmd
+    ? sessionCmd.command
+    : formatMessages(relevantMessages);
 
   // Select model based on message complexity
-  const model = selectModel(relevantMessages);
+  const model = sessionCmd ? undefined : selectModel(relevantMessages);
 
   // Rotate session if idle too long or context too large
   const sKey = sessionKey(group.folder, senderId);
@@ -466,7 +505,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
       return true;
     }
     lastAgentTimestamp[slotKey] = previousCursor;
-    saveState();
+    saveStateFlush();
     logger.warn(
       { group: group.name, senderId },
       'Agent error, rolled back message cursor for retry',
@@ -491,28 +530,24 @@ async function runAgent(
   const sessionId = sessions[sKey];
   const slotKey = makeSlotKey(chatJid, senderId);
 
-  // Update tasks snapshot
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    group.folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
+  // Update snapshots only when underlying data has changed
+  if (taskVersion !== lastSeenTaskVersion) {
+    cachedTasksSnapshot = getAllTasks().map((t) => ({
+      id: t.id, groupFolder: t.group_folder, prompt: t.prompt,
+      schedule_type: t.schedule_type, schedule_value: t.schedule_value,
+      status: t.status, next_run: t.next_run,
+    }));
+    lastSeenTaskVersion = taskVersion;
+  }
+  writeTasksSnapshot(group.folder, isMain, cachedTasksSnapshot);
 
-  // Update available groups snapshot
-  const availableGroups = getAvailableGroups();
+  if (chatVersion !== lastSeenChatVersion) {
+    cachedAvailableGroups = getAvailableGroups();
+    lastSeenChatVersion = chatVersion;
+  }
   writeGroupsSnapshot(
-    group.folder,
-    isMain,
-    availableGroups,
+    group.folder, isMain,
+    cachedAvailableGroups,
     new Set(Object.keys(registeredGroups)),
   );
 
@@ -600,7 +635,6 @@ async function startMessageLoop(): Promise<void> {
       const { messages, newTimestamp } = getNewMessages(
         jids,
         lastTimestamp,
-        ASSISTANT_NAME,
       );
 
       if (messages.length > 0) {
@@ -633,9 +667,11 @@ async function startMessageLoop(): Promise<void> {
 
           const needsTrigger = group.requiresTrigger !== false;
 
-          // Filter to trigger messages only when required
+          // Filter to trigger messages only when required (session commands always pass)
           const triggerMessages = needsTrigger
-            ? groupMessages.filter((m) => TRIGGER_PATTERN.test(m.content.trim()))
+            ? groupMessages.filter((m) =>
+                TRIGGER_PATTERN.test(m.content.trim()) ||
+                extractSessionCommand(m.content, TRIGGER_PATTERN) !== null)
             : groupMessages;
 
           if (triggerMessages.length === 0) continue;
@@ -689,7 +725,7 @@ function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     // Use group-level cursor as baseline
     const groupCursor = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, groupCursor, ASSISTANT_NAME);
+    const pending = getMessagesSince(chatJid, groupCursor);
     if (pending.length === 0) continue;
 
     // Group by sender for per-user recovery
@@ -730,6 +766,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    saveStateFlush();
     // Kill warm pool containers
     for (const entry of warmPool) {
       try { entry.handle.process.kill('SIGTERM'); } catch { /* already dead */ }

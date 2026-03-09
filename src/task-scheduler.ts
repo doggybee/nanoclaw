@@ -196,6 +196,7 @@ async function runTask(
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
+          scheduleClose(); // Close promptly even when result is null (e.g. IPC-only tasks)
           deps.queue.notifyIdle(taskSlotKey);
         }
         if (streamedOutput.status === 'error') {
