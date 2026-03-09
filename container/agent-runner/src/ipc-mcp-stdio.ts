@@ -16,6 +16,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { larkAvailable, larkClient, extractChatId } from './lark-client.js';
 import { createCardEntity, sendCardByCardId } from './lark/cardkit.js';
 import { buildSimpleMarkdownCard } from './lark/card-builder.js';
+import { registerWorkspaceTools } from './lark/workspace-tools.js';
 
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
@@ -754,6 +755,9 @@ Use available_groups.json to find the JID for a group. The folder name should be
     };
   },
 );
+
+// Lark workspace tools (docx, sheets, task, search)
+registerWorkspaceTools(server, larkClient, larkAvailable, chatJid);
 
 // Start the stdio transport
 const transport = new StdioServerTransport();
