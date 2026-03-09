@@ -527,7 +527,7 @@ async function runQuery(
   const accumulator = new TextAccumulator();
 
   // Reasoning (thinking) state — reset per query
-  let accumulatedReasoningText = '';
+  const reasoningChunks: string[] = [];
   let reasoningStartTime: number | null = null;
   let reasoningElapsedMs = 0;
   let isReasoningPhase = false;
@@ -542,10 +542,10 @@ async function runQuery(
     const session = replySession; // capture for closure
     streamingTimer = setInterval(() => {
       let displayText: string;
-      if (isReasoningPhase && accumulatedReasoningText) {
-        displayText = `💭 **Thinking...**\n\n${accumulatedReasoningText}`;
+      if (isReasoningPhase && reasoningChunks.length > 0) {
+        displayText = `💭 **Thinking...**\n\n${reasoningChunks.join('')}`;
       } else {
-        displayText = accumulator.fullText;
+        displayText = stripReasoningTags(accumulator.fullText);
       }
       if (displayText && displayText !== lastFlushedText) {
         lastFlushedText = displayText;
@@ -626,15 +626,15 @@ async function runQuery(
             log(`[thinking] reasoning phase started at +${reasoningStartTime - queryStartTime}ms`);
           }
           isReasoningPhase = true;
-          accumulatedReasoningText += event.delta.thinking;
+          reasoningChunks.push(event.delta.thinking);
         } else if (event.delta?.type === 'text_delta' && event.delta.text) {
           // Answer phase — transition from reasoning if needed
           if (isReasoningPhase) {
             isReasoningPhase = false;
             reasoningElapsedMs = reasoningStartTime ? Date.now() - reasoningStartTime : 0;
-            log(`[thinking] answer phase started, reasoning took ${reasoningElapsedMs}ms (${accumulatedReasoningText.length} chars)`);
+            log(`[thinking] answer phase started, reasoning took ${reasoningElapsedMs}ms (${reasoningChunks.length} chunks)`);
           }
-          accumulator.push(stripReasoningTags(event.delta.text));
+          accumulator.push(event.delta.text);
         }
       }
       continue;
@@ -667,7 +667,8 @@ async function runQuery(
         streamingTimer = null;
       }
 
-      const finalText = accumulator.finalText;
+      const rawFinalText = accumulator.finalText;
+      const finalText = rawFinalText ? stripReasoningTags(rawFinalText) : null;
       const isError = message.subtype !== 'success';
 
       // Finalize ReplySession (completes the streaming card)
@@ -678,7 +679,7 @@ async function runQuery(
         }
         await replySession.finalize({
           isError,
-          reasoningText: accumulatedReasoningText || undefined,
+          reasoningText: reasoningChunks.length > 0 ? reasoningChunks.join('') : undefined,
           reasoningElapsedMs: reasoningElapsedMs || undefined,
         });
         const delivered = replySession.outputDelivered;

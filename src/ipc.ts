@@ -103,7 +103,7 @@ async function processIpcMessage(
           sender_name: m.sender_name,
           content: m.content,
           timestamp: m.timestamp,
-          is_bot_message: !!(m as any).is_bot_message,
+          is_bot_message: !!m.is_bot_message,
         })),
       });
 

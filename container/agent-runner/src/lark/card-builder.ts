@@ -141,9 +141,5 @@ export function formatElapsed(ms: number | undefined): string {
 
 export function formatReasoningDuration(ms: number | undefined): string {
   if (!ms || ms <= 0) return 'Thought';
-  const seconds = ms / 1000;
-  const duration = seconds < 60
-    ? `${seconds.toFixed(1)}s`
-    : `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  return `Thought for ${duration}`;
+  return `Thought for ${formatElapsed(ms)}`;
 }
