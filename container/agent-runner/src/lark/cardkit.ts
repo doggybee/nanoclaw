@@ -68,19 +68,20 @@ export async function sendCardByCardId(
   chatId: string,
   cardId: string,
   replyToMessageId?: string,
-): Promise<void> {
+): Promise<string | null> {
   const contentPayload = JSON.stringify({
     type: 'card',
     data: { card_id: cardId },
   });
 
   if (replyToMessageId) {
-    await client.im.v1.message.reply({
+    const resp = await client.im.v1.message.reply({
       path: { message_id: replyToMessageId },
       data: { content: contentPayload, msg_type: 'interactive' },
     });
+    return resp?.data?.message_id ?? null;
   } else {
-    await client.im.v1.message.create({
+    const resp = await client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: chatId,
@@ -88,6 +89,7 @@ export async function sendCardByCardId(
         content: contentPayload,
       },
     });
+    return resp?.data?.message_id ?? null;
   }
 }
 

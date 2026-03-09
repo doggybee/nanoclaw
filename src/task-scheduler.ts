@@ -80,6 +80,15 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+/** Convert a ScheduledTask to the snapshot format used by writeTasksSnapshot. */
+export function toTaskSnapshot(t: ScheduledTask) {
+  return {
+    id: t.id, groupFolder: t.group_folder, prompt: t.prompt,
+    schedule_type: t.schedule_type, schedule_value: t.schedule_value,
+    status: t.status, next_run: t.next_run,
+  };
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
@@ -136,20 +145,7 @@ async function runTask(
 
   // Update tasks snapshot for container to read (filtered by group)
   const isMain = task.group_folder === MAIN_GROUP_FOLDER;
-  const tasks = getAllTasks();
-  writeTasksSnapshot(
-    task.group_folder,
-    isMain,
-    tasks.map((t) => ({
-      id: t.id,
-      groupFolder: t.group_folder,
-      prompt: t.prompt,
-      schedule_type: t.schedule_type,
-      schedule_value: t.schedule_value,
-      status: t.status,
-      next_run: t.next_run,
-    })),
-  );
+  writeTasksSnapshot(task.group_folder, isMain, getAllTasks().map(toTaskSnapshot));
 
   let result: string | null = null;
   let error: string | null = null;

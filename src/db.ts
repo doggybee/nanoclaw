@@ -300,25 +300,62 @@ export function storeMessage(msg: NewMessage): void {
   );
 }
 
+/** Shared message query builder. All message reads filter empty content. */
+function queryMessages(opts: {
+  chatJid?: string;
+  jids?: string[];
+  sinceTimestamp?: string;
+  beforeTimestamp?: string;
+  sender?: string;
+  includeBotMessages?: boolean;
+  limit?: number;
+  orderDesc?: boolean;
+  columns?: string;
+}): NewMessage[] {
+  const conditions = ["content != '' AND content IS NOT NULL"];
+  const params: unknown[] = [];
+  const cols = opts.columns || 'id, chat_jid, sender, sender_name, content, timestamp';
+
+  if (opts.chatJid) {
+    conditions.push('chat_jid = ?');
+    params.push(opts.chatJid);
+  }
+  if (opts.jids && opts.jids.length > 0) {
+    conditions.push(`chat_jid IN (${opts.jids.map(() => '?').join(',')})`);
+    params.push(...opts.jids);
+  }
+  if (opts.sinceTimestamp) {
+    conditions.push('timestamp > ?');
+    params.push(opts.sinceTimestamp);
+  }
+  if (opts.beforeTimestamp) {
+    conditions.push('timestamp < ?');
+    params.push(opts.beforeTimestamp);
+  }
+  if (opts.sender) {
+    conditions.push('sender = ?');
+    params.push(opts.sender);
+  }
+  if (opts.includeBotMessages === false) {
+    conditions.push('is_bot_message = 0');
+  }
+
+  const order = opts.orderDesc ? 'DESC' : 'ASC';
+  const limitClause = opts.limit ? ` LIMIT ?` : '';
+  if (opts.limit) params.push(opts.limit);
+
+  return db
+    .prepare(`SELECT ${cols} FROM messages WHERE ${conditions.join(' AND ')} ORDER BY timestamp ${order}${limitClause}`)
+    .all(...params) as NewMessage[];
+}
+
 export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
-  const placeholders = jids.map(() => '?').join(',');
-  const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
-      AND is_bot_message = 0
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
-  `;
-
-  const rows = db
-    .prepare(sql)
-    .all(lastTimestamp, ...jids) as NewMessage[];
+  const rows = queryMessages({ jids, sinceTimestamp: lastTimestamp, includeBotMessages: false });
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -339,24 +376,14 @@ export function getRecentMessages(
   beforeTimestamp?: string,
   includeBotMessages = true,
 ): NewMessage[] {
-  const botFilter = includeBotMessages ? '' : 'AND is_bot_message = 0';
-  const timeFilter = beforeTimestamp ? 'AND timestamp < ?' : '';
-  const params: unknown[] = [chatJid];
-  if (beforeTimestamp) params.push(beforeTimestamp);
-  params.push(limit);
-
-  const rows = db
-    .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_bot_message
-       FROM messages
-       WHERE chat_jid = ? ${timeFilter}
-         AND content != '' AND content IS NOT NULL
-         ${botFilter}
-       ORDER BY timestamp DESC
-       LIMIT ?`,
-    )
-    .all(...params) as NewMessage[];
-
+  const rows = queryMessages({
+    chatJid,
+    beforeTimestamp,
+    includeBotMessages,
+    limit,
+    orderDesc: true,
+    columns: 'id, chat_jid, sender, sender_name, content, timestamp, is_bot_message',
+  });
   // Return in chronological order (oldest first)
   return rows.reverse();
 }
@@ -366,28 +393,7 @@ export function getMessagesSince(
   sinceTimestamp: string,
   sender?: string,
 ): NewMessage[] {
-  if (sender) {
-    return db
-      .prepare(
-        `SELECT id, chat_jid, sender, sender_name, content, timestamp
-         FROM messages
-         WHERE chat_jid = ? AND timestamp > ? AND sender = ?
-           AND is_bot_message = 0
-           AND content != '' AND content IS NOT NULL
-         ORDER BY timestamp`,
-      )
-      .all(chatJid, sinceTimestamp, sender) as NewMessage[];
-  }
-  return db
-    .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp
-       FROM messages
-       WHERE chat_jid = ? AND timestamp > ?
-         AND is_bot_message = 0
-         AND content != '' AND content IS NOT NULL
-       ORDER BY timestamp`,
-    )
-    .all(chatJid, sinceTimestamp) as NewMessage[];
+  return queryMessages({ chatJid, sinceTimestamp, sender, includeBotMessages: false });
 }
 
 export function createTask(
@@ -442,33 +448,13 @@ export function updateTask(
     >
   >,
 ): void {
-  const fields: string[] = [];
-  const values: unknown[] = [];
+  const entries = Object.entries(updates).filter(([, v]) => v !== undefined);
+  if (entries.length === 0) return;
 
-  if (updates.prompt !== undefined) {
-    fields.push('prompt = ?');
-    values.push(updates.prompt);
-  }
-  if (updates.schedule_type !== undefined) {
-    fields.push('schedule_type = ?');
-    values.push(updates.schedule_type);
-  }
-  if (updates.schedule_value !== undefined) {
-    fields.push('schedule_value = ?');
-    values.push(updates.schedule_value);
-  }
-  if (updates.next_run !== undefined) {
-    fields.push('next_run = ?');
-    values.push(updates.next_run);
-  }
-  if (updates.status !== undefined) {
-    fields.push('status = ?');
-    values.push(updates.status);
-  }
-
-  if (fields.length === 0) return;
-
+  const fields = entries.map(([k]) => `${k} = ?`);
+  const values = entries.map(([, v]) => v);
   values.push(id);
+
   db.prepare(
     `UPDATE scheduled_tasks SET ${fields.join(', ')} WHERE id = ?`,
   ).run(...values);

@@ -55,12 +55,29 @@ export function registerWorkspaceTools(
   mcpLog('workspace', `enabled groups: ${[...groups].join(', ') || '(none)'}`);
   if (groups.size === 0) return;
 
+  /** Register a tool that requires Lark. Wraps with larkAvailable check + try-catch + larkError. */
+  function reg(
+    name: string,
+    description: string,
+    schema: Record<string, z.ZodType>,
+    handler: (args: any) => Promise<ReturnType<typeof ok>>,
+  ) {
+    server.tool(name, description, schema, async (args) => {
+      if (!larkAvailable) return noLarkError(name);
+      try {
+        return await handler(args);
+      } catch (err) {
+        return larkError(name, err);
+      }
+    });
+  }
+
   // =========================================================================
   // DOCX — Cloud Documents
   // =========================================================================
   if (groups.has('docx')) {
 
-  server.tool(
+  reg(
     'docx_create',
     `Create a new Lark cloud document. Returns the document URL.
 Optionally specify a folder_token to create inside a specific folder (from a Drive URL or folder token).`,
@@ -69,89 +86,69 @@ Optionally specify a folder_token to create inside a specific folder (from a Dri
       folder_token: z.string().optional().describe('Folder token to create in (optional, defaults to root)'),
     },
     async (args) => {
-      mcpLog('docx_create', `title="${args.title}" folder=${args.folder_token || 'root'}`);
-      if (!larkAvailable) return noLarkError('docx_create');
-      try {
-        const resp = await (client as any).docx.document.create({
-          data: { title: args.title, folder_token: args.folder_token || undefined },
-        });
-        const doc = resp?.document || resp?.data?.document || resp;
-        const docId = doc?.document_id;
-        if (!docId) return larkError('docx_create', { msg: 'No document_id in response' });
-        const domain = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace('/open-apis', '').replace('open.', '');
-        const url = `https://${domain.replace(/^https?:\/\//, '')}/docx/${docId}`;
-        mcpLog('docx_create', `success: docId=${docId}`);
-        return ok(`Document created: ${url}\nDocument ID: ${docId}`);
-      } catch (err) { return larkError('docx_create', err); }
+      const resp = await (client as any).docx.document.create({
+        data: { title: args.title, folder_token: args.folder_token || undefined },
+      });
+      const doc = resp?.document || resp?.data?.document || resp;
+      const docId = doc?.document_id;
+      if (!docId) return larkError('docx_create', { msg: 'No document_id in response' });
+      const domain = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace('/open-apis', '').replace('open.', '');
+      const url = `https://${domain.replace(/^https?:\/\//, '')}/docx/${docId}`;
+      return ok(`Document created: ${url}\nDocument ID: ${docId}`);
     },
   );
 
-  server.tool(
+  reg(
     'docx_read',
     `Read the plain text content of a Lark cloud document.
 Accepts a document ID or a full Lark document URL.`,
-    {
-      document_id: z.string().describe('Document ID or Lark document URL'),
-    },
+    { document_id: z.string().describe('Document ID or Lark document URL') },
     async (args) => {
       const docId = parseDocumentId(args.document_id);
-      mcpLog('docx_read', `docId=${docId}`);
-      if (!larkAvailable) return noLarkError('docx_read');
-      try {
-        const resp = await (client as any).docx.document.rawContent({
-          path: { document_id: docId },
-          params: { lang: 0 },
-        });
-        const content = resp?.content || resp?.data?.content || '';
-        mcpLog('docx_read', `success: ${content.length} chars`);
-        return ok(content || '(empty document)');
-      } catch (err) { return larkError('docx_read', err); }
+      const resp = await (client as any).docx.document.rawContent({
+        path: { document_id: docId },
+        params: { lang: 0 },
+      });
+      const content = resp?.content || resp?.data?.content || '';
+      return ok(content || '(empty document)');
     },
   );
 
-  server.tool(
+  reg(
     'docx_list_blocks',
     `List all content blocks in a Lark document. Useful for understanding document structure before editing.
 Returns block IDs, types, and content.`,
-    {
-      document_id: z.string().describe('Document ID or Lark document URL'),
-    },
+    { document_id: z.string().describe('Document ID or Lark document URL') },
     async (args) => {
       const docId = parseDocumentId(args.document_id);
-      mcpLog('docx_list_blocks', `docId=${docId}`);
-      if (!larkAvailable) return noLarkError('docx_list_blocks');
-      try {
-        const blocks: any[] = [];
-        let pageToken: string | undefined;
-        do {
-          const resp = await (client as any).docx.documentBlock.list({
-            path: { document_id: docId },
-            params: { page_size: 500, ...(pageToken ? { page_token: pageToken } : {}) },
-          });
-          const items = resp?.data?.items || resp?.items || [];
-          blocks.push(...items);
-          pageToken = resp?.data?.page_token || resp?.page_token;
-        } while (pageToken);
-
-        if (blocks.length === 0) return ok('(no blocks)');
-        const lines = blocks.map((b: any) => {
-          const type = b.block_type_str || b.block_type || 'unknown';
-          const id = b.block_id || '';
-          // Try to extract text content
-          let text = '';
-          const body = b.text || b.heading1 || b.heading2 || b.heading3 || b.heading4 || b.heading5 || b.heading6 || b.heading7 || b.heading8 || b.heading9 || b.bullet || b.ordered || b.todo || b.code || b.quote || b.callout;
-          if (body?.elements) {
-            text = body.elements.map((e: any) => e?.text_run?.content || e?.mention_user?.user_id || '').join('');
-          }
-          return `[${id}] (${type}) ${text}`;
+      const blocks: any[] = [];
+      let pageToken: string | undefined;
+      do {
+        const resp = await (client as any).docx.documentBlock.list({
+          path: { document_id: docId },
+          params: { page_size: 500, ...(pageToken ? { page_token: pageToken } : {}) },
         });
-        mcpLog('docx_list_blocks', `success: ${blocks.length} blocks`);
-        return ok(lines.join('\n'));
-      } catch (err) { return larkError('docx_list_blocks', err); }
+        const items = resp?.data?.items || resp?.items || [];
+        blocks.push(...items);
+        pageToken = resp?.data?.page_token || resp?.page_token;
+      } while (pageToken);
+
+      if (blocks.length === 0) return ok('(no blocks)');
+      const lines = blocks.map((b: any) => {
+        const type = b.block_type_str || b.block_type || 'unknown';
+        const id = b.block_id || '';
+        let text = '';
+        const body = b.text || b.heading1 || b.heading2 || b.heading3 || b.heading4 || b.heading5 || b.heading6 || b.heading7 || b.heading8 || b.heading9 || b.bullet || b.ordered || b.todo || b.code || b.quote || b.callout;
+        if (body?.elements) {
+          text = body.elements.map((e: any) => e?.text_run?.content || e?.mention_user?.user_id || '').join('');
+        }
+        return `[${id}] (${type}) ${text}`;
+      });
+      return ok(lines.join('\n'));
     },
   );
 
-  server.tool(
+  reg(
     'docx_append',
     `Append content blocks to a Lark document. The content is appended after the last block.
 Accepts an array of block descriptors. Most common block types:
@@ -168,32 +165,20 @@ Accepts an array of block descriptors. Most common block types:
     },
     async (args) => {
       const docId = parseDocumentId(args.document_id);
-      mcpLog('docx_append', `docId=${docId}`);
-      if (!larkAvailable) return noLarkError('docx_append');
-
       let blockDescs: any[];
       try { blockDescs = JSON.parse(args.blocks); } catch {
         return { content: [{ type: 'text' as const, text: 'Invalid JSON in blocks parameter.' }], isError: true };
       }
       if (!Array.isArray(blockDescs)) blockDescs = [blockDescs];
-
-      // Convert simple descriptors to Lark block format
       const children: any[] = blockDescs.map(desc => descToBlock(desc));
 
-      try {
-        // Get the document's root block ID (page block)
-        const docResp = await (client as any).docx.document.get({
-          path: { document_id: docId },
-        });
-        const pageBlockId = docResp?.document?.document_id || docResp?.data?.document?.document_id || docId;
-
-        await (client as any).docx.documentBlock.childrenBatchCreate({
-          path: { document_id: docId, block_id: pageBlockId },
-          data: { children, index: -1 },
-        });
-        mcpLog('docx_append', `success: ${children.length} blocks appended`);
-        return ok(`${children.length} block(s) appended to document.`);
-      } catch (err) { return larkError('docx_append', err); }
+      const docResp = await (client as any).docx.document.get({ path: { document_id: docId } });
+      const pageBlockId = docResp?.document?.document_id || docResp?.data?.document?.document_id || docId;
+      await (client as any).docx.documentBlock.childrenBatchCreate({
+        path: { document_id: docId, block_id: pageBlockId },
+        data: { children, index: -1 },
+      });
+      return ok(`${children.length} block(s) appended to document.`);
     },
   );
 
@@ -204,7 +189,7 @@ Accepts an array of block descriptors. Most common block types:
   // =========================================================================
   if (groups.has('sheets')) {
 
-  server.tool(
+  reg(
     'sheets_create',
     'Create a new Lark spreadsheet. Returns the spreadsheet URL and token.',
     {
@@ -212,24 +197,19 @@ Accepts an array of block descriptors. Most common block types:
       folder_token: z.string().optional().describe('Folder token (optional)'),
     },
     async (args) => {
-      mcpLog('sheets_create', `title="${args.title}"`);
-      if (!larkAvailable) return noLarkError('sheets_create');
-      try {
-        const resp = await (client as any).sheets.spreadsheet.create({
-          data: { title: args.title, folder_token: args.folder_token || undefined },
-        });
-        const sheet = resp?.spreadsheet || resp?.data?.spreadsheet || resp;
-        const token = sheet?.spreadsheet_token;
-        if (!token) return larkError('sheets_create', { msg: 'No spreadsheet_token in response' });
-        const domain = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace('/open-apis', '').replace('open.', '');
-        const url = `https://${domain.replace(/^https?:\/\//, '')}/sheets/${token}`;
-        mcpLog('sheets_create', `success: token=${token}`);
-        return ok(`Spreadsheet created: ${url}\nToken: ${token}`);
-      } catch (err) { return larkError('sheets_create', err); }
+      const resp = await (client as any).sheets.spreadsheet.create({
+        data: { title: args.title, folder_token: args.folder_token || undefined },
+      });
+      const sheet = resp?.spreadsheet || resp?.data?.spreadsheet || resp;
+      const token = sheet?.spreadsheet_token;
+      if (!token) return larkError('sheets_create', { msg: 'No spreadsheet_token in response' });
+      const domain = (process.env.LARK_DOMAIN || 'https://open.larksuite.com').replace('/open-apis', '').replace('open.', '');
+      const url = `https://${domain.replace(/^https?:\/\//, '')}/sheets/${token}`;
+      return ok(`Spreadsheet created: ${url}\nToken: ${token}`);
     },
   );
 
-  server.tool(
+  reg(
     'sheets_read',
     `Read cell values from a Lark spreadsheet range.
 Range format: "SheetName!A1:D10" or "sheet_id!A1:D10".
@@ -240,28 +220,22 @@ Accepts a spreadsheet token or full URL.`,
     },
     async (args) => {
       const token = parseSpreadsheetToken(args.spreadsheet);
-      mcpLog('sheets_read', `token=${token} range=${args.range}`);
-      if (!larkAvailable) return noLarkError('sheets_read');
-      try {
-        const resp = await client.request<any>({
-          method: 'GET',
-          url: `/open-apis/sheets/v2/spreadsheets/${token}/values/${encodeURIComponent(args.range)}`,
-          params: { valueRenderOption: 'ToString' },
-        });
-        const valueRange = resp?.data?.valueRange || resp?.valueRange;
-        const values = valueRange?.values;
-        if (!values || values.length === 0) return ok('(empty range)');
-        // Format as table
-        const table = values.map((row: any[]) =>
-          (row || []).map((cell: any) => cell == null ? '' : String(cell)).join('\t')
-        ).join('\n');
-        mcpLog('sheets_read', `success: ${values.length} rows`);
-        return ok(table);
-      } catch (err) { return larkError('sheets_read', err); }
+      const resp = await client.request<any>({
+        method: 'GET',
+        url: `/open-apis/sheets/v2/spreadsheets/${token}/values/${encodeURIComponent(args.range)}`,
+        params: { valueRenderOption: 'ToString' },
+      });
+      const valueRange = resp?.data?.valueRange || resp?.valueRange;
+      const values = valueRange?.values;
+      if (!values || values.length === 0) return ok('(empty range)');
+      const table = values.map((row: any[]) =>
+        (row || []).map((cell: any) => cell == null ? '' : String(cell)).join('\t')
+      ).join('\n');
+      return ok(table);
     },
   );
 
-  server.tool(
+  reg(
     'sheets_write',
     `Write values to a Lark spreadsheet range. Existing values in the range are overwritten.
 Range format: "SheetName!A1:D10" or "sheet_id!A1:D10".
@@ -273,25 +247,20 @@ Values: 2D JSON array, e.g. [["Name","Age"],["Alice",30],["Bob",25]]`,
     },
     async (args) => {
       const token = parseSpreadsheetToken(args.spreadsheet);
-      mcpLog('sheets_write', `token=${token} range=${args.range}`);
-      if (!larkAvailable) return noLarkError('sheets_write');
       let values: any[][];
       try { values = JSON.parse(args.values); } catch {
         return { content: [{ type: 'text' as const, text: 'Invalid JSON in values.' }], isError: true };
       }
-      try {
-        await client.request({
-          method: 'PUT',
-          url: `/open-apis/sheets/v2/spreadsheets/${token}/values`,
-          data: { valueRange: { range: args.range, values } },
-        });
-        mcpLog('sheets_write', `success: ${values.length} rows written`);
-        return ok(`${values.length} row(s) written to ${args.range}.`);
-      } catch (err) { return larkError('sheets_write', err); }
+      await client.request({
+        method: 'PUT',
+        url: `/open-apis/sheets/v2/spreadsheets/${token}/values`,
+        data: { valueRange: { range: args.range, values } },
+      });
+      return ok(`${values.length} row(s) written to ${args.range}.`);
     },
   );
 
-  server.tool(
+  reg(
     'sheets_append',
     `Append rows to a Lark spreadsheet. Values are added after the last non-empty row in the range.
 Range format: "SheetName!A1:D1" (specifies columns to use).
@@ -303,21 +272,16 @@ Values: 2D JSON array of rows to append.`,
     },
     async (args) => {
       const token = parseSpreadsheetToken(args.spreadsheet);
-      mcpLog('sheets_append', `token=${token} range=${args.range}`);
-      if (!larkAvailable) return noLarkError('sheets_append');
       let values: any[][];
       try { values = JSON.parse(args.values); } catch {
         return { content: [{ type: 'text' as const, text: 'Invalid JSON in values.' }], isError: true };
       }
-      try {
-        await client.request({
-          method: 'POST',
-          url: `/open-apis/sheets/v2/spreadsheets/${token}/values_append`,
-          data: { valueRange: { range: args.range, values } },
-        });
-        mcpLog('sheets_append', `success: ${values.length} rows appended`);
-        return ok(`${values.length} row(s) appended.`);
-      } catch (err) { return larkError('sheets_append', err); }
+      await client.request({
+        method: 'POST',
+        url: `/open-apis/sheets/v2/spreadsheets/${token}/values_append`,
+        data: { valueRange: { range: args.range, values } },
+      });
+      return ok(`${values.length} row(s) appended.`);
     },
   );
 
@@ -328,7 +292,7 @@ Values: 2D JSON array of rows to append.`,
   // =========================================================================
   if (groups.has('task')) {
 
-  server.tool(
+  reg(
     'lark_task_create',
     `Create a Lark task (visible in Lark's Task app). Different from schedule_task which is NanoClaw's internal scheduler.
 Due date format: Unix timestamp in seconds as a string, e.g. "1735689600".`,
@@ -338,26 +302,16 @@ Due date format: Unix timestamp in seconds as a string, e.g. "1735689600".`,
       due_timestamp: z.string().optional().describe('Due date as unix timestamp in seconds (e.g. "1735689600")'),
     },
     async (args) => {
-      mcpLog('lark_task_create', `summary="${args.summary}"`);
-      if (!larkAvailable) return noLarkError('lark_task_create');
-      try {
-        const data: any = {
-          summary: args.summary,
-          origin: { platform_i18n_name: 'NanoClaw' },
-        };
-        if (args.description) data.description = args.description;
-        if (args.due_timestamp) data.due = { time: args.due_timestamp, is_all_day: false };
-
-        const resp = await (client as any).task.task.create({ data });
-        const task = resp?.task || resp?.data?.task || resp;
-        const taskId = task?.id;
-        mcpLog('lark_task_create', `success: taskId=${taskId}`);
-        return ok(`Task created: "${args.summary}"\nTask ID: ${taskId || 'unknown'}`);
-      } catch (err) { return larkError('lark_task_create', err); }
+      const data: any = { summary: args.summary, origin: { platform_i18n_name: 'NanoClaw' } };
+      if (args.description) data.description = args.description;
+      if (args.due_timestamp) data.due = { time: args.due_timestamp, is_all_day: false };
+      const resp = await (client as any).task.task.create({ data });
+      const task = resp?.task || resp?.data?.task || resp;
+      return ok(`Task created: "${args.summary}"\nTask ID: ${task?.id || 'unknown'}`);
     },
   );
 
-  server.tool(
+  reg(
     'lark_task_list',
     'List Lark tasks. Optionally filter by completion status.',
     {
@@ -365,45 +319,31 @@ Due date format: Unix timestamp in seconds as a string, e.g. "1735689600".`,
       page_size: z.number().min(1).max(100).default(50).describe('Number of tasks to return (default 50)'),
     },
     async (args) => {
-      mcpLog('lark_task_list', `completed=${args.completed} pageSize=${args.page_size}`);
-      if (!larkAvailable) return noLarkError('lark_task_list');
-      try {
-        const params: any = { page_size: args.page_size || 50 };
-        if (args.completed !== undefined) params.task_completed = args.completed;
-
-        const resp = await (client as any).task.task.list({ params });
-        const items = resp?.data?.items || resp?.items || [];
-        if (items.length === 0) return ok('No tasks found.');
-
-        const lines = items.map((t: any) => {
-          const status = t.completed_at ? '[x]' : '[ ]';
-          const due = t.due?.time ? ` (due: ${new Date(Number(t.due.time) * 1000).toISOString().slice(0, 10)})` : '';
-          return `${status} ${t.summary || '(no title)'}${due} — id: ${t.id}`;
-        });
-        mcpLog('lark_task_list', `success: ${items.length} tasks`);
-        return ok(lines.join('\n'));
-      } catch (err) { return larkError('lark_task_list', err); }
+      const params: any = { page_size: args.page_size || 50 };
+      if (args.completed !== undefined) params.task_completed = args.completed;
+      const resp = await (client as any).task.task.list({ params });
+      const items = resp?.data?.items || resp?.items || [];
+      if (items.length === 0) return ok('No tasks found.');
+      const lines = items.map((t: any) => {
+        const status = t.completed_at ? '[x]' : '[ ]';
+        const due = t.due?.time ? ` (due: ${new Date(Number(t.due.time) * 1000).toISOString().slice(0, 10)})` : '';
+        return `${status} ${t.summary || '(no title)'}${due} — id: ${t.id}`;
+      });
+      return ok(lines.join('\n'));
     },
   );
 
-  server.tool(
+  reg(
     'lark_task_complete',
     'Mark a Lark task as completed.',
-    {
-      task_id: z.string().describe('The Lark task ID'),
-    },
+    { task_id: z.string().describe('The Lark task ID') },
     async (args) => {
-      mcpLog('lark_task_complete', `taskId=${args.task_id}`);
-      if (!larkAvailable) return noLarkError('lark_task_complete');
-      try {
-        await (client as any).task.task.complete({ path: { task_id: args.task_id } });
-        mcpLog('lark_task_complete', 'success');
-        return ok(`Task ${args.task_id} marked complete.`);
-      } catch (err) { return larkError('lark_task_complete', err); }
+      await (client as any).task.task.complete({ path: { task_id: args.task_id } });
+      return ok(`Task ${args.task_id} marked complete.`);
     },
   );
 
-  server.tool(
+  reg(
     'lark_task_update',
     'Update an existing Lark task (summary, description, or due date).',
     {
@@ -413,41 +353,27 @@ Due date format: Unix timestamp in seconds as a string, e.g. "1735689600".`,
       due_timestamp: z.string().optional().describe('New due date as unix timestamp in seconds'),
     },
     async (args) => {
-      mcpLog('lark_task_update', `taskId=${args.task_id}`);
-      if (!larkAvailable) return noLarkError('lark_task_update');
-
       const task: any = {};
       const updateFields: string[] = [];
       if (args.summary !== undefined) { task.summary = args.summary; updateFields.push('summary'); }
       if (args.description !== undefined) { task.description = args.description; updateFields.push('description'); }
       if (args.due_timestamp !== undefined) { task.due = { time: args.due_timestamp, is_all_day: false }; updateFields.push('due'); }
-
       if (updateFields.length === 0) return ok('Nothing to update.');
-      try {
-        await (client as any).task.task.patch({
-          path: { task_id: args.task_id },
-          data: { task, update_fields: updateFields },
-        });
-        mcpLog('lark_task_update', `success: updated ${updateFields.join(', ')}`);
-        return ok(`Task ${args.task_id} updated: ${updateFields.join(', ')}.`);
-      } catch (err) { return larkError('lark_task_update', err); }
+      await (client as any).task.task.patch({
+        path: { task_id: args.task_id },
+        data: { task, update_fields: updateFields },
+      });
+      return ok(`Task ${args.task_id} updated: ${updateFields.join(', ')}.`);
     },
   );
 
-  server.tool(
+  reg(
     'lark_task_delete',
     'Delete a Lark task.',
-    {
-      task_id: z.string().describe('The Lark task ID to delete'),
-    },
+    { task_id: z.string().describe('The Lark task ID to delete') },
     async (args) => {
-      mcpLog('lark_task_delete', `taskId=${args.task_id}`);
-      if (!larkAvailable) return noLarkError('lark_task_delete');
-      try {
-        await (client as any).task.task.delete({ path: { task_id: args.task_id } });
-        mcpLog('lark_task_delete', 'success');
-        return ok(`Task ${args.task_id} deleted.`);
-      } catch (err) { return larkError('lark_task_delete', err); }
+      await (client as any).task.task.delete({ path: { task_id: args.task_id } });
+      return ok(`Task ${args.task_id} deleted.`);
     },
   );
 
@@ -458,7 +384,7 @@ Due date format: Unix timestamp in seconds as a string, e.g. "1735689600".`,
   // =========================================================================
   if (groups.has('search')) {
 
-  server.tool(
+  reg(
     'search_messages',
     `Search for messages across Lark chats. By default searches only the current chat.
 Set search_all=true to search across all chats the bot is in.
@@ -471,44 +397,36 @@ Supports filtering by sender type, message type, and time range.`,
       page_size: z.number().min(1).max(50).default(20).describe('Number of results (default 20)'),
     },
     async (args) => {
-      mcpLog('search_messages', `query="${args.query}" all=${args.search_all}`);
-      if (!larkAvailable) return noLarkError('search_messages');
-      try {
-        const data: any = { query: args.query };
-        if (!args.search_all) {
-          data.chat_ids = [extractChatId(chatJid)];
-        }
-        if (args.from_type) data.from_type = args.from_type;
-        if (args.message_type) data.message_type = args.message_type;
+      const data: any = { query: args.query };
+      if (!args.search_all) data.chat_ids = [extractChatId(chatJid)];
+      if (args.from_type) data.from_type = args.from_type;
+      if (args.message_type) data.message_type = args.message_type;
 
-        const resp = await (client as any).search.message.create({
-          data,
-          params: { page_size: args.page_size || 20 },
-        });
-        const items: string[] = resp?.data?.items || resp?.items || [];
-        if (items.length === 0) return ok('No messages found.');
+      const resp = await (client as any).search.message.create({
+        data,
+        params: { page_size: args.page_size || 20 },
+      });
+      const items: string[] = resp?.data?.items || resp?.items || [];
+      if (items.length === 0) return ok('No messages found.');
 
-        const results: string[] = [];
-        for (const item of items) {
+      const results: string[] = [];
+      for (const item of items) {
+        try {
+          const msg = typeof item === 'string' ? JSON.parse(item) : item;
+          const time = msg.create_time ? new Date(Number(msg.create_time) * 1000).toISOString().slice(0, 16) : '';
+          const sender = msg.sender?.sender_type === 'bot' ? '(bot)' : '(user)';
+          const chatId = msg.chat_id || '';
+          let content = '';
           try {
-            const msg = typeof item === 'string' ? JSON.parse(item) : item;
-            const time = msg.create_time ? new Date(Number(msg.create_time) * 1000).toISOString().slice(0, 16) : '';
-            const sender = msg.sender?.sender_type === 'bot' ? '(bot)' : '(user)';
-            const chatId = msg.chat_id || '';
-            let content = '';
-            try {
-              if (msg.body?.content) {
-                const parsed = JSON.parse(msg.body.content);
-                content = parsed.text || parsed.content || JSON.stringify(parsed).slice(0, 200);
-              }
-            } catch { content = msg.body?.content?.slice(0, 200) || ''; }
-            results.push(`[${time}] ${sender} in ${chatId}: ${content}`);
-          } catch { /* skip malformed item */ }
-        }
-
-        mcpLog('search_messages', `success: ${results.length} results`);
-        return ok(results.join('\n'));
-      } catch (err) { return larkError('search_messages', err); }
+            if (msg.body?.content) {
+              const parsed = JSON.parse(msg.body.content);
+              content = parsed.text || parsed.content || JSON.stringify(parsed).slice(0, 200);
+            }
+          } catch { content = msg.body?.content?.slice(0, 200) || ''; }
+          results.push(`[${time}] ${sender} in ${chatId}: ${content}`);
+        } catch { /* skip malformed item */ }
+      }
+      return ok(results.join('\n'));
     },
   );
 

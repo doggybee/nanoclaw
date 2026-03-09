@@ -337,6 +337,13 @@ function detectAuthMode(): 'api-key' | 'oauth' {
   return 'oauth'; // default: OAuth (either from .env or CLI credentials)
 }
 
+/** Batch-add `-e KEY=VALUE` args, skipping undefined values. */
+function addEnvArgs(args: string[], env: Record<string, string | undefined>): void {
+  for (const [key, val] of Object.entries(env)) {
+    if (val !== undefined) args.push('-e', `${key}=${val}`);
+  }
+}
+
 function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -348,25 +355,16 @@ function buildContainerArgs(
 
   // Route API traffic through the credential proxy — containers never see real keys
   const proxyUrl = `http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`;
-  args.push('-e', `ANTHROPIC_BASE_URL=${proxyUrl}`);
-
-  // Tell container which auth mode to use (with placeholder credential)
   const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
-  } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
-  }
-
-  // Pass host timezone so container's local time matches the user's
-  args.push('-e', `TZ=${TIMEZONE}`);
+  addEnvArgs(args, {
+    ANTHROPIC_BASE_URL: proxyUrl,
+    ...(authMode === 'api-key' ? { ANTHROPIC_API_KEY: 'placeholder' } : { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' }),
+    TZ: TIMEZONE,
+  });
 
   // Pass model override and Lark credentials so container can call Lark API directly
   const env = readEnvFile(['CLAUDE_MODEL', 'LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN']);
-  if (env.CLAUDE_MODEL) args.push('-e', `CLAUDE_MODEL=${env.CLAUDE_MODEL}`);
-  if (env.LARK_APP_ID) args.push('-e', `LARK_APP_ID=${env.LARK_APP_ID}`);
-  if (env.LARK_APP_SECRET) args.push('-e', `LARK_APP_SECRET=${env.LARK_APP_SECRET}`);
-  if (env.LARK_DOMAIN) args.push('-e', `LARK_DOMAIN=${env.LARK_DOMAIN}`);
+  addEnvArgs(args, env);
 
   // Run as host user so bind-mounted files are accessible.
   // Skip when running as root (uid 0), as the container's node user (uid 1000),
@@ -389,6 +387,29 @@ function buildContainerArgs(
   args.push(CONTAINER_IMAGE);
 
   return args;
+}
+
+/** Manages a resettable timeout that kills a container. */
+function createTimeoutManager(
+  ms: number,
+  group: RegisteredGroup,
+  containerName: string,
+  container: ChildProcess,
+) {
+  let timedOut = false;
+  const kill = () => {
+    timedOut = true;
+    logger.error({ group: group.name, containerName }, 'Container timeout, stopping');
+    stopContainer(containerName, { timeout: 15000 }, (err) => {
+      if (err) container.kill('SIGKILL');
+    });
+  };
+  let timer = setTimeout(kill, ms);
+  return {
+    get timedOut() { return timedOut; },
+    reset() { clearTimeout(timer); timer = setTimeout(kill, ms); },
+    clear() { clearTimeout(timer); },
+  };
 }
 
 /**
@@ -461,20 +482,7 @@ export async function spawnWarmContainer(
   // Timeout management
   const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
   const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
-  let timedOut = false;
-
-  const killOnTimeout = () => {
-    timedOut = true;
-    logger.error({ group: group.name, containerName }, 'Warm container timeout, stopping');
-    stopContainer(containerName, { timeout: 15000 }, (err) => {
-      if (err) container.kill('SIGKILL');
-    });
-  };
-  let timeout = setTimeout(killOnTimeout, timeoutMs);
-  const resetTimeout = () => {
-    clearTimeout(timeout);
-    timeout = setTimeout(killOnTimeout, timeoutMs);
-  };
+  const tm = createTimeoutManager(timeoutMs, group, containerName, container);
 
   container.stdout.on('data', (data) => {
     const chunk = data.toString();
@@ -492,10 +500,8 @@ export async function spawnWarmContainer(
         const parsed: ContainerOutput = JSON.parse(jsonStr);
         if (parsed.newSessionId) newSessionId = parsed.newSessionId;
         hadOutput = true;
-        resetTimeout();
+        tm.reset();
         if (onOutput) {
-          // All outputs processed sequentially (no streaming coalescing needed —
-          // container handles streaming internally via CardKit)
           outputChain = outputChain.then(() => onOutput!(parsed));
         }
       } catch (err) {
@@ -513,11 +519,11 @@ export async function spawnWarmContainer(
 
   const exited = new Promise<ContainerOutput>((resolve) => {
     container.on('close', (code) => {
-      clearTimeout(timeout);
+      tm.clear();
       outputChain.then(() => {
-        if (timedOut && hadOutput) {
+        if (tm.timedOut && hadOutput) {
           resolve({ status: 'success', result: null, newSessionId });
-        } else if (timedOut) {
+        } else if (tm.timedOut) {
           resolve({ status: 'error', result: null, error: 'Warm container timed out' });
         } else {
           resolve({
@@ -530,7 +536,7 @@ export async function spawnWarmContainer(
       });
     });
     container.on('error', (err) => {
-      clearTimeout(timeout);
+      tm.clear();
       resolve({ status: 'error', result: null, error: err.message });
     });
   });
@@ -633,38 +639,12 @@ export async function runContainerAgent(
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
-    // Declare before stdout handler to avoid TDZ issues
-    let timedOut = false;
     let hadOutput = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
     const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
-
-    const killOnTimeout = () => {
-      timedOut = true;
-      logger.error(
-        { group: group.name, containerName },
-        'Container timeout, stopping gracefully',
-      );
-      stopContainer(containerName, { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
-    };
-
-    let timeout = setTimeout(killOnTimeout, timeoutMs);
-
-    // Reset the timeout whenever there's activity (streaming output)
-    const resetTimeout = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(killOnTimeout, timeoutMs);
-    };
+    const tm = createTimeoutManager(timeoutMs, group, containerName, container);
 
     container.stdout.on('data', (data) => {
       const chunk = data.toString();
@@ -707,10 +687,7 @@ export async function runContainerAgent(
               newSessionId = parsed.newSessionId;
             }
             hadOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // All outputs processed sequentially (no streaming coalescing needed —
-            // container handles streaming internally via CardKit)
+            tm.reset();
             outputChain = outputChain.then(() => onOutput(parsed));
           } catch (err) {
             logger.warn(
@@ -745,10 +722,10 @@ export async function runContainerAgent(
     });
 
     container.on('close', (code) => {
-      clearTimeout(timeout);
+      tm.clear();
       const duration = Date.now() - startTime;
 
-      if (timedOut) {
+      if (tm.timedOut) {
         const ts = new Date().toISOString().replace(/[:.]/g, '-');
         const timeoutLog = path.join(logsDir, `container-${ts}.log`);
         fs.writeFileSync(
@@ -940,7 +917,7 @@ export async function runContainerAgent(
     });
 
     container.on('error', (err) => {
-      clearTimeout(timeout);
+      tm.clear();
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',

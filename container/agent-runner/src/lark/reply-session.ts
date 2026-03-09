@@ -1,11 +1,10 @@
 /**
  * Reply session — manages the lifecycle of one streaming card reply.
- * Ported from host src/channels/lark/reply-session.ts.
- * Uses the container's larkClient singleton.
  *
- * Flush strategy: time-based throttle (100ms) + fire-and-forget.
- * pushContent is synchronous — buffers content until card is ready,
- * then flushes with 100ms throttle. API calls are fire-and-forget.
+ * Flush strategy: time-based throttle (100ms from caller) + in-flight guard.
+ * Only one CardKit API call runs at a time. If new content arrives during
+ * a call, a re-flush is scheduled immediately after the call completes.
+ * This matches the official feishu-plugin pattern.
  */
 import type { Client } from '@larksuiteoapi/node-sdk';
 
@@ -35,23 +34,30 @@ export interface ReplySessionOpts {
 }
 
 export class ReplySession {
-  private cardId: string | null = null;
+  // CardKit entity ID (from createCardEntity). Nulled on CardKit failure
+  // to switch subsequent flushes to IM patch mode.
+  private cardKitCardId: string | null = null;
+  // Original CardKit card ID — kept even after fallback so finalize()
+  // can still close streaming mode and update the card structure.
+  private originalCardKitCardId: string | null = null;
+  // IM message ID (from sendCardByCardId). Used for IM patch fallback.
+  private cardMessageId: string | null = null;
+
   private cardCreationPromise: Promise<void> | null = null;
   cardCreationFailed = false;
   private cardCompleted = false;
-  private sequence = 0;
+  private cardKitSequence = 0;
   private lastContent = '';
   private _optimizedContent = '';
   private _optimizedFor = '';
   private readonly startedAt: number;
 
   private flushCount = 0;
-  private consecutiveFailures = 0;
-  private static readonly MAX_STREAM_FAILURES = 3;
-
-  // IM patch fallback state (level 2)
-  private cardMessageId: string | null = null;
-  private useImPatch = false;
+  // In-flight guard: prevents concurrent CardKit calls that cause
+  // sequence reordering (300317 errors).
+  private flushInProgress = false;
+  private needsReflush = false;
+  private pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly client: Client,
@@ -67,12 +73,12 @@ export class ReplySession {
 
   /** Whether a card has been created (either CardKit or IM patch). */
   private get cardReady(): boolean {
-    return !!(this.cardId || this.cardMessageId);
+    return !!this.cardMessageId;
   }
 
   /** Whether a card was successfully created and content was delivered to the user. */
   get outputDelivered(): boolean {
-    return !this.cardCreationFailed && !!(this.cardId || this.cardMessageId);
+    return !this.cardCreationFailed && !!this.cardMessageId;
   }
 
   // ---- ensureCardCreated ----
@@ -87,29 +93,28 @@ export class ReplySession {
 
     this.cardCreationPromise = (async () => {
       try {
+        // Step 1: Create CardKit card entity
         const cardId = await createCardEntity(this.client, buildThinkingCardJson());
         if (!cardId) throw new Error('card.create returned empty card_id');
 
-        this.cardId = cardId;
-        this.sequence = 1;
+        this.cardKitCardId = cardId;
+        this.originalCardKitCardId = cardId;
+        this.cardKitSequence = 1;
 
-        await sendCardByCardId(
+        // Step 2: Send IM message referencing the card
+        const messageId = await sendCardByCardId(
           this.client,
           this.chatId,
           cardId,
           this.opts.replyToMessageId,
         );
+        this.cardMessageId = messageId;
 
-        log(`card created and sent: cardId=${cardId} chatId=${this.chatId}`);
-
-        // Flush any buffered content that arrived during card creation
-        if (this.lastContent && !this.cardCompleted) {
-          this.flushContent();
-        }
+        log(`card created and sent: cardId=${cardId} messageId=${messageId} chatId=${this.chatId}`);
       } catch (err) {
-        log(`CardKit creation failed: ${err instanceof Error ? err.message : String(err)}, trying IM patch fallback`);
+        log(`CardKit creation failed: ${err instanceof Error ? err.message : String(err)}, trying IM fallback`);
 
-        // Level 2: IM patch fallback
+        // Fallback: plain IM card (no CardKit streaming)
         try {
           const resp = await this.client.im.v1.message.create({
             data: {
@@ -123,17 +128,16 @@ export class ReplySession {
           if (!messageId) throw new Error('IM message.create returned empty message_id');
 
           this.cardMessageId = messageId;
-          this.useImPatch = true;
-          log(`IM patch fallback active: messageId=${messageId}`);
-
-          // Flush buffered content
-          if (this.lastContent && !this.cardCompleted) {
-            this.flushContent();
-          }
+          log(`IM fallback active: messageId=${messageId}`);
         } catch (imErr) {
-          log(`IM patch fallback also failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
+          log(`IM fallback also failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
           this.cardCreationFailed = true;
         }
+      }
+
+      // Flush any buffered content that arrived during card creation
+      if (this.lastContent && !this.cardCompleted && this.cardReady) {
+        this.flushCardUpdate();
       }
     })();
 
@@ -160,16 +164,31 @@ export class ReplySession {
     // when ensureCardCreated() completes (see the flush-after-create logic above).
     if (!this.cardReady) return true;
 
-    this.flushContent();
+    this.flushCardUpdate();
     return true;
   }
 
-  private flushContent(): void {
-    if ((!this.cardId && !this.cardMessageId) || this.cardCompleted) return;
+  /**
+   * Push accumulated text to the streaming card.
+   *
+   * When a CardKit card_id is available, uses cardElement.content() for
+   * native typewriter animation. Otherwise falls back to im.message.patch.
+   *
+   * Only one call runs at a time (flushInProgress guard). If new content
+   * arrives during a call, needsReflush triggers an immediate follow-up.
+   */
+  private flushCardUpdate(): void {
+    if (!this.cardMessageId || this.cardCompleted) return;
 
+    // If a flush is in flight, mark for re-flush after it completes
+    if (this.flushInProgress) {
+      this.needsReflush = true;
+      return;
+    }
+
+    this.flushInProgress = true;
+    this.needsReflush = false;
     this.flushCount++;
-    const nextSeq = this.sequence + 1;
-    this.sequence = nextSeq;
 
     // Cache optimizeMarkdownStyle — only recompute when content changes
     if (this.lastContent !== this._optimizedFor) {
@@ -179,67 +198,66 @@ export class ReplySession {
     const optimized = this._optimizedContent;
 
     if (this.flushCount <= 3 || this.flushCount % 10 === 0) {
-      log(`flush #${this.flushCount}: seq=${nextSeq} len=${this.lastContent.length}`);
+      log(`flush #${this.flushCount}: seq=${this.cardKitSequence + 1} len=${this.lastContent.length} cardkit=${!!this.cardKitCardId}`);
     }
 
-    if (this.useImPatch && this.cardMessageId) {
-      // Level 2: IM patch — fire-and-forget
-      this.client.im.v1.message.patch({
-        path: { message_id: this.cardMessageId },
-        data: { content: JSON.stringify(buildSimpleMarkdownCard(optimized)) },
-      }).catch((err) => {
-        log(`IM patch update failed: messageId=${this.cardMessageId} err=${err instanceof Error ? err.message : String(err)}`);
-      });
-    } else if (this.cardId) {
-      // Level 1: CardKit streaming — fire-and-forget
+    if (this.cardKitCardId) {
+      // CardKit streaming — increment sequence inside guard
+      this.cardKitSequence += 1;
+      const seq = this.cardKitSequence;
       streamCardContent(
         this.client,
-        this.cardId,
+        this.cardKitCardId,
         STREAMING_ELEMENT_ID,
         optimized,
-        nextSeq,
+        seq,
       ).then(() => {
-        this.consecutiveFailures = 0;
+        // success — no action needed
       }).catch((err) => {
-        this.consecutiveFailures++;
-        if (this.consecutiveFailures <= 3 || this.consecutiveFailures % 5 === 0) {
-          log(`streaming flush failed: seq=${nextSeq} failures=${this.consecutiveFailures} err=${err instanceof Error ? err.message : String(err)}`);
+        const apiCode = (err as any)?.cardkitCode;
+        if (apiCode === 230020) {
+          // Rate limited — silently skip, next flush picks up latest text
+          log(`flush rate limited (230020), skipping`);
+          return;
         }
-
-        // Auto-fallback to IM patch after repeated failures
-        if (this.consecutiveFailures >= ReplySession.MAX_STREAM_FAILURES) {
-          log(`CardKit streaming failed ${this.consecutiveFailures} times, falling back to IM patch`);
-          this.switchToImPatch();
+        log(`streaming flush failed: seq=${seq} err=${err instanceof Error ? err.message : String(err)}`);
+        // Disable CardKit streaming, fall back to IM patch on same message
+        if (this.cardKitCardId) {
+          log(`disabling CardKit streaming, falling back to IM patch`);
+          this.cardKitCardId = null;
         }
+      }).finally(() => {
+        this.flushInProgress = false;
+        this.scheduleReflush();
+      });
+    } else {
+      // IM patch fallback — update the same card message
+      this.client.im.v1.message.patch({
+        path: { message_id: this.cardMessageId! },
+        data: { content: JSON.stringify(buildSimpleMarkdownCard(optimized)) },
+      }).catch((err) => {
+        const code = (err as any)?.response?.data?.code;
+        if (code === 230020) {
+          log(`IM patch rate limited (230020), skipping`);
+          return;
+        }
+        log(`IM patch update failed: err=${err instanceof Error ? err.message : String(err)}`);
+      }).finally(() => {
+        this.flushInProgress = false;
+        this.scheduleReflush();
       });
     }
   }
 
-  /** Switch from CardKit streaming to IM patch mode mid-session. */
-  private switchingToImPatch = false;
-  private switchToImPatch(): void {
-    if (this.useImPatch || this.switchingToImPatch || !this.cardId) return;
-    this.switchingToImPatch = true;
-
-    this.client.im.v1.message.create({
-      data: {
-        receive_id: this.chatId,
-        msg_type: 'interactive',
-        content: JSON.stringify(buildSimpleMarkdownCard(this.lastContent || '...')),
-      },
-      params: { receive_id_type: 'chat_id' },
-    }).then((resp) => {
-      const messageId = resp?.data?.message_id;
-      if (messageId) {
-        this.cardMessageId = messageId;
-        this.useImPatch = true;
-        this.consecutiveFailures = 0;
-        log(`Switched to IM patch fallback: messageId=${messageId}`);
-      }
-    }).catch((imErr) => {
-      this.switchingToImPatch = false;
-      log(`IM patch fallback switch failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
-    });
+  /** If content arrived during an in-flight flush, re-flush immediately. */
+  private scheduleReflush(): void {
+    if (this.needsReflush && !this.pendingFlushTimer && !this.cardCompleted) {
+      this.needsReflush = false;
+      this.pendingFlushTimer = setTimeout(() => {
+        this.pendingFlushTimer = null;
+        this.flushCardUpdate();
+      }, 0);
+    }
   }
 
   // ---- finalize ----
@@ -248,12 +266,34 @@ export class ReplySession {
     if (this.cardCompleted) return;
     this.cardCompleted = true;
 
+    // Cancel any pending re-flush
+    if (this.pendingFlushTimer) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
+
     if (this.cardCreationPromise) {
       await this.cardCreationPromise;
     }
 
-    if (this.useImPatch && this.cardMessageId) {
-      // IM patch finalize: update card with final content
+    // Wait for any in-flight flush to complete
+    if (this.flushInProgress) {
+      await new Promise<void>(resolve => {
+        const check = () => {
+          if (!this.flushInProgress) { resolve(); return; }
+          setTimeout(check, 10);
+        };
+        check();
+      });
+    }
+
+    // Use originalCardKitCardId for finalization — even if we fell back
+    // to IM patch mid-stream, the original CardKit card still needs its
+    // streaming mode closed and structure updated.
+    const effectiveCardId = this.originalCardKitCardId;
+
+    if (!effectiveCardId && this.cardMessageId) {
+      // Pure IM fallback (CardKit never worked) — update via im.message.patch
       try {
         const elapsedMs = Date.now() - this.startedAt;
         const content = this.lastContent || 'Done.';
@@ -278,24 +318,26 @@ export class ReplySession {
       return;
     }
 
-    if (!this.cardId) return;
+    if (!effectiveCardId) return;
 
     try {
-      this.sequence += 1;
-      await setCardStreamingMode(this.client, this.cardId, false, this.sequence);
+      // Close streaming mode
+      this.cardKitSequence += 1;
+      await setCardStreamingMode(this.client, effectiveCardId, false, this.cardKitSequence);
 
+      // Build and apply final card
       const elapsedMs = Date.now() - this.startedAt;
       const completeCard = buildCompleteCard(
         this.lastContent || 'Done.',
         { ...opts, elapsedMs },
       );
 
-      this.sequence += 1;
-      await updateCardKitCard(this.client, this.cardId, completeCard, this.sequence);
+      this.cardKitSequence += 1;
+      await updateCardKitCard(this.client, effectiveCardId, completeCard, this.cardKitSequence);
 
-      log(`card finalized: cardId=${this.cardId} elapsedMs=${elapsedMs} flushes=${this.flushCount} failures=${this.consecutiveFailures}`);
+      log(`card finalized: cardId=${effectiveCardId} elapsedMs=${elapsedMs} flushes=${this.flushCount}`);
     } catch (err) {
-      log(`finalize failed: cardId=${this.cardId} err=${err instanceof Error ? err.message : String(err)}`);
+      log(`finalize failed: cardId=${effectiveCardId} err=${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -305,5 +347,9 @@ export class ReplySession {
 
   destroy(): void {
     this.cardCompleted = true;
+    if (this.pendingFlushTimer) {
+      clearTimeout(this.pendingFlushTimer);
+      this.pendingFlushTimer = null;
+    }
   }
 }

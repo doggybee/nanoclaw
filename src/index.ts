@@ -55,7 +55,7 @@ import { startIpcWatcher } from './ipc.js';
 import { selectModel } from './model-router.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { extractSessionCommand, findSessionCommand } from './session-commands.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { startSchedulerLoop, toTaskSnapshot } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -255,24 +255,20 @@ function loadState(): void {
 
 let _saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-/** Debounced state persistence — coalesces writes within 1s window. */
-function saveState(): void {
+/** Persist router state. Debounced by default; pass immediate=true for shutdown/rollback. */
+function saveState(immediate?: boolean): void {
+  if (immediate) {
+    if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+    setRouterState('last_timestamp', lastTimestamp);
+    setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
+    return;
+  }
   if (_saveTimer) return;
   _saveTimer = setTimeout(() => {
     _saveTimer = null;
     setRouterState('last_timestamp', lastTimestamp);
     setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
   }, 1000);
-}
-
-/** Immediate state flush — call on shutdown or critical rollback. */
-function saveStateFlush(): void {
-  if (_saveTimer) {
-    clearTimeout(_saveTimer);
-    _saveTimer = null;
-  }
-  setRouterState('last_timestamp', lastTimestamp);
-  setRouterState('last_agent_timestamp', JSON.stringify(lastAgentTimestamp));
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
@@ -514,7 +510,7 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
       return true;
     }
     lastAgentTimestamp[slotKey] = previousCursor;
-    saveStateFlush();
+    saveState(true);
     logger.warn(
       { group: group.name, senderId },
       'Agent error, rolled back message cursor for retry',
@@ -541,11 +537,7 @@ async function runAgent(
 
   // Update snapshots only when underlying data has changed
   if (taskVersion !== lastSeenTaskVersion) {
-    cachedTasksSnapshot = getAllTasks().map((t) => ({
-      id: t.id, groupFolder: t.group_folder, prompt: t.prompt,
-      schedule_type: t.schedule_type, schedule_value: t.schedule_value,
-      status: t.status, next_run: t.next_run,
-    }));
+    cachedTasksSnapshot = getAllTasks().map(toTaskSnapshot);
     lastSeenTaskVersion = taskVersion;
   }
   writeTasksSnapshot(group.folder, isMain, cachedTasksSnapshot);
@@ -790,7 +782,7 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
-    saveStateFlush();
+    saveState(true);
     proxyServer.close();
     // Kill warm pool containers
     for (const entry of warmPool) {

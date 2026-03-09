@@ -69,23 +69,16 @@ interface SDKUserMessage {
 class TextAccumulator {
   private currentTurn = '';
   private allTurns = '';
-  private _cachedFull = '';
-  private _dirty = false;
 
   push(delta: string): void {
     this.currentTurn += delta;
-    this._dirty = true;
   }
 
-  /** Full text: all previous turns + current turn. Cached until content changes. */
+  /** Full text: all previous turns + current turn. */
   get fullText(): string {
-    if (this._dirty) {
-      this._cachedFull = this.allTurns
-        ? this.allTurns + (this.currentTurn ? '\n\n' + this.currentTurn : '')
-        : this.currentTurn;
-      this._dirty = false;
-    }
-    return this._cachedFull;
+    return this.allTurns
+      ? this.allTurns + (this.currentTurn ? '\n\n' + this.currentTurn : '')
+      : this.currentTurn;
   }
 
   /** Final text (at query end). Returns null if no content. */
@@ -99,7 +92,6 @@ class TextAccumulator {
       this.allTurns += (this.allTurns ? '\n\n' : '') + this.currentTurn;
     }
     this.currentTurn = '';
-    this._dirty = true;
   }
 
   get hasContent(): boolean { return this.currentTurn.length > 0; }
