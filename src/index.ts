@@ -803,9 +803,17 @@ async function main(): Promise<void> {
       channel?: string,
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
-    onCardAction: (chatJid: string, action: { actionId: string; value?: Record<string, string>; userId: string; messageId?: string }) => {
+    onCardAction: async (chatJid: string, action: { actionId: string; value?: Record<string, string>; userId: string; messageId?: string }) => {
       const group = registeredGroups[chatJid];
       if (!group) return;
+
+      // Agent-controlled ownership: if the card action value contains _owner,
+      // only that user can interact. No _owner = anyone can click.
+      const owner = action.value?._owner;
+      if (owner && owner !== action.userId) {
+        return { toast: { type: 'warning' as const, content: '仅发起者可操作此卡片' } };
+      }
+
       const actionText = `@${ASSISTANT_NAME} [Card action: ${action.actionId}${action.value ? ` data=${JSON.stringify(action.value)}` : ''} by user ${action.userId}]`;
       const syntheticId = `card-action-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       storeMessage({
@@ -824,6 +832,21 @@ async function main(): Promise<void> {
         pendingReplyTo[slotKey] = { messageId: action.messageId, senderId: action.userId, senderName: action.userId };
       }
       wakeMessageLoop();
+    },
+    onNewChat: (jid: string, isGroup: boolean) => {
+      // Auto-register: generate a folder name from the chat ID
+      const chatId = jid.replace(/^lark:/, '');
+      const folder = (isGroup ? 'g-' : 'dm-') + chatId.replace(/[^a-zA-Z0-9]/g, '').slice(-12);
+      const group: RegisteredGroup = {
+        name: folder,
+        folder,
+        trigger: `@${ASSISTANT_NAME}`,
+        added_at: new Date().toISOString(),
+        requiresTrigger: isGroup, // groups need @mention, DMs respond directly
+      };
+      registerGroup(jid, group);
+      logger.info({ jid, folder, isGroup }, 'Auto-registered new chat');
+      return group;
     },
     registeredGroups: () => registeredGroups,
   };

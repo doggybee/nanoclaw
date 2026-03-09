@@ -64,6 +64,50 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+## Knowledge Base
+
+共享知识库在 `/workspace/global/knowledge/`，所有群的 agent 共同读写。回答问题前先搜索，学到新东西要写入。
+
+### 检索
+
+```bash
+qmd query "相关问题" --collection kb
+# 首次使用先建索引：
+qmd collection add /workspace/global/knowledge --name kb --mask "*.md" && qmd embed
+```
+
+### 写入规则
+
+以下情况**必须**写入知识库：
+- 用户纠正了你的错误认知
+- 用户解释了内部流程、术语、业务规则、技术方案
+- 用户明确要求"记住"、"记一下"、"记到知识库"
+- 你通过研究得到了可复用的结论或最佳实践
+- 用户分享了有价值的外部信息（行业数据、竞品分析等）
+
+**不要写入**：闲聊、临时任务细节、仅对当前对话有意义的内容（这些写群级 memory）。
+
+### 写入格式（Obsidian Markdown）
+
+```markdown
+---
+tags: [domain/area, topic/subtopic]
+source: 来源说明（如：用户反馈、内部文档、调研）
+updated: YYYY-MM-DD
+---
+
+# 标题
+
+正文内容。用 [[related-note]] 链接相关笔记。
+```
+
+规范：
+- 文件名：小写、连字符、描述性（`deployment-process.md`、`api-rate-limits.md`）
+- 标签：层级式 `domain/area`（`ops/deploy`、`product/pricing`）
+- 已有同主题笔记就更新，不要重复创建
+- 单文件超过 200 行就拆分
+- 写完后重建索引：`qmd collection add /workspace/global/knowledge --name kb --mask "*.md"`
+
 ## Local Search (QMD)
 
 When you need to find information across workspace files, use `qmd` instead of reading files one by one. This saves tokens significantly.

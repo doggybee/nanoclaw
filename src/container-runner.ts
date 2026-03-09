@@ -178,17 +178,26 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
+  }
 
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
+  // Global directory (read-only for all) — shared CLAUDE.md + instructions
+  const globalDir = path.join(GROUPS_DIR, 'global');
+  if (fs.existsSync(globalDir)) {
+    mounts.push({
+      hostPath: globalDir,
+      containerPath: '/workspace/global',
+      readonly: true,
+    });
+
+    // Knowledge subdirectory: writable overlay so all agents can accumulate knowledge.
+    // Docker overlays the more specific mount path on top of the read-only parent.
+    const knowledgeDir = path.join(globalDir, 'knowledge');
+    cachedMkdir(knowledgeDir);
+    mounts.push({
+      hostPath: knowledgeDir,
+      containerPath: '/workspace/global/knowledge',
+      readonly: false,
+    });
   }
 
   // Per-group Claude sessions directory (isolated from other groups)

@@ -35,7 +35,7 @@ Run `npx tsx setup/index.ts --step environment` and parse the status block.
 - DOCKER=running → continue to 3a
 - DOCKER=installed_not_running → start Docker: `sudo systemctl start docker` (Linux) or `open -a Docker` (macOS). Wait 15s, re-check with `docker info`.
 - DOCKER=not_found → Use `AskUserQuestion: Docker is required for running agents. Would you like me to install it?` If confirmed:
-  - Linux: `curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker $USER`. Note: user may need to log out/in for group membership.
+  - Linux: `curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $USER`. User MUST log out and back in (or run `newgrp docker`) for group membership to take effect. Verify with `docker info` (no sudo). If it fails, the user hasn't re-logged.
   - macOS: `brew install --cask docker`, then `open -a Docker` and wait for it to start.
 
 ### 3a. Build and test
@@ -172,11 +172,13 @@ If service already running: stop it first.
 - Linux: `sudo systemctl stop nanoclaw` or `systemctl --user stop nanoclaw`
 - macOS: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist`
 
+On Linux as non-root: ensure `loginctl enable-linger $USER` has been run (requires sudo). Without this, `systemctl --user` services die when the SSH session disconnects. Check with `loginctl show-user $USER -p Linger`; if Linger=no, run `sudo loginctl enable-linger $USER`.
+
 Run `npx tsx setup/index.ts --step service` and parse the status block.
 
 **If SERVICE_LOADED=false:**
 - Read `logs/setup.log` for the error.
-- Linux: check `systemctl status nanoclaw` or `systemctl --user status nanoclaw`.
+- Linux: check `systemctl status nanoclaw` or `systemctl --user status nanoclaw`. If "Failed to connect to bus", the user likely needs `enable-linger` or `export XDG_RUNTIME_DIR=/run/user/$(id -u)`.
 - macOS: check `launchctl list | grep nanoclaw`.
 - Re-run the service step after fixing.
 

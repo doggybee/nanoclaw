@@ -14,6 +14,7 @@
  *   Final marker after loop ends signals completion.
  */
 
+import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
@@ -733,6 +734,18 @@ async function main(): Promise<void> {
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
   try { if (!containerInput.isMain) globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8'); } catch {}
+
+  // Auto-index shared knowledge base in background (non-blocking).
+  // QMD skips unchanged files, so repeated runs are near-instant.
+  const knowledgeDir = '/workspace/global/knowledge';
+  try {
+    if (fs.existsSync(knowledgeDir) && fs.readdirSync(knowledgeDir).some(f => f.endsWith('.md'))) {
+      execFile('qmd', ['collection', 'add', knowledgeDir, '--name', 'kb', '--mask', '*.md'], (err) => {
+        if (err) log(`Knowledge base indexing failed: ${err.message}`);
+        else log('Knowledge base indexed');
+      });
+    }
+  } catch {}
 
   // Discover extra mount directories once
   const extraDirs: string[] = [];

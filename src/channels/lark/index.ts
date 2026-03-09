@@ -51,17 +51,23 @@ const SUPPORTED_MESSAGE_TYPES = new Set([
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+export interface CardActionResult {
+  toast?: { type: 'info' | 'warning' | 'error'; content: string };
+}
+
 export type OnCardAction = (chatJid: string, action: {
   actionId: string;
   value?: Record<string, string>;
   userId: string;
   messageId?: string;
-}) => void;
+}) => Promise<CardActionResult | void> | void;
 
 export interface LarkChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   onCardAction?: OnCardAction;
+  /** Called when a message arrives from an unregistered chat. Host should auto-register and return the group. */
+  onNewChat?: (jid: string, isGroup: boolean) => import('../../types.js').RegisteredGroup | undefined;
   registeredGroups: () => Record<string, import('../../types.js').RegisteredGroup>;
 }
 
@@ -284,7 +290,7 @@ class LarkChannel implements Channel {
       : '/lark/card';
     const cardActionHandler = new Lark.CardActionHandler(
       eventConfig,
-      async (data: any) => { await this.handleCardAction(data); return undefined as any; },
+      async (data: any) => { return await this.handleCardAction(data) ?? undefined as any; },
     );
 
     const webhookHandler = (Lark as any).adaptDefault(webhookPath, eventDispatcher, { autoChallenge: true });
@@ -359,7 +365,11 @@ class LarkChannel implements Channel {
     this.opts.onChatMetadata(jid, timestamp, undefined, 'lark', isGroup);
 
     const groups = this.opts.registeredGroups();
-    if (!groups[jid]) return;
+    if (!groups[jid]) {
+      if (!this.opts.onNewChat) return;
+      const registered = this.opts.onNewChat(jid, isGroup);
+      if (!registered) return;
+    }
 
     const sender = data.sender;
     const senderOpenId = sender?.sender_id?.open_id;
@@ -479,7 +489,7 @@ class LarkChannel implements Channel {
     });
   }
 
-  private async handleCardAction(data: any): Promise<void> {
+  private async handleCardAction(data: any): Promise<CardActionResult | void> {
     try {
       const action = data?.action;
       const operatorId = data?.operator?.open_id;
@@ -488,7 +498,7 @@ class LarkChannel implements Channel {
       if (!action || !chatId) return;
       const jid = `lark:${chatId}`;
       const actionId = action?.value?.action_id || action?.name || action?.tag || 'unknown';
-      this.opts.onCardAction?.(jid, {
+      return await this.opts.onCardAction?.(jid, {
         actionId,
         value: action?.value,
         userId: operatorId || '',
@@ -496,6 +506,7 @@ class LarkChannel implements Channel {
       });
     } catch (err) { logger.error({ err }, 'Error handling card action'); }
   }
+
 
   // ---- Outbound: sendMessage (text post only) ----
 
