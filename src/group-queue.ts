@@ -47,6 +47,7 @@ export class GroupQueue {
   private activeCount = 0;
   private groupActiveCount = new Map<string, number>(); // chatJid -> active slot count
   private waitingSlots: SlotKey[] = [];
+  private waitingSet = new Set<SlotKey>();
   private processMessagesFn: ((chatJid: string, senderId: string) => Promise<boolean>) | null =
     null;
   private onMaxRetriesFn: ((chatJid: string, senderId: string) => void) | null = null;
@@ -100,8 +101,9 @@ export class GroupQueue {
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS || groupActive >= MAX_CONTAINERS_PER_GROUP) {
       state.pendingMessages = true;
-      if (!this.waitingSlots.includes(slotKey)) {
+      if (!this.waitingSet.has(slotKey)) {
         this.waitingSlots.push(slotKey);
+        this.waitingSet.add(slotKey);
       }
       logger.debug(
         { slotKey, activeCount: this.activeCount, groupActive },
@@ -146,8 +148,9 @@ export class GroupQueue {
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS || groupActive >= MAX_CONTAINERS_PER_GROUP) {
       state.pendingTasks.push({ id: taskId, groupJid, fn });
-      if (!this.waitingSlots.includes(slotKey)) {
+      if (!this.waitingSet.has(slotKey)) {
         this.waitingSlots.push(slotKey);
+        this.waitingSet.add(slotKey);
       }
       logger.debug(
         { slotKey, taskId, activeCount: this.activeCount, groupActive },
@@ -396,6 +399,7 @@ export class GroupQueue {
       this.activeCount < MAX_CONCURRENT_CONTAINERS
     ) {
       const nextSlotKey = this.waitingSlots.shift()!;
+      this.waitingSet.delete(nextSlotKey);
       const state = this.getSlot(nextSlotKey);
       const { chatJid } = parseSlotKey(nextSlotKey);
       const groupActive = this.groupActiveCount.get(chatJid) || 0;
@@ -404,6 +408,7 @@ export class GroupQueue {
       if (groupActive >= MAX_CONTAINERS_PER_GROUP) {
         // Put back at end of waiting list
         this.waitingSlots.push(nextSlotKey);
+        this.waitingSet.add(nextSlotKey);
         checked++;
         continue;
       }

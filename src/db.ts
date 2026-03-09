@@ -14,6 +14,10 @@ import {
 
 let db: Database.Database;
 
+// Version counters for dirty tracking — consumers skip DB queries when unchanged
+export let taskVersion = 0;
+export let chatVersion = 0;
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -158,6 +162,8 @@ export function initDatabase(): void {
 export function _initTestDatabase(): void {
   db = new Database(':memory:');
   createSchema(db);
+  taskVersion = 0;
+  chatVersion = 0;
 }
 
 /**
@@ -198,6 +204,7 @@ export function storeChatMetadata(
     `,
     ).run(chatJid, chatJid, timestamp, ch, group);
   }
+  chatVersion++;
 }
 
 /**
@@ -212,6 +219,7 @@ export function updateChatName(chatJid: string, name: string): void {
     ON CONFLICT(jid) DO UPDATE SET name = excluded.name
   `,
   ).run(chatJid, name, new Date().toISOString());
+  chatVersion++;
 }
 
 /** Batch update chat names in a single transaction. */
@@ -226,6 +234,7 @@ export function updateChatNamesBatch(chats: Array<{ jid: string; name: string }>
       stmt.run(chat.jid, chat.name, now);
     }
   })();
+  chatVersion++;
 }
 
 export interface ChatInfo {
@@ -294,25 +303,22 @@ export function storeMessage(msg: NewMessage): void {
 export function getNewMessages(
   jids: string[],
   lastTimestamp: string,
-  botPrefix: string,
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
   const placeholders = jids.map(() => '?').join(',');
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp
     FROM messages
     WHERE timestamp > ? AND chat_jid IN (${placeholders})
-      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND is_bot_message = 0
       AND content != '' AND content IS NOT NULL
     ORDER BY timestamp
   `;
 
   const rows = db
     .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+    .all(lastTimestamp, ...jids) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {
@@ -325,21 +331,30 @@ export function getNewMessages(
 export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
-  botPrefix: string,
+  sender?: string,
 ): NewMessage[] {
-  // Filter bot messages using both the is_bot_message flag AND the content
-  // prefix as a backstop for messages written before the migration ran.
-  const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
-    FROM messages
-    WHERE chat_jid = ? AND timestamp > ?
-      AND is_bot_message = 0 AND content NOT LIKE ?
-      AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
-  `;
+  if (sender) {
+    return db
+      .prepare(
+        `SELECT id, chat_jid, sender, sender_name, content, timestamp
+         FROM messages
+         WHERE chat_jid = ? AND timestamp > ? AND sender = ?
+           AND is_bot_message = 0
+           AND content != '' AND content IS NOT NULL
+         ORDER BY timestamp`,
+      )
+      .all(chatJid, sinceTimestamp, sender) as NewMessage[];
+  }
   return db
-    .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+    .prepare(
+      `SELECT id, chat_jid, sender, sender_name, content, timestamp
+       FROM messages
+       WHERE chat_jid = ? AND timestamp > ?
+         AND is_bot_message = 0
+         AND content != '' AND content IS NOT NULL
+       ORDER BY timestamp`,
+    )
+    .all(chatJid, sinceTimestamp) as NewMessage[];
 }
 
 export function createTask(
@@ -362,6 +377,7 @@ export function createTask(
     task.status,
     task.created_at,
   );
+  taskVersion++;
 }
 
 export function getTaskById(id: string): ScheduledTask | undefined {
@@ -423,12 +439,14 @@ export function updateTask(
   db.prepare(
     `UPDATE scheduled_tasks SET ${fields.join(', ')} WHERE id = ?`,
   ).run(...values);
+  taskVersion++;
 }
 
 export function deleteTask(id: string): void {
   // Delete child records first (FK constraint)
   db.prepare('DELETE FROM task_run_logs WHERE task_id = ?').run(id);
   db.prepare('DELETE FROM scheduled_tasks WHERE id = ?').run(id);
+  taskVersion++;
 }
 
 export function getDueTasks(): ScheduledTask[] {
@@ -457,6 +475,7 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+  taskVersion++;
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -579,6 +598,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
   );
+  chatVersion++;
 }
 
 export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {

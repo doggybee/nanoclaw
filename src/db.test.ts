@@ -56,7 +56,6 @@ describe('storeMessage', () => {
     const messages = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     expect(messages).toHaveLength(1);
     expect(messages[0].id).toBe('msg-1');
@@ -80,7 +79,6 @@ describe('storeMessage', () => {
     const messages = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     expect(messages).toHaveLength(0);
   });
@@ -102,7 +100,6 @@ describe('storeMessage', () => {
     const messages = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     expect(messages).toHaveLength(1);
   });
@@ -131,7 +128,6 @@ describe('storeMessage', () => {
     const messages = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     expect(messages).toHaveLength(1);
     expect(messages[0].content).toBe('updated');
@@ -183,7 +179,6 @@ describe('getMessagesSince', () => {
     const msgs = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:02.000Z',
-      'Andy',
     );
     // Should exclude m1, m2 (before/at timestamp), m3 (bot message)
     expect(msgs).toHaveLength(1);
@@ -194,34 +189,21 @@ describe('getMessagesSince', () => {
     const msgs = getMessagesSince(
       'group@g.us',
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     const botMsgs = msgs.filter((m) => m.content === 'bot reply');
     expect(botMsgs).toHaveLength(0);
   });
 
   it('returns all non-bot messages when sinceTimestamp is empty', () => {
-    const msgs = getMessagesSince('group@g.us', '', 'Andy');
+    const msgs = getMessagesSince('group@g.us', '');
     // 3 user messages (bot message excluded)
     expect(msgs).toHaveLength(3);
   });
 
-  it('filters pre-migration bot messages via content prefix backstop', () => {
-    // Simulate a message written before migration: has prefix but is_bot_message = 0
-    store({
-      id: 'm5',
-      chat_jid: 'group@g.us',
-      sender: 'Bot@s.whatsapp.net',
-      sender_name: 'Bot',
-      content: 'Andy: old bot reply',
-      timestamp: '2024-01-01T00:00:05.000Z',
-    });
-    const msgs = getMessagesSince(
-      'group@g.us',
-      '2024-01-01T00:00:04.000Z',
-      'Andy',
-    );
-    expect(msgs).toHaveLength(0);
+  it('filters by sender when sender param is provided', () => {
+    const msgs = getMessagesSince('group@g.us', '', 'Alice@s.whatsapp.net');
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('first');
   });
 });
 
@@ -271,7 +253,6 @@ describe('getNewMessages', () => {
     const { messages, newTimestamp } = getNewMessages(
       ['group1@g.us', 'group2@g.us'],
       '2024-01-01T00:00:00.000Z',
-      'Andy',
     );
     // Excludes bot message, returns 3 user messages
     expect(messages).toHaveLength(3);
@@ -282,7 +263,6 @@ describe('getNewMessages', () => {
     const { messages } = getNewMessages(
       ['group1@g.us', 'group2@g.us'],
       '2024-01-01T00:00:02.000Z',
-      'Andy',
     );
     // Only g1 msg2 (after ts, not bot)
     expect(messages).toHaveLength(1);
@@ -290,7 +270,7 @@ describe('getNewMessages', () => {
   });
 
   it('returns empty for no registered groups', () => {
-    const { messages, newTimestamp } = getNewMessages([], '', 'Andy');
+    const { messages, newTimestamp } = getNewMessages([], '');
     expect(messages).toHaveLength(0);
     expect(newTimestamp).toBe('');
   });
