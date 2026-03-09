@@ -105,7 +105,7 @@ export async function run(_args: string[]): Promise<void> {
     }
   }
   if (credentials === 'missing') {
-    const credsPath = path.join(process.env.HOME || '/root', '.claude', '.credentials.json');
+    const credsPath = path.join(process.env.HOME || os.homedir(), '.claude', '.credentials.json');
     try {
       const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
       if (creds?.claudeAiOauth?.accessToken) credentials = 'configured';

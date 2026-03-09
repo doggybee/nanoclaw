@@ -3,11 +3,12 @@
  * and auto-refresh when expired.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { logger } from './logger.js';
 
 const CREDENTIALS_PATH = path.join(
-  process.env.HOME || '/root',
+  process.env.HOME || os.homedir(),
   '.claude',
   '.credentials.json',
 );

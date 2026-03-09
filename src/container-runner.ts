@@ -91,6 +91,24 @@ function chownRecursive(dir: string, uid: number, gid: number): void {
   }
 }
 
+/** Recursively chmod a directory tree — used when host is non-root so the
+ *  container's node user (different uid) can still read/write mounted dirs. */
+function chmodRecursive(dir: string, mode: number): void {
+  try {
+    fs.chmodSync(dir, mode);
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        chmodRecursive(full, mode);
+      } else {
+        fs.chmodSync(full, mode);
+      }
+    }
+  } catch {
+    // Best-effort: don't crash
+  }
+}
+
 /** mkdir with in-memory cache — skips syscall if already created this process. */
 function cachedMkdir(dir: string): void {
   if (createdDirs.has(dir)) return;
@@ -293,16 +311,19 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
-  // When running as root on the host, the container runs as node (uid 1000).
-  // Ensure ALL writable mount directories are owned by the container user
-  // so the agent can read, write, and delete files freely.
-  // Cached: only chown on first spawn per mount path to avoid redundant tree walks.
-  if (process.getuid?.() === 0) {
-    for (const mount of mounts) {
-      if (!mount.readonly && !chownedDirs.has(mount.hostPath)) {
+  // Ensure ALL writable mount directories are accessible to the container's
+  // node user (uid 1000).  Root host → chown to 1000; non-root host → chmod
+  // world-writable so the different uid inside the container can still write.
+  // Cached: only fix on first spawn per mount path to avoid redundant tree walks.
+  const isRoot = process.getuid?.() === 0;
+  for (const mount of mounts) {
+    if (!mount.readonly && !chownedDirs.has(mount.hostPath)) {
+      if (isRoot) {
         chownRecursive(mount.hostPath, 1000, 1000);
-        chownedDirs.add(mount.hostPath);
+      } else {
+        chmodRecursive(mount.hostPath, 0o777);
       }
+      chownedDirs.add(mount.hostPath);
     }
   }
 
