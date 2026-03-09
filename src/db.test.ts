@@ -9,6 +9,7 @@ import {
   getAllSessions,
   getMessagesSince,
   getNewMessages,
+  getRecentMessages,
   getSession,
   getTaskById,
   purgeOldMessages,
@@ -440,6 +441,52 @@ describe('sessions', () => {
     setSession('group-b', 'sess-b', 'user1');
     expect(getSession('group-a', 'user1')).toBe('sess-a');
     expect(getSession('group-b', 'user1')).toBe('sess-b');
+  });
+});
+
+// --- getRecentMessages ---
+
+describe('getRecentMessages', () => {
+  beforeEach(() => {
+    storeChatMetadata('group@g.us', '2024-01-01T00:00:00.000Z');
+
+    store({ id: 'r1', chat_jid: 'group@g.us', sender: 'Alice', sender_name: 'Alice', content: 'msg1', timestamp: '2024-01-01T00:00:01.000Z' });
+    store({ id: 'r2', chat_jid: 'group@g.us', sender: 'Bob', sender_name: 'Bob', content: 'msg2', timestamp: '2024-01-01T00:00:02.000Z' });
+    storeMessage({ id: 'r3', chat_jid: 'group@g.us', sender: 'Bot', sender_name: 'Bot', content: 'bot reply', timestamp: '2024-01-01T00:00:03.000Z', is_bot_message: true });
+    store({ id: 'r4', chat_jid: 'group@g.us', sender: 'Carol', sender_name: 'Carol', content: 'msg3', timestamp: '2024-01-01T00:00:04.000Z' });
+  });
+
+  it('returns messages in chronological order', () => {
+    const msgs = getRecentMessages('group@g.us', 10);
+    expect(msgs).toHaveLength(4); // includes bot message by default
+    expect(msgs[0].content).toBe('msg1');
+    expect(msgs[3].content).toBe('msg3');
+  });
+
+  it('respects limit', () => {
+    const msgs = getRecentMessages('group@g.us', 2);
+    expect(msgs).toHaveLength(2);
+    // Should be the 2 most recent, in chronological order
+    expect(msgs[0].content).toBe('bot reply');
+    expect(msgs[1].content).toBe('msg3');
+  });
+
+  it('supports before_timestamp', () => {
+    const msgs = getRecentMessages('group@g.us', 10, '2024-01-01T00:00:03.000Z');
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content).toBe('msg1');
+    expect(msgs[1].content).toBe('msg2');
+  });
+
+  it('excludes bot messages when includeBotMessages is false', () => {
+    const msgs = getRecentMessages('group@g.us', 10, undefined, false);
+    expect(msgs).toHaveLength(3);
+    expect(msgs.every((m) => m.content !== 'bot reply')).toBe(true);
+  });
+
+  it('includes bot messages by default', () => {
+    const msgs = getRecentMessages('group@g.us', 10);
+    expect(msgs.some((m) => m.content === 'bot reply')).toBe(true);
   });
 });
 

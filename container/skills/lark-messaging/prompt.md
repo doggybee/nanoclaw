@@ -33,7 +33,8 @@ React to a message with an emoji. Use the message ID from `<message id="...">` t
 Common emoji types: THUMBSUP, SMILE, HEART, YES, FireCracker, OK, JIAYI,�артnersh, MUSCLE.
 
 ### `get_chat_history`
-Fetch recent messages from the chat. Returns newest first. Use to get context about what others said.
+Fetch recent messages from the group chat. Returns messages in chronological order.
+Reads from the local message database — fast, no API call. Use this when you need context about what others in the group have been discussing. For example, if someone asks "what do you think?" and you're missing context, call this first.
 
 ### `edit_message`
 Edit a bot message by its message ID. Replaces the full content.

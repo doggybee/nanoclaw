@@ -9,7 +9,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { createTask, deleteTask, getRecentMessages, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -42,8 +42,18 @@ function isAuthorized(
   return !!target && target.folder === sourceGroup;
 }
 
+/** Write a response file for the container to read. Atomic write via temp+rename. */
+function writeIpcResponse(responsesDir: string, requestId: string, data: object): void {
+  fs.mkdirSync(responsesDir, { recursive: true });
+  const filepath = path.join(responsesDir, `${requestId}.json`);
+  const tempPath = `${filepath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data));
+  fs.renameSync(tempPath, filepath);
+}
+
 /**
- * Process a single IPC message. Only handles send_message as fallback.
+ * Process a single IPC message. Handles send_message fallback and
+ * request/response queries (get_chat_history).
  * All other Lark tools (add_reaction, edit_message, send_image, etc.) are
  * handled directly by the container's MCP server via the Lark SDK.
  */
@@ -52,8 +62,8 @@ async function processIpcMessage(
   sourceGroup: string,
   isMain: boolean,
   deps: IpcDeps,
-  _ipcBaseDir: string,
-  _slotId?: string,
+  ipcBaseDir: string,
+  slotId?: string,
 ): Promise<void> {
   const registeredGroups = deps.registeredGroups();
   const { type, chatJid } = data;
@@ -70,6 +80,37 @@ async function processIpcMessage(
       if (!data.text) return;
       await deps.sendMessage(chatJid, data.text);
       logger.info({ chatJid, sourceGroup, textLen: data.text.length }, 'IPC send_message (fallback)');
+      return;
+    }
+
+    case 'get_chat_history': {
+      const requestId = data.requestId as string;
+      if (!requestId) return;
+
+      const count = Math.min(Math.max(data.count || 20, 1), 50);
+      const beforeTimestamp = data.before_timestamp as string | undefined;
+
+      const messages = getRecentMessages(chatJid, count, beforeTimestamp);
+
+      // Resolve the responses directory for this slot
+      const responsesDir = slotId
+        ? path.join(ipcBaseDir, sourceGroup, 'slots', slotId, 'responses')
+        : path.join(ipcBaseDir, sourceGroup, 'responses');
+
+      writeIpcResponse(responsesDir, requestId, {
+        requestId,
+        messages: messages.map((m) => ({
+          sender_name: m.sender_name,
+          content: m.content,
+          timestamp: m.timestamp,
+          is_bot_message: !!(m as any).is_bot_message,
+        })),
+      });
+
+      logger.debug(
+        { chatJid, sourceGroup, count: messages.length, requestId },
+        'IPC get_chat_history response written',
+      );
       return;
     }
 

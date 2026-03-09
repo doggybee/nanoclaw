@@ -268,7 +268,7 @@ Agent 可以发送带按钮的交互式卡片，用户点击后触发回调：
 | `send_card` | 发送交互式卡片（Schema 2.0，支持按钮和布局） |
 | `edit_message` | 编辑已发送的消息 |
 | `add_reaction` | 给消息添加表情回应 |
-| `get_chat_history` | 获取聊天记录（1-50 条，支持分页） |
+| `get_chat_history` | 获取群聊记录（本地 SQLite 查询，<1ms；Lark API 作为 fallback） |
 
 **飞书文档工具**：
 
@@ -435,6 +435,7 @@ data/ipc/{group}/slots/{slotId}/
 
 - **输入**：宿主机写入 JSON 文件到 `input/`，容器通过 `fs.watch` 监听
 - **输出**：容器写入 JSON 文件到 `messages/` 或 `tasks/`，宿主机通过 `fs.watch` + 5 秒轮询监听
+- **请求/响应**：容器写入带 `requestId` 的请求到 `messages/`，宿主机处理后将结果写到 `responses/{requestId}.json`，容器轮询等待（30ms 间隔，5 秒超时）
 - **关闭信号**：宿主机写入 `input/_close` 文件通知容器退出
 
 ---
@@ -535,6 +536,77 @@ NanoClaw/
 │   └── messages.db               # SQLite
 └── docs/                         # 文档
 ```
+
+---
+
+## 常见问题（FAQ）
+
+### 同一群组里多个用户同时提问，会造成写入冲突吗？
+
+不会。系统通过 `SlotKey = chatJid::senderId` 做了多层隔离：
+
+**完全隔离的部分：**
+- **IPC 路径**：每个用户有独立的 IPC 目录 `data/ipc/{group}/slots/{senderId}/`，消息输入输出互不干扰
+- **Session**：数据库用复合主键 `(group_folder, sender_id)`，每人独立的 Claude 会话
+- **容器进程**：每个 slot 独立的 Docker 容器，独立的 stdin/stdout
+- **队列状态**：`GroupQueue` 按 SlotKey 隔离，各自独立的 active/pending 状态
+
+**SQLite 不会冲突：** 宿主机是单线程 Node.js，所有 DB 操作天然串行，加上 WAL 模式读写互不阻塞。
+
+**唯一的共享可写区域是 group folder**（`groups/{name}/` → `/workspace/group`）。两个容器同时挂载同一个目录做读写。如果两个 Agent 同时改同一个文件（比如 CLAUDE.md），后写的会覆盖先写的。实际场景下风险很低：Agent 主要读 group folder 里的配置和记忆，写入不频繁；即使同时写，Claude Code 用的是 Edit tool（原子替换），不会出现内容交错。
+
+### Agent 收到的 prompt 里包含什么？
+
+Agent 不是只处理"触发的那条消息"，而是处理该用户自上次游标（`lastAgentTimestamp[slotKey]`）以来的所有未处理消息。具体流程（`processUserSlot`）：
+
+1. 从 SQLite 拉取该 sender 自上次游标以来的所有消息
+2. 如果 group 需要 trigger，过滤出包含触发词的消息
+3. 用 `formatMessages()` 包成 XML 格式作为 prompt：
+
+```xml
+<messages>
+<message id="msg-1" sender="张三" time="2024-01-01T12:00:00Z">@Andy 帮我查一下这个</message>
+<message id="msg-2" sender="张三" time="2024-01-01T12:00:05Z">@Andy 补充一下，还要包含价格</message>
+</messages>
+```
+
+4. 该 prompt 发给容器，容器里的 Claude Agent SDK 结合 session 上下文处理
+
+如果容器还在运行时用户发了新消息，通过 `queue.sendMessage()` 直接以 IPC 文件推送到正在运行的容器，不用启动新容器。
+
+### Agent 能看到其他用户的消息吗？群聊上下文怎么获取？
+
+默认情况下，`processUserSlot` 只拉取该 sender 的消息（按 `senderId` 过滤）。如果 User A 和 User B 在群里讨论了 20 条，然后 User A @bot "你觉得呢"，Agent 只看到 User A 自己发的消息，看不到 User B 说了什么。
+
+Agent 的上下文来源：
+
+| 来源 | 内容 | 范围 |
+|------|------|------|
+| 当次 prompt | 该用户未处理的消息 | 仅该 sender |
+| Session 历史 | Claude SDK 的 `.jsonl` 会话文件 | 该用户之前与 bot 的对话 |
+| Group CLAUDE.md | 持久化的群组记忆 | 所有用户共享，但需要手动或 Agent 写入 |
+| `get_chat_history` 工具 | 群聊近期消息 | 所有用户的消息（含 bot） |
+
+**当 Agent 需要群聊上下文时**，可以主动调用 `get_chat_history` 工具获取最近的群聊消息。这个工具优先从宿主机 SQLite 读取（通过 IPC 请求/响应机制），延迟 <50ms；如果 IPC 超时则 fallback 到 Lark API。
+
+这个设计是有意为之：不在 prompt 里硬塞所有群聊消息（会干扰 Agent、浪费 token），而是让 Agent 按需拉取。Agent 看到用户说"你觉得呢"、"刚才说的那个"之类缺少上下文的表述时，会自己判断需要调 `get_chat_history`。
+
+### `get_chat_history` 的数据源和性能？
+
+`get_chat_history` 有两条路径：
+
+| 路径 | 数据源 | 延迟 | 触发条件 |
+|------|--------|------|----------|
+| IPC（主路径） | 宿主机 SQLite `messages` 表 | <1ms 查询 + ~30ms IPC 开销 | 默认 |
+| Lark API（fallback） | 飞书服务器 | 200-500ms | IPC 5 秒超时后 |
+
+IPC 路径的流程：
+1. 容器 MCP 工具写 `{"type": "get_chat_history", "chatJid": "...", "count": 20, "requestId": "xxx"}` 到 `messages/` 目录
+2. 宿主机 IPC watcher 检测到请求，调用 `getRecentMessages()` 从 SQLite 查询
+3. 结果写到 `responses/{requestId}.json`
+4. 容器 30ms 间隔轮询 `responses/` 目录，读取结果
+
+SQLite 使用 WAL 模式，`messages` 表有 `idx_messages_chat_ts` 索引，查询 50 条消息是微秒级操作。多人并发读写不会阻塞。
 
 ---
 

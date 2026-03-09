@@ -328,6 +328,39 @@ export function getNewMessages(
   return { messages: rows, newTimestamp };
 }
 
+/**
+ * Get the most recent messages in a chat, ordered oldest-first.
+ * Includes bot messages when includeBotMessages is true.
+ * Used for providing group chat context to agents via IPC.
+ */
+export function getRecentMessages(
+  chatJid: string,
+  limit: number,
+  beforeTimestamp?: string,
+  includeBotMessages = true,
+): NewMessage[] {
+  const botFilter = includeBotMessages ? '' : 'AND is_bot_message = 0';
+  const timeFilter = beforeTimestamp ? 'AND timestamp < ?' : '';
+  const params: unknown[] = [chatJid];
+  if (beforeTimestamp) params.push(beforeTimestamp);
+  params.push(limit);
+
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_bot_message
+       FROM messages
+       WHERE chat_jid = ? ${timeFilter}
+         AND content != '' AND content IS NOT NULL
+         ${botFilter}
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+    )
+    .all(...params) as NewMessage[];
+
+  // Return in chronological order (oldest first)
+  return rows.reverse();
+}
+
 export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,

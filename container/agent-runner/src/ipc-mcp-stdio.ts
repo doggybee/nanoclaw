@@ -22,6 +22,7 @@ import { mcpLog, extractLarkError, noLarkError, ok } from './lark/mcp-helpers.js
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const RESPONSES_DIR = path.join(IPC_DIR, 'responses');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -55,6 +56,33 @@ function writeIpcFile(dir: string, data: object): string {
   fs.renameSync(tempPath, filepath);
 
   return filename;
+}
+
+/**
+ * Send an IPC request and wait for the host to write a response file.
+ * Returns the parsed JSON response, or null on timeout.
+ */
+async function ipcRequest(dir: string, data: object, timeoutMs = 5000): Promise<any | null> {
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  writeIpcFile(dir, { ...data, requestId });
+
+  const responseFile = path.join(RESPONSES_DIR, `${requestId}.json`);
+  const start = Date.now();
+  const pollInterval = 30; // ms
+
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const content = fs.readFileSync(responseFile, 'utf-8');
+      // Clean up response file
+      try { fs.unlinkSync(responseFile); } catch { /* already removed */ }
+      return JSON.parse(content);
+    } catch {
+      // Not yet — wait and retry
+    }
+    await new Promise((r) => setTimeout(r, pollInterval));
+  }
+
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,17 +132,47 @@ server.tool(
 
 server.tool(
   'get_chat_history',
-  `Fetch recent chat history from the messaging platform. Returns messages in reverse chronological order (newest first).
+  `Fetch recent chat history from the group. Returns messages in chronological order (oldest first).
 Use this to get context about the conversation — especially messages from other users that weren't sent directly to you.
-Each returned message includes message_id, sender_id, sender_type ("user" or "bot"), msg_type, content, and create_time.`,
+Each returned message includes sender_name, content, timestamp, and whether it's from the bot.
+Fast local query (no API call). Use before responding when you need conversational context.`,
   {
     count: z.number().min(1).max(50).default(20).describe('Number of messages to fetch (1-50, default 20)'),
     before_timestamp: z.string().optional().describe('ISO timestamp — only return messages before this time. Omit for latest messages.'),
   },
   async (args) => {
     const count = args.count || 20;
-    mcpLog('get_chat_history', `count=${count} before=${args.before_timestamp || 'latest'} larkAvailable=${larkAvailable}`);
+    mcpLog('get_chat_history', `count=${count} before=${args.before_timestamp || 'latest'}`);
 
+    // Primary path: IPC request to host (reads from local SQLite — fast)
+    const response = await ipcRequest(MESSAGES_DIR, {
+      type: 'get_chat_history',
+      chatJid,
+      count,
+      before_timestamp: args.before_timestamp,
+    });
+
+    if (response?.messages) {
+      const messages = response.messages as Array<{
+        sender_name: string; content: string; timestamp: string; is_bot_message: boolean;
+      }>;
+
+      if (messages.length === 0) {
+        mcpLog('get_chat_history', 'success (ipc): 0 messages');
+        return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
+      }
+
+      const formatted = messages.map((m) =>
+        `[${m.timestamp}] ${m.is_bot_message ? '(bot)' : m.sender_name}: ${m.content}`
+      ).join('\n');
+
+      mcpLog('get_chat_history', `success (ipc): ${messages.length} messages`);
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    }
+
+    mcpLog('get_chat_history', 'IPC timeout, falling back to Lark API');
+
+    // Fallback: Lark API (slower, but works if host IPC is down)
     if (larkAvailable) {
       try {
         const chatId = extractChatId(chatJid);
@@ -134,7 +192,7 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
 
         const items = result?.data?.items || [];
         if (items.length === 0) {
-          mcpLog('get_chat_history', 'success: 0 messages');
+          mcpLog('get_chat_history', 'success (lark): 0 messages');
           return { content: [{ type: 'text' as const, text: 'No messages found.' }] };
         }
 
@@ -146,7 +204,6 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
               if (typeof parsed === 'string') content = parsed;
               else if (parsed.text) content = parsed.text;
               else if (parsed.content) {
-                // Extract text from post content
                 content = (Array.isArray(parsed.content) ? parsed.content : [])
                   .map((line: any[]) => (Array.isArray(line) ? line : []).map((el: any) => {
                     if (el.tag === 'text') return el.text || '';
@@ -162,20 +219,18 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
           } catch { content = item.body?.content || ''; }
 
           return {
-            message_id: item.message_id || '',
             sender_id: item.sender?.id || '',
             sender_type: item.sender?.sender_type || 'unknown',
-            msg_type: item.msg_type || 'unknown',
             content,
             create_time: item.create_time ? new Date(Number(item.create_time)).toISOString() : '',
           };
         });
 
         const formatted = messages.map((m) =>
-          `[${m.create_time}] ${m.sender_type === 'bot' ? '(bot)' : '(user)'} ${m.sender_id}: [${m.msg_type}] ${m.content}`
+          `[${m.create_time}] ${m.sender_type === 'bot' ? '(bot)' : '(user)'} ${m.sender_id}: ${m.content}`
         ).join('\n');
 
-        mcpLog('get_chat_history', `success: ${messages.length} messages`);
+        mcpLog('get_chat_history', `success (lark): ${messages.length} messages`);
         return { content: [{ type: 'text' as const, text: formatted }] };
       } catch (err: any) {
         const { code, msg } = extractLarkError(err);
@@ -184,7 +239,7 @@ Each returned message includes message_id, sender_id, sender_type ("user" or "bo
       }
     }
 
-    return noLarkError('get_chat_history');
+    return { content: [{ type: 'text' as const, text: 'Chat history unavailable (IPC timeout and Lark not configured).' }], isError: true };
   },
 );
 
