@@ -492,4 +492,94 @@ describe('GroupQueue', () => {
     completionCallbacks[1]();
     await vi.advanceTimersByTimeAsync(10);
   });
+
+  it('queues third user in same group when per-group limit (2) reached', async () => {
+    const processed: string[] = [];
+    const completionCallbacks: Array<() => void> = [];
+
+    const processMessages = vi.fn(async (chatJid: string, senderId: string) => {
+      processed.push(`${chatJid}::${senderId}`);
+      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us', 'user1');
+    queue.enqueueMessageCheck('group1@g.us', 'user2');
+    queue.enqueueMessageCheck('group1@g.us', 'user3');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Only 2 should run (per-group limit = 2), user3 queued
+    expect(processed).toEqual(['group1@g.us::user1', 'group1@g.us::user2']);
+
+    // Complete one, user3 should drain
+    completionCallbacks[0]();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(processed).toContain('group1@g.us::user3');
+
+    completionCallbacks[1]();
+    completionCallbacks[2]();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('allows other groups to run when one group hits per-group limit', async () => {
+    const processed: string[] = [];
+    const completionCallbacks: Array<() => void> = [];
+
+    // MAX_CONCURRENT_CONTAINERS = 2, MAX_CONTAINERS_PER_GROUP = 2
+    // Fill group1 with 1 slot, then enqueue group1 user2 and group2 user1
+    const processMessages = vi.fn(async (chatJid: string, senderId: string) => {
+      processed.push(`${chatJid}::${senderId}`);
+      await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+      return true;
+    });
+
+    queue.setProcessMessagesFn(processMessages);
+
+    queue.enqueueMessageCheck('group1@g.us', 'user1');
+    queue.enqueueMessageCheck('group1@g.us', 'user2');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Both run (per-group limit = 2, global limit = 2)
+    expect(processed).toHaveLength(2);
+
+    // Now global limit is full. group2 should queue.
+    queue.enqueueMessageCheck('group2@g.us', 'user1');
+    await vi.advanceTimersByTimeAsync(10);
+    expect(processed).toHaveLength(2); // still 2, group2 queued
+
+    // Free one slot
+    completionCallbacks[0]();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(processed).toContain('group2@g.us::user1');
+
+    completionCallbacks[1]();
+    completionCallbacks[2]();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('cleans up slot after max retries exceeded', async () => {
+    const processMessages = vi.fn(async () => false); // always fails
+    const onMaxRetries = vi.fn();
+
+    queue.setProcessMessagesFn(processMessages);
+    queue.setOnMaxRetriesFn(onMaxRetries);
+
+    queue.enqueueMessageCheck('group1@g.us', 'userX');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Advance through all 5 retries (5s, 10s, 20s, 40s, 80s = 155s total)
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(100_000);
+    }
+
+    expect(onMaxRetries).toHaveBeenCalledWith('group1@g.us', 'userX');
+
+    // Slot should be cleaned up — new enqueue creates a fresh slot
+    queue.enqueueMessageCheck('group1@g.us', 'userX');
+    await vi.advanceTimersByTimeAsync(10);
+    // Should process again (fresh slot, no stale retry state)
+    expect(processMessages.mock.calls.length).toBeGreaterThan(6);
+  });
 });
