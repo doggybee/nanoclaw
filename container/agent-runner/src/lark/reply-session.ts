@@ -24,7 +24,6 @@ import {
   type CompleteCardOpts,
 } from './card-builder.js';
 import { optimizeMarkdownStyle } from './markdown-style.js';
-import { addTypingIndicator, removeTypingIndicator, type TypingState } from './typing.js';
 
 function log(message: string): void {
   console.error(`[reply-session] ${message}`);
@@ -54,9 +53,6 @@ export class ReplySession {
   private cardMessageId: string | null = null;
   private useImPatch = false;
 
-  private typingState: TypingState | null = null;
-  private typingStopped = false;
-
   constructor(
     private readonly client: Client,
     private readonly chatId: string,
@@ -79,27 +75,6 @@ export class ReplySession {
     return !this.cardCreationFailed && !!(this.cardId || this.cardMessageId);
   }
 
-  // ---- Typing indicator ----
-
-  private async startTyping(): Promise<void> {
-    if (this.typingStopped || !this.opts.replyToMessageId) return;
-    if (this.typingState?.reactionId) return;
-
-    this.typingState = await addTypingIndicator(this.client, this.opts.replyToMessageId);
-
-    if (this.typingStopped && this.typingState) {
-      await removeTypingIndicator(this.client, this.typingState);
-      this.typingState = null;
-    }
-  }
-
-  private async stopTyping(): Promise<void> {
-    this.typingStopped = true;
-    if (!this.typingState) return;
-    await removeTypingIndicator(this.client, this.typingState);
-    this.typingState = null;
-  }
-
   // ---- ensureCardCreated ----
 
   async ensureCardCreated(): Promise<void> {
@@ -112,8 +87,6 @@ export class ReplySession {
 
     this.cardCreationPromise = (async () => {
       try {
-        this.startTyping().catch(() => {});
-
         const cardId = await createCardEntity(this.client, buildThinkingCardJson());
         if (!cardId) throw new Error('card.create returned empty card_id');
 
@@ -272,8 +245,6 @@ export class ReplySession {
     if (this.cardCompleted) return;
     this.cardCompleted = true;
 
-    await this.stopTyping().catch(() => {});
-
     if (this.cardCreationPromise) {
       await this.cardCreationPromise;
     }
@@ -331,6 +302,5 @@ export class ReplySession {
 
   destroy(): void {
     this.cardCompleted = true;
-    this.typingStopped = true;
   }
 }

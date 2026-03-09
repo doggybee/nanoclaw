@@ -32,7 +32,7 @@ interface ContainerInput {
   secrets?: Record<string, string>;
   /** Override model for this run (from model router). */
   model?: string;
-  /** User message ID for reply threading and typing indicator. */
+  /** User message ID for reply threading. */
   replyToMessageId?: string;
 }
 

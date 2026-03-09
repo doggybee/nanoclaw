@@ -113,7 +113,7 @@ export interface ContainerInput {
   model?: string;
   /** Slot ID for per-user IPC isolation. */
   slotId?: string;
-  /** Message ID to reply to (for streaming card reply and typing indicator). */
+  /** Message ID to reply to (for streaming card reply). */
   replyToMessageId?: string;
 }
 
