@@ -1,45 +1,22 @@
 # NanoClaw Agent Container
-# Runs Claude Agent SDK in isolated Linux VM with browser automation
+# Runs Claude Agent SDK in isolated Docker containers
 
 FROM node:22-slim
 
-# Install system dependencies for Chromium
-# Clean up docs, icons, DRI drivers, and OpenType CJK fonts (keep TrueType only)
-# to reduce image size by ~160MB
+# Install system dependencies and fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    chromium \
     fonts-liberation \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
-    libgbm1 \
-    libnss3 \
-    libatk-bridge2.0-0 \
-    libgtk-3-0 \
-    libx11-xcb1 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxrandr2 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxshmfence1 \
     curl \
     git \
     jq \
     unzip \
-    && rm -rf /var/lib/apt/lists/* \
-              /usr/share/doc/* \
-              /usr/share/icons/* \
-              /usr/lib/x86_64-linux-gnu/dri/*
+    && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/icons/*
 
-# Set Chromium path for agent-browser
-ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
-ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
-
-# Install agent-browser and claude-code globally, clean npm cache
-RUN npm install -g agent-browser @anthropic-ai/claude-code && npm cache clean --force
+# Install claude-code globally, clean npm cache
+RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
 
 # Install RTK (token-saving CLI proxy) — single static binary
 RUN RTK_ARCH=$(uname -m | sed 's/aarch64/aarch64-unknown-linux-gnu/;s/x86_64/x86_64-unknown-linux-musl/') \
