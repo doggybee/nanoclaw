@@ -472,10 +472,8 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
     }, IDLE_TIMEOUT);
   };
 
-  // Set reply target
-  if (!pendingReplyTo[slotKey]) {
-    pendingReplyTo[slotKey] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
-  }
+  // Set reply target — always update so new messages reply to the latest trigger
+  pendingReplyTo[slotKey] = findReplyTarget(relevantMessages, group.requiresTrigger !== false);
 
   let hadError = false;
   let outputSentToUser = false;
@@ -508,6 +506,9 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
 
   const isErrorState = output === 'error' || hadError;
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Clear reply target so next message gets a fresh one
+  delete pendingReplyTo[slotKey];
 
   if (isErrorState) {
     if (outputSentToUser) {
