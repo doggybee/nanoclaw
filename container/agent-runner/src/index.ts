@@ -453,7 +453,6 @@ async function runQuery(
           });
           log(`ReplySession: created for replyTo=${msg.replyToMessageId}`);
           replySession.ensureCardCreated().catch(() => {});
-          startStreamingTimer();
         }
         stream.push(msg.text);
       }
@@ -478,48 +477,63 @@ async function runQuery(
   let reasoningElapsedMs = 0;
   let isReasoningPhase = false;
 
-  // Timer-based streaming flush: instead of calling pushContent() on every
-  // stream_event (which floods the event loop with microtasks and delays API
-  // response callbacks), we check periodically if content changed and flush once.
-  // First flush at 50ms for fast perceived response, then 100ms steady state.
+  // Throttled streaming flush — matches official feishu-plugin's
+  // throttledCardUpdate / flushCardUpdate pattern.
+  // CardKit uses 100ms throttle; IM patch uses 1500ms (stricter rate limit).
+  // After a long gap (tool call), batch 300ms to show meaningful first update.
+  const CARDKIT_THROTTLE_MS = 100;
+  const PATCH_THROTTLE_MS = 1500;
+  const LONG_GAP_THRESHOLD_MS = 2000;
+  const BATCH_AFTER_GAP_MS = 300;
+
   let lastFlushedText = '';
-  let streamingTimer: ReturnType<typeof setTimeout> | null = null;
-  let streamingStarted = false;
-  const flushStreaming = () => {
+  let lastCardUpdateTime = 0;
+  let pendingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const flushCardUpdate = () => {
     if (!replySession) return;
-    let displayText: string;
-    if (isReasoningPhase && reasoningChunks.length > 0) {
-      displayText = `💭 **Thinking...**\n\n${reasoningChunks.join('')}`;
-    } else {
-      const raw = accumulator.fullText;
-      // Only run regex strip if reasoning deltas were received this turn
-      displayText = reasoningChunks.length > 0 ? stripReasoningTags(raw) : raw;
-    }
+    lastCardUpdateTime = Date.now();
+    const raw = accumulator.fullText;
+    const displayText = reasoningChunks.length > 0 ? stripReasoningTags(raw) : raw;
     if (displayText && displayText !== lastFlushedText) {
       lastFlushedText = displayText;
       replySession.pushContent(displayText);
     }
   };
-  const scheduleFlush = (delayMs: number) => {
-    streamingTimer = setTimeout(() => {
-      streamingTimer = null;
-      flushStreaming();
-      if (!streamingStarted) return;
-      scheduleFlush(100);
-    }, delayMs);
-  };
-  const startStreamingTimer = () => {
-    if (streamingStarted || !replySession) return;
-    streamingStarted = true;
-    scheduleFlush(50);
-  };
-  const stopStreamingTimer = () => {
-    streamingStarted = false;
-    if (streamingTimer) {
-      clearTimeout(streamingTimer);
-      streamingTimer = null;
+
+  const throttledCardUpdate = () => {
+    if (!replySession) return;
+    const throttleMs = replySession.isCardKit ? CARDKIT_THROTTLE_MS : PATCH_THROTTLE_MS;
+    const now = Date.now();
+    const elapsed = now - lastCardUpdateTime;
+    if (elapsed >= throttleMs) {
+      if (pendingFlushTimer) {
+        clearTimeout(pendingFlushTimer);
+        pendingFlushTimer = null;
+      }
+      if (elapsed > LONG_GAP_THRESHOLD_MS) {
+        // After a long gap (tool call / LLM thinking), batch briefly so
+        // the first visible update contains meaningful text rather than
+        // just 1-2 characters.
+        pendingFlushTimer = setTimeout(() => {
+          pendingFlushTimer = null;
+          flushCardUpdate();
+        }, BATCH_AFTER_GAP_MS);
+      } else {
+        flushCardUpdate();
+      }
+    } else if (!pendingFlushTimer) {
+      // Inside throttle window — schedule a deferred flush
+      const delay = throttleMs - elapsed;
+      pendingFlushTimer = setTimeout(() => {
+        pendingFlushTimer = null;
+        flushCardUpdate();
+      }, delay);
     }
+    // If a deferred flush is already scheduled, do nothing — it will
+    // pick up the latest accumulatedText when it fires.
   };
+
   const resetTurnState = () => {
     accumulator = new TextAccumulator();
     reasoningChunks = [];
@@ -529,11 +543,13 @@ async function runQuery(
     firstTokenTime = 0;
     streamEventCount = 0;
     lastFlushedText = '';
+    lastCardUpdateTime = 0;
+    if (pendingFlushTimer) {
+      clearTimeout(pendingFlushTimer);
+      pendingFlushTimer = null;
+    }
     turnStartTime = Date.now();
   };
-  if (replySession) {
-    startStreamingTimer();
-  }
 
   for await (const message of query({
     prompt: stream,
@@ -617,6 +633,7 @@ async function runQuery(
             log(`[thinking] answer phase started, reasoning took ${reasoningElapsedMs}ms (${reasoningChunks.length} chunks)`);
           }
           accumulator.push(event.delta.text);
+          throttledCardUpdate();
         }
       }
       continue;
@@ -638,7 +655,11 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      stopStreamingTimer();
+      // Cancel any pending flush before finalize
+      if (pendingFlushTimer) {
+        clearTimeout(pendingFlushTimer);
+        pendingFlushTimer = null;
+      }
 
       const rawFinalText = accumulator.finalText;
       const finalText = rawFinalText ? stripReasoningTags(rawFinalText) : null;
@@ -649,11 +670,7 @@ async function runQuery(
         if (finalText && finalText !== lastFlushedText) {
           replySession.pushContent(finalText);
         }
-        await replySession.finalize({
-          isError,
-          reasoningText: reasoningChunks.length > 0 ? reasoningChunks.join('') : undefined,
-          reasoningElapsedMs: reasoningElapsedMs || undefined,
-        });
+        await replySession.finalize({ isError });
         const delivered = replySession.outputDelivered;
         log(`Result #${resultCount}: subtype=${message.subtype} outputDelivered=${delivered}${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
         writeOutput({
@@ -686,7 +703,10 @@ async function runQuery(
 
   ipcPolling = false;
   stream.end(); // ensure poller exits if still awaiting
-  stopStreamingTimer();
+  if (pendingFlushTimer) {
+    clearTimeout(pendingFlushTimer);
+    pendingFlushTimer = null;
+  }
   if (replySession) {
     replySession.destroy();
   }

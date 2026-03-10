@@ -363,7 +363,7 @@ function buildContainerArgs(
   });
 
   // Pass model override and Lark credentials so container can call Lark API directly
-  const env = readEnvFile(['CLAUDE_MODEL', 'LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN']);
+  const env = readEnvFile(['CLAUDE_MODEL', 'LARK_APP_ID', 'LARK_APP_SECRET', 'LARK_DOMAIN', 'THINKING_BUDGET']);
   addEnvArgs(args, env);
 
   // Run as host user so bind-mounted files are accessible.

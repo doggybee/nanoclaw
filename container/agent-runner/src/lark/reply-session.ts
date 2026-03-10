@@ -40,6 +40,9 @@ export class ReplySession {
   // Original CardKit card ID — kept even after fallback so finalize()
   // can still close streaming mode and update the card structure.
   private originalCardKitCardId: string | null = null;
+
+  /** Whether CardKit streaming is active (vs IM patch fallback). */
+  get isCardKit(): boolean { return this.cardKitCardId !== null; }
   // IM message ID (from sendCardByCardId). Used for IM patch fallback.
   private cardMessageId: string | null = null;
 
