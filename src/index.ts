@@ -479,11 +479,20 @@ async function processUserSlot(chatJid: string, senderId: string): Promise<boole
 
   let hadError = false;
   let outputSentToUser = false;
+  const slotStartTime = Date.now();
+  let firstOutputTime = 0;
 
   const output = await runAgent(group, prompt, chatJid, senderId, async (result) => {
     // Container handles all message sending (CardKit streaming cards).
     // Host only tracks state.
     if (result.outputDelivered || result.result) {
+      if (!firstOutputTime) {
+        firstOutputTime = Date.now();
+        logger.info(
+          { group: group.name, senderId, model, elapsedMs: firstOutputTime - slotStartTime },
+          '[timing] first output from container',
+        );
+      }
       outputSentToUser = true;
       resetIdleTimer();
     }

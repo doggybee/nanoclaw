@@ -513,7 +513,13 @@ export async function spawnWarmContainer(
   container.stderr.on('data', (data) => {
     const lines = data.toString().trim().split('\n');
     for (const line of lines) {
-      if (line) logger.debug({ container: group.folder }, line);
+      if (!line) continue;
+      // Surface timing/thinking lines at info level for diagnostics
+      if (line.includes('[timing]') || line.includes('[thinking]')) {
+        logger.info({ container: group.folder }, line);
+      } else {
+        logger.debug({ container: group.folder }, line);
+      }
     }
   });
 

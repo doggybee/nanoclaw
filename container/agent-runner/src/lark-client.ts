@@ -26,3 +26,20 @@ export const larkClient = larkAvailable
       domain: (process.env.LARK_DOMAIN as any) || 'https://open.larksuite.com',
     })
   : (null as unknown as Client);
+
+/**
+ * Pre-warm the Lark SDK: fetch tenant_access_token + establish HTTPS connection.
+ * Call once during container idle time so the first real API call is fast.
+ * Mirrors the official feishu-plugin's probe() pattern.
+ */
+export async function warmupLarkClient(): Promise<void> {
+  if (!larkAvailable) return;
+  try {
+    const start = Date.now();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (larkClient as any).request({ method: 'GET', url: '/open-apis/bot/v3/info', data: {} });
+    console.error(`[agent-runner] [timing] Lark warmup done in ${Date.now() - start}ms`);
+  } catch (err) {
+    console.error(`[agent-runner] Lark warmup failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}

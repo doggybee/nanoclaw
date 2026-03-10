@@ -19,7 +19,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
-import { larkAvailable, larkClient, extractChatId } from './lark-client.js';
+import { larkAvailable, larkClient, extractChatId, warmupLarkClient } from './lark-client.js';
 import { ReplySession } from './lark/reply-session.js';
 
 interface ContainerInput {
@@ -100,6 +100,70 @@ class TextAccumulator {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 50; // fallback only — used when inotify unavailable
+
+// ---------------------------------------------------------------------------
+// Session file management — compact and prune to keep JSONL small
+// ---------------------------------------------------------------------------
+const SESSION_JSONL_DIR = path.join(
+  process.env.HOME || '/home/node',
+  '.claude', 'projects', '-workspace-group',
+);
+// Proactive compact threshold. When session JSONL exceeds this, trigger
+// /compact + prune before the next user message. Default 500KB.
+const SESSION_COMPACT_BYTES = parseInt(
+  process.env.SESSION_COMPACT_BYTES || '500000', 10,
+);
+
+function getSessionFileSize(sessionId: string): number {
+  try {
+    return fs.statSync(path.join(SESSION_JSONL_DIR, `${sessionId}.jsonl`)).size;
+  } catch { return 0; }
+}
+
+/**
+ * Prune session JSONL: discard lines before the last compact_boundary.
+ * The SDK only needs post-compact content to reconstruct the session.
+ * This dramatically reduces resume parsing time for long-running sessions.
+ *
+ * Returns bytes saved, or 0 if nothing to prune.
+ */
+function pruneSessionJsonl(sessionId: string): number {
+  const filePath = path.join(SESSION_JSONL_DIR, `${sessionId}.jsonl`);
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const lines = content.split('\n');
+
+    // Find last compact_boundary
+    let lastCompactIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+          lastCompactIdx = i;
+          break;
+        }
+      } catch {}
+    }
+
+    if (lastCompactIdx <= 0) return 0; // No compact boundary or at start
+
+    // Keep compact_boundary + everything after
+    const kept = lines.slice(lastCompactIdx).join('\n');
+    if (kept.length >= content.length * 0.8) return 0; // < 20% savings, skip
+
+    const saved = content.length - kept.length;
+    log(`Pruning session JSONL: ${(content.length / 1048576).toFixed(1)}MB → ${(kept.length / 1048576).toFixed(1)}MB (${lines.length} → ${lines.length - lastCompactIdx} lines)`);
+
+    // Backup then write pruned content
+    fs.writeFileSync(`${filePath}.pre-prune`, content);
+    fs.writeFileSync(filePath, kept);
+    return saved;
+  } catch (err) {
+    log(`Session prune failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 0;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // IPC watcher — event-driven via inotify (fs.watch), polling fallback
@@ -396,50 +460,15 @@ function drainIpcInput(): IpcMessage[] {
   }
 }
 
-// Messages drained from IPC but not processed (e.g. arrived after result).
-// waitForIpcMessage() checks this first before reading new files.
-let pendingIpcMessages: IpcMessage[] = [];
-
 /**
- * Wait for a new IPC message or _close sentinel.
- * Uses inotify (fs.watch) for near-instant detection, polling fallback.
- * Returns the combined message (with optional model from first message), or null if _close.
- */
-async function waitForIpcMessage(): Promise<IpcMessage | null> {
-  while (true) {
-    if (shouldClose()) return null;
-    // Check buffered messages first (left over from pollIpcDuringQuery)
-    if (pendingIpcMessages.length > 0) {
-      const msgs = pendingIpcMessages;
-      pendingIpcMessages = [];
-      return {
-        text: msgs.map(m => m.text).join('\n'),
-        model: msgs[0].model,
-        replyToMessageId: msgs[0].replyToMessageId,
-      };
-    }
-    const messages = drainIpcInput();
-    if (messages.length > 0) {
-      return {
-        text: messages.map(m => m.text).join('\n'),
-        model: messages[0].model,
-        replyToMessageId: messages[0].replyToMessageId,
-      };
-    }
-    await waitForIpcEvent();
-  }
-}
-
-/**
- * Run a single query and stream results via writeOutput.
- * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
- * allowing agent teams subagents to run to completion.
- * Also pipes IPC messages into the stream during the query.
+ * Run the query lifecycle — single query() call, stream stays open for multi-turn.
+ * The SDK handles session continuity natively (no JSONL re-parsing between turns).
+ * IPC messages are pushed into the stream; each result finalizes the current card
+ * and resets per-turn state, but the stream stays alive for the next message.
  *
  * Streaming output is handled by ReplySession (when larkAvailable):
  * text deltas are pushed to TextAccumulator then forwarded to ReplySession
  * which manages CardKit streaming cards directly via the Lark API.
- * writeOutput is only called once at result time.
  */
 async function runQuery(
   prompt: string,
@@ -447,11 +476,11 @@ async function runQuery(
   mcpServerPath: string,
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
-  replySession: ReplySession | null,
+  initialReplySession: ReplySession | null,
   globalClaudeMd: string | undefined,
   extraDirs: string[],
-  resumeAt?: string,
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
+  onFirstResult?: () => void,
+): Promise<{ newSessionId?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
   // In warm mode (empty prompt), don't push anything yet — let IPC polling
   // push the first message. The SDK initializes (MCP servers, session loading)
@@ -461,42 +490,32 @@ async function runQuery(
     stream.push(prompt);
   }
 
-  // Watch IPC for follow-up messages and _close sentinel during the query.
+  // Watch IPC for follow-up messages and _close sentinel.
   // Uses inotify (fs.watch) for near-instant detection, polling fallback.
   let ipcPolling = true;
   let closedDuringQuery = false;
-  // Set to true when the SDK emits a result — prevents pushing more IPC
-  // messages into the same query (which would accumulate all turns' text).
-  let queryResultReceived = false;
+  let replySession = initialReplySession;
   const pollIpcDuringQuery = async () => {
     while (ipcPolling) {
       if (shouldClose()) {
-        log('Close sentinel detected during query, ending stream');
+        log('Close sentinel detected, ending stream');
         closedDuringQuery = true;
         stream.end();
         ipcPolling = false;
         return;
       }
       const messages = drainIpcInput();
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        const sinceQuery = Date.now() - queryStartTime;
-        log(`[timing] IPC message received at +${sinceQuery}ms (${msg.text.length} chars)`);
-        if (queryResultReceived) {
-          log('Result already received, buffering IPC message for next query');
-          pendingIpcMessages.push(...messages.slice(i));
-          ipcPolling = false;
-          return;
-        }
-        // Lazy ReplySession creation: first IPC message provides replyToMessageId.
-        // In warm mode, this runs in parallel with SDK init (MCP servers etc.).
+      for (const msg of messages) {
+        log(`[timing] IPC message received (${msg.text.length} chars)`);
+        // Lazy ReplySession creation for each new turn.
+        // In warm mode first turn, this runs in parallel with SDK init.
         if (!replySession && larkAvailable && msg.replyToMessageId) {
           const chatId = extractChatId(containerInput.chatJid);
           replySession = new ReplySession(larkClient, chatId, {
             replyToMessageId: msg.replyToMessageId,
             startedAt: Date.now(),
           });
-          log(`ReplySession: lazy-created for chatId=${chatId} replyToMessageId=${msg.replyToMessageId}`);
+          log(`ReplySession: created for replyTo=${msg.replyToMessageId}`);
           replySession.ensureCardCreated().catch(() => {});
           startStreamingTimer();
         }
@@ -513,39 +532,68 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
-  const queryStartTime = Date.now();
+  let turnStartTime = Date.now();
   let firstTokenTime = 0;
   let streamEventCount = 0;
-  const accumulator = new TextAccumulator();
+  let accumulator = new TextAccumulator();
 
-  // Reasoning (thinking) state — reset per query
-  const reasoningChunks: string[] = [];
+  // Per-turn reasoning state
+  let reasoningChunks: string[] = [];
   let reasoningStartTime: number | null = null;
   let reasoningElapsedMs = 0;
   let isReasoningPhase = false;
 
   // Timer-based streaming flush: instead of calling pushContent() on every
   // stream_event (which floods the event loop with microtasks and delays API
-  // response callbacks), we check every 100ms if content changed and flush once.
+  // response callbacks), we check periodically if content changed and flush once.
+  // First flush at 50ms for fast perceived response, then 100ms steady state.
   let lastFlushedText = '';
-  let streamingTimer: ReturnType<typeof setInterval> | null = null;
-  const startStreamingTimer = () => {
-    if (streamingTimer || !replySession) return;
-    const session = replySession; // capture for closure
-    streamingTimer = setInterval(() => {
-      let displayText: string;
-      if (isReasoningPhase && reasoningChunks.length > 0) {
-        displayText = `💭 **Thinking...**\n\n${reasoningChunks.join('')}`;
-      } else {
-        displayText = stripReasoningTags(accumulator.fullText);
-      }
-      if (displayText && displayText !== lastFlushedText) {
-        lastFlushedText = displayText;
-        session.pushContent(displayText);
-      }
-    }, 100);
+  let streamingTimer: ReturnType<typeof setTimeout> | null = null;
+  let streamingStarted = false;
+  const flushStreaming = () => {
+    if (!replySession) return;
+    let displayText: string;
+    if (isReasoningPhase && reasoningChunks.length > 0) {
+      displayText = `💭 **Thinking...**\n\n${reasoningChunks.join('')}`;
+    } else {
+      displayText = stripReasoningTags(accumulator.fullText);
+    }
+    if (displayText && displayText !== lastFlushedText) {
+      lastFlushedText = displayText;
+      replySession.pushContent(displayText);
+    }
   };
-  // Start timer immediately if ReplySession was pre-created (non-warm mode)
+  const scheduleFlush = (delayMs: number) => {
+    streamingTimer = setTimeout(() => {
+      streamingTimer = null;
+      flushStreaming();
+      if (!streamingStarted) return;
+      scheduleFlush(100);
+    }, delayMs);
+  };
+  const startStreamingTimer = () => {
+    if (streamingStarted || !replySession) return;
+    streamingStarted = true;
+    scheduleFlush(50);
+  };
+  const stopStreamingTimer = () => {
+    streamingStarted = false;
+    if (streamingTimer) {
+      clearTimeout(streamingTimer);
+      streamingTimer = null;
+    }
+  };
+  const resetTurnState = () => {
+    accumulator = new TextAccumulator();
+    reasoningChunks = [];
+    reasoningStartTime = null;
+    reasoningElapsedMs = 0;
+    isReasoningPhase = false;
+    firstTokenTime = 0;
+    streamEventCount = 0;
+    lastFlushedText = '';
+    turnStartTime = Date.now();
+  };
   if (replySession) {
     startStreamingTimer();
   }
@@ -557,7 +605,6 @@ async function runQuery(
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
-      resumeSessionAt: resumeAt,
       systemPrompt: globalClaudeMd
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
         : undefined,
@@ -588,9 +635,15 @@ async function runQuery(
         },
       },
       includePartialMessages: true,
-      thinking: process.env.THINKING_BUDGET === '0'
-        ? { type: 'disabled' as const }
-        : { type: 'enabled' as const, budgetTokens: parseInt(process.env.THINKING_BUDGET || '10000', 10) },
+      thinking: (() => {
+        const model = containerInput.model || process.env.CLAUDE_MODEL || '';
+        const isHaiku = model.includes('haiku');
+        const defaultBudget = isHaiku ? 2000 : 10000;
+        const budget = parseInt(process.env.THINKING_BUDGET || String(defaultBudget), 10);
+        return budget === 0
+          ? { type: 'disabled' as const }
+          : { type: 'enabled' as const, budgetTokens: budget };
+      })(),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
@@ -599,7 +652,7 @@ async function runQuery(
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     if (message.type !== 'stream_event') {
-      log(`[msg #${messageCount}] type=${msgType} (+${Date.now() - queryStartTime}ms)`);
+      log(`[msg #${messageCount}] type=${msgType} (+${Date.now() - turnStartTime}ms)`);
     }
 
     // Token-level streaming: push text deltas to accumulator, forward to ReplySession
@@ -607,7 +660,7 @@ async function runQuery(
       streamEventCount++;
       if (!firstTokenTime) {
         firstTokenTime = Date.now();
-        log(`[timing] first stream_event at +${firstTokenTime - queryStartTime}ms from query start`);
+        log(`[timing] first stream_event at +${firstTokenTime - turnStartTime}ms from turn start`);
       }
       const event = (message as { event: { type: string; delta?: { type?: string; text?: string; thinking?: string } } }).event;
       if (event.type === 'content_block_delta') {
@@ -615,7 +668,7 @@ async function runQuery(
           // Reasoning phase
           if (!reasoningStartTime) {
             reasoningStartTime = Date.now();
-            log(`[thinking] reasoning phase started at +${reasoningStartTime - queryStartTime}ms`);
+            log(`[thinking] reasoning phase started at +${reasoningStartTime - turnStartTime}ms`);
           }
           isReasoningPhase = true;
           reasoningChunks.push(event.delta.thinking);
@@ -640,7 +693,7 @@ async function runQuery(
 
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
-      log(`[timing] SDK initialized at +${Date.now() - queryStartTime}ms, session: ${newSessionId}`);
+      log(`[timing] SDK initialized at +${Date.now() - turnStartTime}ms, session: ${newSessionId}`);
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -650,14 +703,7 @@ async function runQuery(
 
     if (message.type === 'result') {
       resultCount++;
-      queryResultReceived = true; // Prevent IPC poll from feeding more messages into this query
-      stream.end(); // End the stream so the SDK finishes and the main loop can start a new query
-
-      // Stop the streaming timer — flush final content synchronously below
-      if (streamingTimer) {
-        clearInterval(streamingTimer);
-        streamingTimer = null;
-      }
+      stopStreamingTimer();
 
       const rawFinalText = accumulator.finalText;
       const finalText = rawFinalText ? stripReasoningTags(rawFinalText) : null;
@@ -665,7 +711,6 @@ async function runQuery(
 
       // Finalize ReplySession (completes the streaming card)
       if (replySession) {
-        // Push final content before finalizing (timer may not have caught the last delta)
         if (finalText && finalText !== lastFlushedText) {
           replySession.pushContent(finalText);
         }
@@ -683,8 +728,8 @@ async function runQuery(
           outputDelivered: delivered,
           ...(isError ? { error: finalText || 'Agent returned error' } : {}),
         });
+        replySession.destroy();
       } else {
-        // No ReplySession (scheduled task, or lark not available) — send text via host
         log(`Result #${resultCount}: subtype=${message.subtype} (no ReplySession)${finalText ? ` text=${finalText.slice(0, 200)}` : ''}`);
         writeOutput({
           status: isError ? 'error' : 'success',
@@ -694,21 +739,23 @@ async function runQuery(
           ...(isError ? { error: finalText || 'Agent returned error' } : {}),
         });
       }
+
+      // Clear ReplySession — next IPC message creates a new one
+      replySession = null;
+      if (resultCount === 1) onFirstResult?.();
+
+      // Reset per-turn state; stream stays open for multi-turn
+      resetTurnState();
     }
   }
 
   ipcPolling = false;
-  if (streamingTimer) {
-    clearInterval(streamingTimer);
-    streamingTimer = null;
-  }
-  // Cleanup lazy-created ReplySession (warm mode creates it inside runQuery)
+  stopStreamingTimer();
   if (replySession) {
     replySession.destroy();
-    log('ReplySession: destroyed (end of runQuery)');
   }
-  log(`Query done. Messages: ${messageCount}, streamEvents: ${streamEventCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
-  return { newSessionId, lastAssistantUuid, closedDuringQuery };
+  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, closedDuringQuery: ${closedDuringQuery}`);
+  return { newSessionId, closedDuringQuery };
 }
 
 /**
@@ -738,6 +785,8 @@ async function main(): Promise<void> {
     containerInput = JSON.parse(stdinData);
     log(`Received input for group: ${containerInput.groupFolder}`);
     log(`Lark available: ${larkAvailable}`);
+    // Pre-warm Lark token + HTTPS connection in background (don't block startup)
+    warmupLarkClient().catch(() => {});
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -759,20 +808,25 @@ async function main(): Promise<void> {
   let globalClaudeMd: string | undefined;
   try { if (!containerInput.isMain) globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8'); } catch {}
 
-  // Auto-index knowledge base and conversation history in background (non-blocking).
-  // QMD skips unchanged files, so repeated runs are near-instant.
-  const qmdIndex = (dir: string, collection: string) => {
-    try {
-      if (fs.existsSync(dir) && fs.readdirSync(dir).some(f => f.endsWith('.md'))) {
-        execFile('qmd', ['collection', 'add', dir, '--name', collection, '--mask', '*.md'], (err) => {
-          if (err) log(`QMD index [${collection}] failed: ${err.message}`);
-          else log(`QMD index [${collection}] done`);
-        });
-      }
-    } catch {}
+  // QMD indexing helper — deferred to idle time (after first query completes)
+  // to avoid competing for CPU during SDK init and first API call.
+  let qmdIndexed = false;
+  const qmdIndexDeferred = () => {
+    if (qmdIndexed) return;
+    qmdIndexed = true;
+    const qmdIndex = (dir: string, collection: string) => {
+      try {
+        if (fs.existsSync(dir) && fs.readdirSync(dir).some(f => f.endsWith('.md'))) {
+          execFile('qmd', ['collection', 'add', dir, '--name', collection, '--mask', '*.md'], (err) => {
+            if (err) log(`QMD index [${collection}] failed: ${err.message}`);
+            else log(`QMD index [${collection}] done`);
+          });
+        }
+      } catch {}
+    };
+    qmdIndex('/workspace/global/knowledge', 'kb');
+    qmdIndex('/workspace/group/conversations', 'conversations');
   };
-  qmdIndex('/workspace/global/knowledge', 'kb');
-  qmdIndex('/workspace/group/conversations', 'conversations');
 
   // Discover extra mount directories once
   const extraDirs: string[] = [];
@@ -886,62 +940,30 @@ async function main(): Promise<void> {
   let currentReplyToMessageId = containerInput.replyToMessageId
     || (pending.length > 0 ? pending[0].replyToMessageId : undefined);
 
-  // Query loop: run query -> wait for IPC message -> run new query -> repeat
-  let resumeAt: string | undefined;
+  // Single query with persistent stream — SDK handles multi-turn natively.
+  // Follow-up messages are pushed into the stream via IPC polling inside runQuery.
+  // No JSONL re-parsing between turns; no MCP server re-init.
   try {
-    while (true) {
-      log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
+    log(`Starting query (session: ${sessionId || 'new'})...`);
 
-      // Warm mode: DON'T wait for IPC — call runQuery immediately with empty prompt.
-      // SDK initializes (MCP servers, session) in parallel with IPC waiting.
-      // ReplySession is created lazily inside runQuery when the first IPC message arrives.
+    const replySession = prompt
+      ? createReplySession(containerInput, currentReplyToMessageId)
+      : null; // warm mode: lazy creation inside runQuery
 
-      // For non-warm mode (prompt available): create ReplySession eagerly
-      const replySession = prompt
-        ? createReplySession(containerInput, currentReplyToMessageId)
-        : null; // warm mode: lazy creation inside runQuery
-
-      if (replySession) {
-        replySession.ensureCardCreated().catch(() => {});
-      }
-
-      const queryResult = await runQuery(prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv, replySession, globalClaudeMd, extraDirs, resumeAt);
-      // ReplySession cleanup is handled inside runQuery
-
-      if (queryResult.newSessionId) {
-        sessionId = queryResult.newSessionId;
-      }
-      if (queryResult.lastAssistantUuid) {
-        resumeAt = queryResult.lastAssistantUuid;
-      }
-
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
-      if (queryResult.closedDuringQuery) {
-        log('Close sentinel consumed during query, exiting');
-        break;
-      }
-
-      // Emit session update so host can track it
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId });
-
-      log('Query ended, waiting for next IPC message...');
-
-      // Wait for the next message or _close sentinel
-      const nextMessage = await waitForIpcMessage();
-      if (nextMessage === null) {
-        log('Close sentinel received, exiting');
-        break;
-      }
-
-      log(`Got new message (${nextMessage.text.length} chars), starting new query`);
-      prompt = nextMessage.text;
-      currentReplyToMessageId = nextMessage.replyToMessageId;
-      if (nextMessage.model) {
-        containerInput.model = nextMessage.model;
-      }
+    if (replySession) {
+      replySession.ensureCardCreated().catch(() => {});
     }
+
+    const queryResult = await runQuery(
+      prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv,
+      replySession, globalClaudeMd, extraDirs,
+      () => qmdIndexDeferred(),
+    );
+
+    if (queryResult.newSessionId) {
+      sessionId = queryResult.newSessionId;
+    }
+    log(`Query ended (closedDuringQuery=${queryResult.closedDuringQuery})`);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
