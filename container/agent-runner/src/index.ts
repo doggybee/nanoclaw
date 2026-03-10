@@ -102,70 +102,6 @@ const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 50; // fallback only — used when inotify unavailable
 
 // ---------------------------------------------------------------------------
-// Session file management — compact and prune to keep JSONL small
-// ---------------------------------------------------------------------------
-const SESSION_JSONL_DIR = path.join(
-  process.env.HOME || '/home/node',
-  '.claude', 'projects', '-workspace-group',
-);
-// Proactive compact threshold. When session JSONL exceeds this, trigger
-// /compact + prune before the next user message. Default 500KB.
-const SESSION_COMPACT_BYTES = parseInt(
-  process.env.SESSION_COMPACT_BYTES || '500000', 10,
-);
-
-function getSessionFileSize(sessionId: string): number {
-  try {
-    return fs.statSync(path.join(SESSION_JSONL_DIR, `${sessionId}.jsonl`)).size;
-  } catch { return 0; }
-}
-
-/**
- * Prune session JSONL: discard lines before the last compact_boundary.
- * The SDK only needs post-compact content to reconstruct the session.
- * This dramatically reduces resume parsing time for long-running sessions.
- *
- * Returns bytes saved, or 0 if nothing to prune.
- */
-function pruneSessionJsonl(sessionId: string): number {
-  const filePath = path.join(SESSION_JSONL_DIR, `${sessionId}.jsonl`);
-  try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n');
-
-    // Find last compact_boundary
-    let lastCompactIdx = -1;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      if (!lines[i].trim()) continue;
-      try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
-          lastCompactIdx = i;
-          break;
-        }
-      } catch {}
-    }
-
-    if (lastCompactIdx <= 0) return 0; // No compact boundary or at start
-
-    // Keep compact_boundary + everything after
-    const kept = lines.slice(lastCompactIdx).join('\n');
-    if (kept.length >= content.length * 0.8) return 0; // < 20% savings, skip
-
-    const saved = content.length - kept.length;
-    log(`Pruning session JSONL: ${(content.length / 1048576).toFixed(1)}MB → ${(kept.length / 1048576).toFixed(1)}MB (${lines.length} → ${lines.length - lastCompactIdx} lines)`);
-
-    // Backup then write pruned content
-    fs.writeFileSync(`${filePath}.pre-prune`, content);
-    fs.writeFileSync(filePath, kept);
-    return saved;
-  } catch (err) {
-    log(`Session prune failed: ${err instanceof Error ? err.message : String(err)}`);
-    return 0;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // IPC watcher — event-driven via inotify (fs.watch), polling fallback
 // ---------------------------------------------------------------------------
 let ipcWatcher: fs.FSWatcher | null = null;
@@ -529,7 +465,6 @@ async function runQuery(
   });
 
   let newSessionId: string | undefined;
-  let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
   let turnStartTime = Date.now();
@@ -556,7 +491,9 @@ async function runQuery(
     if (isReasoningPhase && reasoningChunks.length > 0) {
       displayText = `💭 **Thinking...**\n\n${reasoningChunks.join('')}`;
     } else {
-      displayText = stripReasoningTags(accumulator.fullText);
+      const raw = accumulator.fullText;
+      // Only run regex strip if reasoning deltas were received this turn
+      displayText = reasoningChunks.length > 0 ? stripReasoningTags(raw) : raw;
     }
     if (displayText && displayText !== lastFlushedText) {
       lastFlushedText = displayText;
@@ -686,8 +623,6 @@ async function runQuery(
     }
 
     if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
-      // Archive current turn text for cross-turn accumulation
       accumulator.reset();
     }
 
@@ -750,6 +685,7 @@ async function runQuery(
   }
 
   ipcPolling = false;
+  stream.end(); // ensure poller exits if still awaiting
   stopStreamingTimer();
   if (replySession) {
     replySession.destroy();
@@ -922,8 +858,6 @@ async function main(): Promise<void> {
         result: compactBoundarySeen ? 'Conversation compacted.' : 'Compaction requested but compact_boundary was not observed.',
         newSessionId: slashSessionId,
       });
-    } else if (!hadError && !resultEmitted) {
-      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
     }
     return;
   }
