@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
+import { z } from 'zod';
 
 import {
   DATA_DIR,
@@ -13,6 +14,21 @@ import { createTask, deleteTask, getRecentMessages, getTaskById, updateTask } fr
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
+
+// ---------------------------------------------------------------------------
+// IPC message schemas (validated at the boundary when reading JSON from disk)
+// ---------------------------------------------------------------------------
+
+const ipcMessageSchema = z.object({
+  type: z.string(),
+  chatJid: z.string().optional(),
+  text: z.string().optional(),
+  requestId: z.string().optional(),
+  count: z.number().optional(),
+  before_timestamp: z.string().optional(),
+});
+
+type IpcMessage = z.infer<typeof ipcMessageSchema>;
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -58,13 +74,19 @@ function writeIpcResponse(responsesDir: string, requestId: string, data: object)
  * handled directly by the container's MCP server via the Lark SDK.
  */
 async function processIpcMessage(
-  data: any,
+  raw: unknown,
   sourceGroup: string,
   isMain: boolean,
   deps: IpcDeps,
   ipcBaseDir: string,
   slotId?: string,
 ): Promise<void> {
+  const parsed = ipcMessageSchema.safeParse(raw);
+  if (!parsed.success) {
+    logger.warn({ sourceGroup, error: parsed.error.message }, 'Invalid IPC message schema');
+    return;
+  }
+  const data: IpcMessage = parsed.data;
   const registeredGroups = deps.registeredGroups();
   const { type, chatJid } = data;
 
@@ -136,7 +158,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
   const processDir = async (
     dir: string,
     sourceGroup: string,
-    handler: (data: any) => Promise<void>,
+    handler: (data: unknown) => Promise<void>,
   ) => {
     let files: string[];
     try {
@@ -237,29 +259,39 @@ export function startIpcWatcher(deps: IpcDeps): void {
   logger.info('IPC watcher started (fs.watch + fallback polling)');
 }
 
+export interface TaskIpcData {
+  type: string;
+  taskId?: string;
+  prompt?: string;
+  schedule_type?: string;
+  schedule_value?: string;
+  context_mode?: string;
+  groupFolder?: string;
+  chatJid?: string;
+  targetJid?: string;
+  // For register_group
+  jid?: string;
+  name?: string;
+  folder?: string;
+  trigger?: string;
+  requiresTrigger?: boolean;
+  containerConfig?: RegisteredGroup['containerConfig'];
+}
+
+const taskIpcBaseSchema = z.object({ type: z.string() });
+
 export async function processTaskIpc(
-  data: {
-    type: string;
-    taskId?: string;
-    prompt?: string;
-    schedule_type?: string;
-    schedule_value?: string;
-    context_mode?: string;
-    groupFolder?: string;
-    chatJid?: string;
-    targetJid?: string;
-    // For register_group
-    jid?: string;
-    name?: string;
-    folder?: string;
-    trigger?: string;
-    requiresTrigger?: boolean;
-    containerConfig?: RegisteredGroup['containerConfig'];
-  },
+  raw: unknown,
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
   deps: IpcDeps,
 ): Promise<void> {
+  const check = taskIpcBaseSchema.safeParse(raw);
+  if (!check.success) {
+    logger.warn({ sourceGroup, error: check.error.message }, 'Invalid task IPC data schema');
+    return;
+  }
+  const data = raw as TaskIpcData;
   const registeredGroups = deps.registeredGroups();
 
   switch (data.type) {

@@ -134,7 +134,7 @@ function convertInteractiveCard(raw: string): string {
       return convertCardToText(JSON.parse(parsed.json_card));
     }
     return convertCardToText(parsed);
-  } catch { return '[interactive card]'; }
+  } catch (err) { logger.debug({ err }, 'Failed to parse interactive card JSON'); return '[interactive card]'; }
 }
 
 function convertCardToText(card: any): string {
@@ -382,7 +382,7 @@ class LarkChannel implements Channel {
 
     // Extract content by message type
     if (messageType === 'text') {
-      try { content = JSON.parse(message.content).text || ''; } catch { return; }
+      try { content = JSON.parse(message.content).text || ''; } catch (err) { logger.debug({ err, messageId }, 'Failed to parse text message content'); return; }
     } else if (messageType === 'image') {
       try { const p = JSON.parse(message.content); content = `[image:${p.image_key}]`; embeddedImageKeys.push(p.image_key); } catch { return; }
     } else if (messageType === 'file') {
@@ -411,7 +411,7 @@ class LarkChannel implements Channel {
           lines.push(line);
         }
         content = lines.join('\n').trim() || '';
-      } catch { return; }
+      } catch (err) { logger.debug({ err, messageId }, 'Failed to parse post message content'); return; }
     } else if (messageType === 'audio') {
       try { const p = JSON.parse(message.content); const dur = p.duration != null ? ` duration="${Math.ceil(Number(p.duration) / 1000)}s"` : ''; content = p.file_key ? `<audio key="${p.file_key}"${dur}/>` : '[audio]'; } catch { content = '[audio]'; }
     } else if (messageType === 'video' || messageType === 'media') {
@@ -600,10 +600,10 @@ class LarkChannel implements Channel {
           else if (msgType === 'merge_forward') { sub = '<forwarded_messages/>'; }
           else { try { sub = JSON.parse(item.body?.content ?? '{}').text ?? `[${msgType}]`; } catch { sub = `[${msgType}]`; } }
           parts.push(`[${createTime}] ${senderId} (${item.message_id ?? ''}):\n${sub.split('\n').map((l: string) => `    ${l}`).join('\n')}`);
-        } catch { /* skip */ }
+        } catch (err) { logger.debug({ err, messageId: item.message_id }, 'Failed to parse forwarded message item'); }
       }
       return parts.length ? `<forwarded_messages>\n${parts.join('\n')}\n</forwarded_messages>` : '<forwarded_messages/>';
-    } catch { return '<forwarded_messages/>'; }
+    } catch (err) { logger.debug({ err, messageId }, 'Failed to expand merge forward'); return '<forwarded_messages/>'; }
   }
 
   private async downloadImages(jid: string, messageId: string, imageKeys: string[], groupFolder: string, content: string): Promise<string> {

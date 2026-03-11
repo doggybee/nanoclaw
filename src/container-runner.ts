@@ -31,6 +31,11 @@ import {
 } from './container-runtime.js';
 
 const PARSE_BUFFER_MAX = 10 * 1024 * 1024; // 10MB — prevent unbounded growth
+const CONTAINER_NODE_UID = 1000;
+const CONTAINER_NODE_GID = 1000;
+const CONTAINER_STOP_TIMEOUT_MS = 15000;
+const GRACE_PERIOD_MS = 30_000;
+const STDERR_SNIPPET_LENGTH = 200;
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
@@ -311,7 +316,7 @@ function buildVolumeMounts(
   for (const mount of mounts) {
     if (!mount.readonly && !chownedDirs.has(mount.hostPath)) {
       if (isRoot) {
-        chownRecursive(mount.hostPath, 1000, 1000);
+        chownRecursive(mount.hostPath, CONTAINER_NODE_UID, CONTAINER_NODE_GID);
       } else {
         chmodRecursive(mount.hostPath, 0o777);
       }
@@ -368,7 +373,7 @@ function buildContainerArgs(
   // or when getuid is unavailable (native Windows without WSL).
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
-  if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
+  if (hostUid != null && hostUid !== 0 && hostUid !== CONTAINER_NODE_UID) {
     args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', `HOME=${CONTAINER_HOME}`);
   }
@@ -397,7 +402,7 @@ function createTimeoutManager(
   const kill = () => {
     timedOut = true;
     logger.error({ group: group.name, containerName }, 'Container timeout, stopping');
-    stopContainer(containerName, { timeout: 15000 }, (err) => {
+    stopContainer(containerName, { timeout: CONTAINER_STOP_TIMEOUT_MS }, (err) => {
       if (err) container.kill('SIGKILL');
     });
   };
@@ -478,7 +483,7 @@ export async function spawnWarmContainer(
 
   // Timeout management
   const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-  const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+  const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + GRACE_PERIOD_MS);
   const tm = createTimeoutManager(timeoutMs, group, containerName, container);
 
   container.stdout.on('data', (data) => {
@@ -644,9 +649,9 @@ export async function runContainerAgent(
 
     let hadOutput = false;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
-    // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
+    // Grace period: hard timeout must be at least IDLE_TIMEOUT + grace period so the
     // graceful _close sentinel has time to trigger before the hard kill fires.
-    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + 30_000);
+    const timeoutMs = Math.max(configTimeout, IDLE_TIMEOUT + GRACE_PERIOD_MS);
     const tm = createTimeoutManager(timeoutMs, group, containerName, container);
 
     container.stdout.on('data', (data) => {
@@ -849,7 +854,7 @@ export async function runContainerAgent(
         resolve({
           status: 'error',
           result: null,
-          error: `Container exited with code ${code}: ${stderr.slice(-200)}`,
+          error: `Container exited with code ${code}: ${stderr.slice(-STDERR_SNIPPET_LENGTH)}`,
         });
         return;
       }

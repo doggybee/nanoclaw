@@ -13,6 +13,7 @@ import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
 const UPSTREAM = 'https://api.anthropic.com';
+const CREDENTIAL_REFRESH_INTERVAL_MS = 4 * 60 * 1000;
 
 /** Only allow known Anthropic API paths. Everything else is rejected. */
 const ALLOWED_PATH_PREFIXES = ['/v1/messages', '/v1/models', '/v1/oauth'];
@@ -72,7 +73,7 @@ export async function startCredentialProxy(
     } catch (err) {
       logger.warn({ err }, 'Credential proxy: failed to refresh credentials');
     }
-  }, 4 * 60 * 1000); // every 4 minutes
+  }, CREDENTIAL_REFRESH_INTERVAL_MS);
 
   const server = http.createServer((req, res) => {
     const reqPath = req.url || '/';
