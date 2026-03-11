@@ -10,7 +10,7 @@ This guide covers debugging the containerized agent execution system.
 ## Architecture Overview
 
 ```
-Host (macOS)                          Container (Linux VM)
+Host (Linux)                          Container (Docker)
 ─────────────────────────────────────────────────────────────
 src/container-runner.ts               container/agent-runner/
     │                                      │
@@ -30,7 +30,7 @@ src/container-runner.ts               container/agent-runner/
 
 | Log | Location | Content |
 |-----|----------|---------|
-| **Main app logs** | `logs/nanoclaw.log` | Host-side WhatsApp, routing, container spawning |
+| **Main app logs** | `logs/nanoclaw.log` | Host-side Lark events, routing, container spawning |
 | **Main app errors** | `logs/nanoclaw.error.log` | Host-side errors |
 | **Container run logs** | `groups/{folder}/logs/container-*.log` | Per-run: input, mounts, stderr, stdout |
 | **Claude sessions** | `~/.claude/projects/` | Claude Code session history |
@@ -43,10 +43,7 @@ Set `LOG_LEVEL=debug` for verbose output:
 # For development
 LOG_LEVEL=debug npm run dev
 
-# For launchd service (macOS), add to plist EnvironmentVariables:
-<key>LOG_LEVEL</key>
-<string>debug</string>
-# For systemd service (Linux), add to unit [Service] section:
+# For systemd service, add to unit [Service] section:
 # Environment=LOG_LEVEL=debug
 ```
 
@@ -120,10 +117,10 @@ Expected structure:
 ├── project/              # Project root (main channel only)
 ├── global/               # Global CLAUDE.md (non-main only)
 ├── ipc/                  # Inter-process communication
-│   ├── messages/         # Outgoing WhatsApp messages
-│   ├── tasks/            # Scheduled task commands
-│   ├── current_tasks.json    # Read-only: scheduled tasks visible to this group
-│   └── available_groups.json # Read-only: WhatsApp groups for activation (main only)
+│   ├── slots/{senderId}/messages/  # Outgoing Lark messages
+│   ├── slots/{senderId}/tasks/     # Scheduled task commands
+│   ├── current_tasks.json          # Read-only: scheduled tasks visible to this group
+│   └── available_groups.json       # Read-only: Lark groups for activation (main only)
 └── extra/                # Additional custom mounts
 ```
 
@@ -293,14 +290,11 @@ grep "Session initialized" logs/nanoclaw.log | tail -5
 The container communicates back to the host via files in `/workspace/ipc/`:
 
 ```bash
-# Check pending messages
-ls -la data/ipc/messages/
+# Check pending messages (per-slot)
+ls -la data/ipc/*/slots/*/messages/
 
 # Check pending task operations
-ls -la data/ipc/tasks/
-
-# Read a specific IPC file
-cat data/ipc/messages/*.json
+ls -la data/ipc/*/slots/*/tasks/
 
 # Check available groups (main channel only)
 cat data/ipc/main/available_groups.json
@@ -310,10 +304,10 @@ cat data/ipc/{groupFolder}/current_tasks.json
 ```
 
 **IPC file types:**
-- `messages/*.json` - Agent writes: outgoing WhatsApp messages
-- `tasks/*.json` - Agent writes: task operations (schedule, pause, resume, cancel, refresh_groups)
+- `slots/{senderId}/messages/*.json` - Agent writes: outgoing Lark messages
+- `slots/{senderId}/tasks/*.json` - Agent writes: task operations (schedule, pause, resume, cancel, refresh_groups)
 - `current_tasks.json` - Host writes: read-only snapshot of scheduled tasks
-- `available_groups.json` - Host writes: read-only list of WhatsApp groups (main only)
+- `available_groups.json` - Host writes: read-only list of Lark groups (main only)
 
 ## Quick Diagnostic Script
 
@@ -329,7 +323,7 @@ echo -e "\n2. Env file copied for container?"
 [ -f data/env/env ] && echo "OK" || echo "MISSING - will be created on first run"
 
 echo -e "\n3. Container runtime running?"
-docker info &>/dev/null && echo "OK" || echo "NOT RUNNING - start Docker Desktop (macOS) or sudo systemctl start docker (Linux)"
+docker info &>/dev/null && echo "OK" || echo "NOT RUNNING - sudo systemctl start docker"
 
 echo -e "\n4. Container image exists?"
 echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"

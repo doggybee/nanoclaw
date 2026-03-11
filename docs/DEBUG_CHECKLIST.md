@@ -15,20 +15,20 @@ Both timers fire at the same time, so containers always exit via hard SIGKILL (c
 
 ```bash
 # 1. Is the service running?
-launchctl list | grep nanoclaw
-# Expected: PID  0  com.nanoclaw (PID = running, "-" = not running, non-zero exit = crashed)
+systemctl status nanoclaw
+# Expected: active (running)
 
 # 2. Any running containers?
-container ls --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
+docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
 
 # 3. Any stopped/orphaned containers?
-container ls -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
+docker ps -a --format '{{.Names}} {{.Status}}' 2>/dev/null | grep nanoclaw
 
 # 4. Recent errors in service log?
 grep -E 'ERROR|WARN' logs/nanoclaw.log | tail -20
 
-# 5. Is WhatsApp connected? (look for last connection event)
-grep -E 'Connected to WhatsApp|Connection closed|connection.*close' logs/nanoclaw.log | tail -5
+# 5. Is Lark webhook active? (look for last event)
+grep -E 'Lark event|webhook|card callback' logs/nanoclaw.log | tail -5
 
 # 6. Are groups loaded?
 grep 'groupCount' logs/nanoclaw.log | tail -3
@@ -77,7 +77,7 @@ grep -E 'Scheduling retry|retry|Max retries' logs/nanoclaw.log | tail -10
 ## Agent Not Responding
 
 ```bash
-# Check if messages are being received from WhatsApp
+# Check if messages are being received from Lark
 grep 'New messages' logs/nanoclaw.log | tail -10
 
 # Check if messages are being processed (container spawned)
@@ -107,37 +107,38 @@ sqlite3 store/messages.db "SELECT name, container_config FROM registered_groups;
 
 # Test-run a container to check mounts (dry run)
 # Replace <group-folder> with the group's folder name
-container run -i --rm --entrypoint ls nanoclaw-agent:latest /workspace/extra/
+docker run -i --rm --entrypoint ls nanoclaw-agent:latest /workspace/extra/
 ```
 
-## WhatsApp Auth Issues
+## Lark Webhook Issues
 
 ```bash
-# Check if QR code was requested (means auth expired)
-grep 'QR\|authentication required\|qr' logs/nanoclaw.log | tail -5
+# Check if Lark events are arriving
+grep -E 'Lark event|webhook|event received' logs/nanoclaw.log | tail -5
 
-# Check auth files exist
-ls -la store/auth/
+# Verify Lark credentials are configured
+grep -q 'LARK_APP_ID' .env && echo "OK" || echo "MISSING"
 
-# Re-authenticate if needed
-npm run auth
+# Check Lark card callback errors
+grep -E 'card.*error|callback.*fail' logs/nanoclaw.log | tail -5
 ```
 
 ## Service Management
 
 ```bash
 # Restart the service
-launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+systemctl restart nanoclaw
 
 # View live logs
-tail -f logs/nanoclaw.log
+journalctl -u nanoclaw -f
+# Or: tail -f logs/nanoclaw.log
 
 # Stop the service (careful — running containers are detached, not killed)
-launchctl bootout gui/$(id -u)/com.nanoclaw
+systemctl stop nanoclaw
 
 # Start the service
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nanoclaw.plist
+systemctl start nanoclaw
 
 # Rebuild after code changes
-npm run build && launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+npm run build && systemctl restart nanoclaw
 ```
