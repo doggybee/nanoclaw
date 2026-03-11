@@ -28,7 +28,6 @@ Single Node.js process that connects to Lark (Feishu), routes messages to Claude
 | `/setup` | First-time installation, Lark configuration, service startup |
 | `/customize` | Adding integrations, changing behavior |
 | `/debug` | Container issues, logs, troubleshooting |
-| `/update` | Pull upstream NanoClaw changes, merge with customizations, run migrations |
 
 ## Local Search (QMD)
 
