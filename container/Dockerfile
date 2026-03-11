@@ -12,6 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     jq \
+    python3 \
     unzip \
     && rm -rf /var/lib/apt/lists/* /usr/share/doc/* /usr/share/icons/*
 
