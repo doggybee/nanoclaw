@@ -12,12 +12,13 @@ import fs from 'fs';
 import path from 'path';
 
 import { createStore, type QMDStore, extractSnippet, addLineNumbers, DEFAULT_MULTI_GET_MAX_BYTES } from '@tobilu/qmd';
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
 import { QMD_DATA_DIR, GROUPS_DIR } from './config.js';
+import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 
 // ---------------------------------------------------------------------------
@@ -26,16 +27,22 @@ import { logger } from './logger.js';
 
 interface StoreEntry {
   store: QMDStore;
+  mcpServer: McpServer;
   lastAccess: number;
 }
 
 const stores = new Map<string, StoreEntry>();
 const STORE_IDLE_MS = 30 * 60 * 1000; // 30 minutes
 const REINDEX_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_IDLE_MS = 60 * 60 * 1000; // 1 hour
 
-/** Validate group folder name — reject path traversal and absolute paths. */
-function isValidGroup(name: string): boolean {
-  return /^[a-zA-Z0-9_-]+$/.test(name) && !name.includes('..');
+// Global knowledge dir — checked once at startup, same for all groups
+let globalKnowledgeDir: string | null = null;
+function getGlobalKnowledgeDir(): string | null {
+  if (globalKnowledgeDir !== null) return globalKnowledgeDir;
+  const dir = path.join(GROUPS_DIR, 'global', 'knowledge');
+  globalKnowledgeDir = fs.existsSync(dir) ? dir : '';
+  return globalKnowledgeDir || null;
 }
 
 /** Get collections config for a group. */
@@ -47,19 +54,19 @@ function collectionsForGroup(groupFolder: string): Record<string, { path: string
     collections.conversations = { path: conversationsDir, pattern: '**/*.md' };
   }
 
-  const knowledgeDir = path.join(GROUPS_DIR, 'global', 'knowledge');
-  if (fs.existsSync(knowledgeDir)) {
+  const knowledgeDir = getGlobalKnowledgeDir();
+  if (knowledgeDir) {
     collections.kb = { path: knowledgeDir, pattern: '**/*.md' };
   }
 
   return collections;
 }
 
-async function getOrCreateStore(groupFolder: string): Promise<QMDStore> {
+async function getOrCreateEntry(groupFolder: string): Promise<StoreEntry> {
   const existing = stores.get(groupFolder);
   if (existing) {
     existing.lastAccess = Date.now();
-    return existing.store;
+    return existing;
   }
 
   const dbDir = path.join(QMD_DATA_DIR, groupFolder);
@@ -74,7 +81,11 @@ async function getOrCreateStore(groupFolder: string): Promise<QMDStore> {
       : undefined,
   });
 
-  stores.set(groupFolder, { store, lastAccess: Date.now() });
+  // Build McpServer once per store (expensive: builds instructions, registers tools)
+  const mcpServer = await createMcpServer(store);
+
+  const entry: StoreEntry = { store, mcpServer, lastAccess: Date.now() };
+  stores.set(groupFolder, entry);
   logger.info({ groupFolder, dbPath, collections: Object.keys(collections) }, 'QMD store created');
 
   // Background index + embed (don't block the request)
@@ -82,7 +93,7 @@ async function getOrCreateStore(groupFolder: string): Promise<QMDStore> {
     logger.warn({ groupFolder, err }, 'QMD background index failed');
   });
 
-  return store;
+  return entry;
 }
 
 async function indexStore(groupFolder: string, store: QMDStore): Promise<void> {
@@ -333,25 +344,40 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
 // Per-group MCP session management
 // ---------------------------------------------------------------------------
 
-// Each client connection gets its own Transport+McpServer pair (MCP spec).
-// The QMDStore is shared within a group (SQLite handles concurrent reads).
-const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+// Each client connection gets its own Transport (MCP spec).
+// McpServer is shared per store. Transport is per-session.
+interface SessionEntry {
+  transport: WebStandardStreamableHTTPServerTransport;
+  lastAccess: number;
+}
+const sessions = new Map<string, SessionEntry>();
 
-async function createSession(store: QMDStore): Promise<WebStandardStreamableHTTPServerTransport> {
+async function createSession(mcpServer: McpServer): Promise<WebStandardStreamableHTTPServerTransport> {
+  const now = Date.now();
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: () => randomUUID(),
     enableJsonResponse: true,
     onsessioninitialized: (sessionId: string) => {
-      sessions.set(sessionId, transport);
+      sessions.set(sessionId, { transport, lastAccess: now });
       logger.debug({ sessionId, activeSessions: sessions.size }, 'QMD MCP session created');
     },
   });
-  const server = await createMcpServer(store);
-  await server.connect(transport);
+  await mcpServer.connect(transport);
   transport.onclose = () => {
     if (transport.sessionId) sessions.delete(transport.sessionId);
   };
   return transport;
+}
+
+/** Close sessions idle longer than SESSION_IDLE_MS. */
+function reapIdleSessions(): void {
+  const now = Date.now();
+  for (const [id, entry] of sessions) {
+    if (now - entry.lastAccess > SESSION_IDLE_MS) {
+      entry.transport.close?.();
+      sessions.delete(id);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -385,13 +411,13 @@ export async function startQmdProxy(port: number, host: string): Promise<void> {
       // MCP endpoint
       if (pathname === '/mcp' && req.method === 'POST') {
         const groupFolder = req.headers['x-nanoclaw-group'] as string | undefined;
-        if (!groupFolder || !isValidGroup(groupFolder)) {
+        if (!groupFolder || !isValidGroupFolder(groupFolder)) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Missing or invalid X-NanoClaw-Group header' }));
           return;
         }
 
-        const store = await getOrCreateStore(groupFolder);
+        const entry = await getOrCreateEntry(groupFolder);
         const body = await collectBody(req);
         let parsed: Record<string, unknown>;
         try {
@@ -407,9 +433,11 @@ export async function startQmdProxy(port: number, host: string): Promise<void> {
         let transport: WebStandardStreamableHTTPServerTransport;
 
         if (sessionId && sessions.has(sessionId)) {
-          transport = sessions.get(sessionId)!;
+          const sessionEntry = sessions.get(sessionId)!;
+          sessionEntry.lastAccess = Date.now();
+          transport = sessionEntry.transport;
         } else if (isInitializeRequest(parsed)) {
-          transport = await createSession(store);
+          transport = await createSession(entry.mcpServer);
         } else {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'No active session. Send initialize first.' }));
@@ -451,41 +479,22 @@ export async function startQmdProxy(port: number, host: string): Promise<void> {
     logger.info({ port, host }, 'QMD proxy started');
   });
 
-  // Idle store reaper — every 5 minutes
-  idleReaper = setInterval(reapIdleStores, 5 * 60 * 1000);
+  // Idle store + session reaper — every 5 minutes
+  idleReaper = setInterval(() => { reapIdleStores(); reapIdleSessions(); }, 5 * 60 * 1000);
 
-  // Periodic re-index — every 30 minutes
+  // Periodic re-index — every 30 minutes, parallel across stores
   reindexTimer = setInterval(async () => {
-    for (const [group, entry] of stores) {
-      try {
-        await indexStore(group, entry.store);
-      } catch (err) {
-        logger.warn({ group, err }, 'QMD periodic reindex failed');
-      }
-    }
+    const entries = [...stores.entries()];
+    await Promise.allSettled(
+      entries.map(async ([group, entry]) => {
+        try {
+          await indexStore(group, entry.store);
+        } catch (err) {
+          logger.warn({ group, err }, 'QMD periodic reindex failed');
+        }
+      }),
+    );
   }, REINDEX_INTERVAL_MS);
-
-  // Pre-index all registered groups in the background
-  preIndexExistingGroups().catch((err) => {
-    logger.warn({ err }, 'QMD pre-index failed');
-  });
-}
-
-/** Pre-index stores for groups that already have conversations or knowledge. */
-async function preIndexExistingGroups(): Promise<void> {
-  try {
-    const entries = fs.readdirSync(GROUPS_DIR, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name === 'global') continue;
-      if (!isValidGroup(entry.name)) continue;
-      const conversationsDir = path.join(GROUPS_DIR, entry.name, 'conversations');
-      if (fs.existsSync(conversationsDir)) {
-        await getOrCreateStore(entry.name);
-      }
-    }
-  } catch {
-    // groups dir may not exist yet
-  }
 }
 
 export function stopQmdProxy(): void {
