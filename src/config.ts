@@ -111,6 +111,12 @@ export const CREDENTIAL_PROXY_PORT = parseInt(
   process.env.CREDENTIAL_PROXY_PORT || '3001', 10,
 );
 
+// QMD proxy: centralized search server for all groups
+export const QMD_PROXY_PORT = parseInt(
+  process.env.QMD_PROXY_PORT || '3002', 10,
+);
+export const QMD_DATA_DIR = path.resolve(DATA_DIR, 'qmd');
+
 // Lark configuration
 // LARK_APP_ID and LARK_APP_SECRET are read directly by LarkChannel
 // from .env via readEnvFile() to keep secrets off the config module entirely.

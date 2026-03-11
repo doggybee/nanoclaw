@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",
+    "@tobilu/qmd": "^2.0.1",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
     "pino": "^9.6.0",

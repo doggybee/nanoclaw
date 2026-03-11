@@ -14,7 +14,6 @@
  *   Final marker after loop ends signals completion.
  */
 
-import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { query, Query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
@@ -611,7 +610,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__qmd__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -627,6 +627,13 @@ async function runQuery(
             ...(containerInput.isScheduledTask ? { NANOCLAW_IS_TASK: '1' } : {}),
           },
         },
+        ...(process.env.NANOCLAW_QMD_URL ? {
+          qmd: {
+            type: 'http' as const,
+            url: process.env.NANOCLAW_QMD_URL,
+            headers: { 'X-NanoClaw-Group': containerInput.groupFolder },
+          },
+        } : {}),
       },
       includePartialMessages: true,
       thinking: (() => {
@@ -807,26 +814,6 @@ async function main(): Promise<void> {
   let globalClaudeMd: string | undefined;
   try { if (!containerInput.isMain) globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8'); } catch {}
 
-  // QMD indexing helper — deferred to idle time (after first query completes)
-  // to avoid competing for CPU during SDK init and first API call.
-  let qmdIndexed = false;
-  const qmdIndexDeferred = () => {
-    if (qmdIndexed) return;
-    qmdIndexed = true;
-    const qmdIndex = (dir: string, collection: string) => {
-      try {
-        if (fs.existsSync(dir) && fs.readdirSync(dir).some(f => f.endsWith('.md'))) {
-          execFile('qmd', ['collection', 'add', dir, '--name', collection, '--mask', '*.md'], (err) => {
-            if (err) log(`QMD index [${collection}] failed: ${err.message}`);
-            else log(`QMD index [${collection}] done`);
-          });
-        }
-      } catch {}
-    };
-    qmdIndex('/workspace/global/knowledge', 'kb');
-    qmdIndex('/workspace/group/conversations', 'conversations');
-  };
-
   // Discover extra mount directories once
   const extraDirs: string[] = [];
   try {
@@ -954,7 +941,6 @@ async function main(): Promise<void> {
     const queryResult = await runQuery(
       prompt || '', sessionId, mcpServerPath, containerInput, sdkEnv,
       replySession, globalClaudeMd, extraDirs,
-      () => qmdIndexDeferred(),
     );
 
     if (queryResult.newSessionId) {

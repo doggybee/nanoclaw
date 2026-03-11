@@ -10,6 +10,7 @@ import {
   MESSAGE_RETENTION_DAYS,
   MODEL_FAST,
   POLL_INTERVAL,
+  QMD_PROXY_PORT,
   SESSION_IDLE_TIMEOUT,
   SESSION_MAX_BYTES,
   TRIGGER_PATTERN,
@@ -30,6 +31,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import { startCredentialProxy } from './credential-proxy.js';
+import { startQmdProxy, stopQmdProxy } from './qmd-proxy.js';
 import {
   chatVersion,
   deleteSession,
@@ -805,6 +807,10 @@ async function main(): Promise<void> {
     }),
   );
 
+  // Start QMD proxy (centralized search for containers)
+  const bindHost = detectProxyBindHost();
+  await startQmdProxy(QMD_PROXY_PORT, bindHost);
+
   initDatabase();
   logger.info('Database initialized');
   loadState();
@@ -814,6 +820,7 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutdown signal received');
     saveState(true);
     proxyServer.close();
+    stopQmdProxy();
     // Kill warm pool containers
     for (const entry of warmPool) {
       try { entry.handle.process.kill('SIGTERM'); } catch { /* already dead */ }

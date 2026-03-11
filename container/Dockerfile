@@ -24,12 +24,6 @@ RUN RTK_ARCH=$(uname -m | sed 's/aarch64/aarch64-unknown-linux-gnu/;s/x86_64/x86
     | tar xz -C /usr/local/bin rtk \
     && chmod +x /usr/local/bin/rtk
 
-# Install Bun runtime (required by QMD) to shared path accessible by all users
-RUN curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
-
-# Install QMD CLI (local search: BM25 + vector + LLM reranking)
-RUN npm install -g @tobilu/qmd && npm cache clean --force
-
 # Create app directory
 WORKDIR /app
 

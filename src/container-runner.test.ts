@@ -18,6 +18,7 @@ vi.mock('./config.js', () => ({
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
   MESSAGE_RETENTION_DAYS: 30,
+  QMD_PROXY_PORT: 3002,
   TIMEZONE: 'America/Los_Angeles',
 }));
 

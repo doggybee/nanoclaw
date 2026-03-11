@@ -16,6 +16,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  QMD_PROXY_PORT,
   TIMEZONE,
 } from './config.js';
 import { readEnvFile } from './env.js';
@@ -266,15 +267,6 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Per-group QMD cache: persist index + downloaded models across conversations
-  const qmdCacheDir = path.join(DATA_DIR, 'sessions', group.folder, '.qmd-cache');
-  cachedMkdir(qmdCacheDir);
-  mounts.push({
-    hostPath: qmdCacheDir,
-    containerPath: `${CONTAINER_HOME}/.cache/qmd`,
-    readonly: false,
-  });
-
   // Per-slot IPC namespace (read-write): each user slot gets its own IPC directory
   // to prevent concurrent containers from conflicting on input/output files.
   // Secondary read-only mount at /workspace/ipc-group contains shared group-level files.
@@ -360,6 +352,11 @@ function buildContainerArgs(
     ANTHROPIC_BASE_URL: proxyUrl,
     ...(authMode === 'api-key' ? { ANTHROPIC_API_KEY: 'placeholder' } : { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' }),
     TZ: TIMEZONE,
+  });
+
+  // QMD proxy URL — containers connect to host's centralized search server
+  addEnvArgs(args, {
+    NANOCLAW_QMD_URL: `http://${CONTAINER_HOST_GATEWAY}:${QMD_PROXY_PORT}/mcp`,
   });
 
   // Pass model override and Lark credentials so container can call Lark API directly
