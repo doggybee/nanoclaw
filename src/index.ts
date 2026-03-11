@@ -62,6 +62,14 @@ import { logger } from './logger.js';
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
 
+// Abort trigger detection — user sends these to immediately stop the active container
+const ABORT_WORDS = new Set(['stop', '停', '停止']);
+function isAbortTrigger(content: string): boolean {
+  // Strip @mention prefix, trim, lowercase
+  const text = content.replace(TRIGGER_PATTERN, '').trim().toLowerCase();
+  return ABORT_WORDS.has(text);
+}
+
 let lastTimestamp = '';
 let sessions: Record<string, string> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
@@ -687,9 +695,21 @@ async function startMessageLoop(): Promise<void> {
 
           if (triggerMessages.length === 0) continue;
 
+          // Check for abort triggers before queuing — instantly terminate
+          // the active container if user sends "STOP", "停", etc.
+          for (const msg of triggerMessages) {
+            if (isAbortTrigger(msg.content)) {
+              if (queue.hasActiveSlot(chatJid, msg.sender)) {
+                queue.abortSlot(chatJid, msg.sender);
+                logger.info({ chatJid, sender: msg.sender }, 'Abort triggered');
+              }
+            }
+          }
+
           // Sub-group by sender for per-user slot routing
           const bySender = new Map<string, NewMessage[]>();
           for (const msg of triggerMessages) {
+            if (isAbortTrigger(msg.content)) continue; // don't forward abort messages
             const existing = bySender.get(msg.sender);
             if (existing) {
               existing.push(msg);

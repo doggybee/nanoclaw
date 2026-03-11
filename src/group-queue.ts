@@ -227,6 +227,34 @@ export class GroupQueue {
     }
   }
 
+  /** Check if a slot has an active container running. */
+  hasActiveSlot(chatJid: string, senderId: string): boolean {
+    const slotKey = makeSlotKey(chatJid, senderId);
+    const state = this.slots.get(slotKey);
+    return !!state?.active;
+  }
+
+  /** Abort a running container: write _abort IPC marker, fallback to SIGTERM. */
+  abortSlot(chatJid: string, senderId: string): void {
+    const slotKey = makeSlotKey(chatJid, senderId);
+    const state = this.slots.get(slotKey);
+    if (!state?.active) return;
+
+    // Write _abort marker for container to detect
+    const inputDir = this.getSlotIpcInputDir(state);
+    try {
+      fs.mkdirSync(inputDir, { recursive: true });
+      fs.writeFileSync(path.join(inputDir, '_abort'), '');
+      logger.info({ slotKey }, 'Abort marker written');
+    } catch {
+      // IPC write failed — fall back to process kill
+      if (state.process && !state.process.killed) {
+        state.process.kill('SIGTERM');
+        logger.info({ slotKey }, 'Abort via SIGTERM (IPC write failed)');
+      }
+    }
+  }
+
   /** Get the IPC input directory for a slot. Uses per-slot IPC path. */
   private getSlotIpcInputDir(state: SlotState): string {
     if (state.ipcPath) {

@@ -99,6 +99,7 @@ class TextAccumulator {
 
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
+const IPC_INPUT_ABORT_SENTINEL = path.join(IPC_INPUT_DIR, '_abort');
 const IPC_POLL_MS = 50; // fallback only — used when inotify unavailable
 
 // ---------------------------------------------------------------------------
@@ -353,6 +354,18 @@ function shouldClose(): boolean {
   }
 }
 
+/**
+ * Check for _abort sentinel.
+ */
+function shouldAbort(): boolean {
+  try {
+    fs.unlinkSync(IPC_INPUT_ABORT_SENTINEL);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 interface IpcMessage {
   text: string;
   model?: string;
@@ -433,6 +446,14 @@ async function runQuery(
   let replySession = initialReplySession;
   const pollIpcDuringQuery = async () => {
     while (ipcPolling) {
+      if (shouldAbort()) {
+        log('Abort sentinel detected, aborting reply and ending stream');
+        if (replySession) replySession.abort().catch(() => {});
+        closedDuringQuery = true;
+        stream.end();
+        ipcPolling = false;
+        return;
+      }
       if (shouldClose()) {
         log('Close sentinel detected, ending stream');
         closedDuringQuery = true;
@@ -822,8 +843,9 @@ async function main(): Promise<void> {
   // Start IPC watcher (inotify-based, polling fallback)
   startIpcWatch();
 
-  // Clean up stale _close sentinel from previous container runs
+  // Clean up stale sentinels from previous container runs
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
+  try { fs.unlinkSync(IPC_INPUT_ABORT_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;

@@ -33,6 +33,14 @@ export interface ReplySessionOpts {
   startedAt?: number;
 }
 
+// Lark API error codes indicating the target message is deleted/recalled
+const TERMINAL_CODES = new Set([230011, 231003]);
+
+function extractApiCode(err: unknown): number | undefined {
+  const e = err as any;
+  return e?.code ?? e?.data?.code ?? e?.response?.data?.code ?? e?.cardkitCode;
+}
+
 export class ReplySession {
   // CardKit entity ID (from createCardEntity). Nulled on CardKit failure
   // to switch subsequent flushes to IM patch mode.
@@ -49,6 +57,8 @@ export class ReplySession {
   private cardCreationPromise: Promise<void> | null = null;
   cardCreationFailed = false;
   private cardCompleted = false;
+  // UnavailableGuard: stops all API calls when target message is deleted/recalled
+  private terminated = false;
   private cardKitSequence = 0;
   private lastContent = '';
   private _optimizedContent = '';
@@ -71,7 +81,23 @@ export class ReplySession {
   }
 
   get isActive(): boolean {
-    return !this.cardCompleted;
+    return !this.cardCompleted && !this.terminated;
+  }
+
+  /** Check if an API error indicates the message was deleted/recalled. */
+  private checkTerminal(err: unknown, context: string): boolean {
+    const code = extractApiCode(err);
+    if (code !== undefined && TERMINAL_CODES.has(code)) {
+      log(`message unavailable (${code}) during ${context}, terminating`);
+      this.terminated = true;
+      this.cardCompleted = true;
+      if (this.pendingFlushTimer) {
+        clearTimeout(this.pendingFlushTimer);
+        this.pendingFlushTimer = null;
+      }
+      return true;
+    }
+    return false;
   }
 
   /** Whether a card has been created (either CardKit or IM patch). */
@@ -117,7 +143,7 @@ export class ReplySession {
       } catch (err) {
         log(`CardKit creation failed: ${err instanceof Error ? err.message : String(err)}, trying IM fallback`);
 
-        // Fallback: plain IM card (no CardKit streaming)
+        // Fallback level 2: plain IM card (no CardKit streaming)
         try {
           const resp = await this.client.im.v1.message.create({
             data: {
@@ -131,10 +157,30 @@ export class ReplySession {
           if (!messageId) throw new Error('IM message.create returned empty message_id');
 
           this.cardMessageId = messageId;
-          log(`IM fallback active: messageId=${messageId}`);
+          log(`IM card fallback active: messageId=${messageId}`);
         } catch (imErr) {
-          log(`IM fallback also failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
-          this.cardCreationFailed = true;
+          log(`IM card fallback failed: ${imErr instanceof Error ? imErr.message : String(imErr)}`);
+          // Fallback level 3: plain text message
+          try {
+            const resp = await this.client.im.v1.message.create({
+              data: {
+                receive_id: this.chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text: '思考中...' }),
+              },
+              params: { receive_id_type: 'chat_id' },
+            });
+            const messageId = resp?.data?.message_id;
+            if (messageId) {
+              this.cardMessageId = messageId;
+              log(`plain text fallback active: messageId=${messageId}`);
+            } else {
+              this.cardCreationFailed = true;
+            }
+          } catch (textErr) {
+            log(`all card creation fallbacks failed: ${textErr instanceof Error ? textErr.message : String(textErr)}`);
+            this.cardCreationFailed = true;
+          }
         }
       }
 
@@ -219,21 +265,20 @@ export class ReplySession {
       ).then(() => {
         // success — no action needed
       }).catch((err) => {
+        if (this.checkTerminal(err, 'streamCardContent')) return;
         const apiCode = (err as any)?.cardkitCode;
         if (apiCode === 230020) {
-          // Rate limited — silently skip, next flush picks up latest text
           log(`flush rate limited (230020), skipping`);
           return;
         }
         log(`streaming flush failed: seq=${seq} err=${err instanceof Error ? err.message : String(err)}`);
-        // Disable CardKit streaming, fall back to IM patch on same message
         if (this.cardKitCardId) {
           log(`disabling CardKit streaming, falling back to IM patch`);
           this.cardKitCardId = null;
         }
       }).finally(() => {
         this.flushInProgress = false;
-        this.scheduleReflush();
+        if (!this.terminated) this.scheduleReflush();
       });
     } else {
       // IM patch fallback — update the same card message
@@ -241,6 +286,7 @@ export class ReplySession {
         path: { message_id: this.cardMessageId! },
         data: { content: JSON.stringify(buildSimpleMarkdownCard(optimized)) },
       }).catch((err) => {
+        if (this.checkTerminal(err, 'im.message.patch')) return;
         const code = (err as any)?.response?.data?.code;
         if (code === 230020) {
           log(`IM patch rate limited (230020), skipping`);
@@ -249,7 +295,7 @@ export class ReplySession {
         log(`IM patch update failed: err=${err instanceof Error ? err.message : String(err)}`);
       }).finally(() => {
         this.flushInProgress = false;
-        this.scheduleReflush();
+        if (!this.terminated) this.scheduleReflush();
       });
     }
   }
@@ -268,7 +314,7 @@ export class ReplySession {
   // ---- finalize ----
 
   async finalize(opts?: CompleteCardOpts): Promise<void> {
-    if (this.cardCompleted) return;
+    if (this.cardCompleted || this.terminated) return;
     this.cardCompleted = true;
 
     // Cancel any pending re-flush
