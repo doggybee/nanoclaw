@@ -17,7 +17,7 @@
 import { execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { query, Query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 import { larkAvailable, larkClient, extractChatId, warmupLarkClient } from './lark-client.js';
 import { ReplySession } from './lark/reply-session.js';
@@ -443,6 +443,23 @@ async function runQuery(
       const messages = drainIpcInput();
       for (const msg of messages) {
         log(`[timing] IPC message received (${msg.text.length} chars)`);
+        // Dynamic model switching — when model router selects a different
+        // model, apply it before pushing the message so the next API call
+        // uses the correct model. Also adjust thinking budget per model.
+        if (msg.model && msg.model !== currentModel && queryObj) {
+          log(`[timing] switching model: ${currentModel} → ${msg.model}`);
+          currentModel = msg.model;
+          queryObj.setModel(msg.model).catch((err) => {
+            log(`setModel failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+          // Adjust thinking budget for the new model
+          const isHaiku = msg.model.includes('haiku');
+          const defaultBudget = isHaiku ? 2000 : 10000;
+          const budget = parseInt(process.env.THINKING_BUDGET || String(defaultBudget), 10);
+          queryObj.setMaxThinkingTokens(budget === 0 ? null : budget).catch((err) => {
+            log(`setMaxThinkingTokens failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
         // Lazy ReplySession creation for each new turn.
         // In warm mode first turn, this runs in parallel with SDK init.
         if (!replySession && larkAvailable && msg.replyToMessageId) {
@@ -470,6 +487,10 @@ async function runQuery(
   let firstTokenTime = 0;
   let streamEventCount = 0;
   let accumulator = new TextAccumulator();
+
+  // Track current model for dynamic switching via setModel()
+  let currentModel = containerInput.model || process.env.CLAUDE_MODEL || '';
+  let queryObj: Query | null = null;
 
   // Per-turn reasoning state
   let reasoningChunks: string[] = [];
@@ -551,7 +572,7 @@ async function runQuery(
     turnStartTime = Date.now();
   };
 
-  for await (const message of query({
+  queryObj = query({
     prompt: stream,
     options: {
       model: containerInput.model || process.env.CLAUDE_MODEL || undefined,
@@ -601,7 +622,9 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
       },
     }
-  })) {
+  });
+
+  for await (const message of queryObj) {
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     if (message.type !== 'stream_event') {

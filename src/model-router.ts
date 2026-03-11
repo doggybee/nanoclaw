@@ -18,10 +18,15 @@ const COMPLEX_PATTERNS = [
   /```/,                                    // code blocks
   /\.(ts|js|py|go|rs|java|cpp|c|sh|yaml|yml|json|toml|sql|css|html|xml|md|txt|log|csv)\b/i, // file extensions
   /(https?:\/\/)/,                          // URLs
-  /\b(debug|fix|bug|error|deploy|build|test|refactor|implement|create|write|edit|delete|modify|update|install|configure|setup|migrate|analyze|review)\b/i, // action verbs
-  /\b(code|file|script|function|class|module|package|dependency|container|docker|git|branch|commit|PR|pull request|merge)\b/i, // dev terms
-  /\b(database|query|API|endpoint|server|deploy|CI|CD|pipeline)\b/i, // infrastructure
-  /\b(MCP|tool|skill|search|fetch|browse)\b/i, // tool usage
+  /\b(debug|fix|bug|error|deploy|build|test|refactor|implement|create|write|edit|delete|modify|update|install|configure|setup|migrate|analyze|review)\b/i,
+  /(调试|修复|修改|报错|出错|部署|构建|编译|测试|重构|实现|编写|写个|写一个|删除|更新|安装|配置|搭建|迁移|分析|审查)/,
+  /\b(code|file|script|function|class|module|package|dependency|container|docker|git|branch|commit|PR|pull request|merge)\b/i,
+  /(代码|文件|脚本|函数|模块|依赖|容器|分支|提交|合并|仓库)/,
+  /\b(database|query|API|endpoint|server|deploy|CI|CD|pipeline)\b/i,
+  /(数据库|接口|服务器|流水线|上线)/,
+  /\b(MCP|tool|skill|search|fetch|browse)\b/i,
+  /(工具|搜索|抓取|爬取|浏览)/,
+  /(帮我写|帮我改|帮我做|帮我弄|帮我看看|帮我查|帮我找)/,   // task delegation
 ];
 
 // Patterns that strongly indicate a simple conversational message
@@ -45,14 +50,14 @@ function classifyMessage(text: string): 'simple' | 'complex' {
   }
 
   // Short messages matching simple patterns
-  if (text.length < 200) {
+  if (text.length < 100) {
     for (const pattern of SIMPLE_PATTERNS) {
       if (pattern.test(text)) return 'simple';
     }
   }
 
-  // Default: messages under 200 chars without complex indicators → simple
-  if (text.length < 200) return 'simple';
+  // Default: messages under 100 chars without complex indicators → simple
+  if (text.length < 100) return 'simple';
 
   return 'complex';
 }

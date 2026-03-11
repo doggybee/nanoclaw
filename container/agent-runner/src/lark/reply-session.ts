@@ -200,7 +200,9 @@ export class ReplySession {
     }
     const optimized = this._optimizedContent;
 
-    if (this.flushCount <= 3 || this.flushCount % 10 === 0) {
+    if (this.flushCount === 1) {
+      log(`[timing] first card update at +${Date.now() - this.startedAt}ms (len=${this.lastContent.length})`);
+    } else if (this.flushCount <= 3 || this.flushCount % 10 === 0) {
       log(`flush #${this.flushCount}: seq=${this.cardKitSequence + 1} len=${this.lastContent.length} cardkit=${!!this.cardKitCardId}`);
     }
 
